@@ -1,4 +1,3 @@
-import os
 import re
 from typing import Optional
 
@@ -9,53 +8,45 @@ from core.exceptions import UnknownIntentError
 INTENT_PATTERNS: list[tuple[str, list[str]]] = [
     ("storage_report", [
         r"storage\s+report", r"disk\s+usage", r"how\s+much\s+space",
-        r"storage\s+status", r"تقرير.*تخزين", r"استخدام.*مساحة",
-        r"كم.*مساحة", r"وضع.*تخزين", r"مساحة.*القرص",
+        r"storage\s+status", r"check\s+storage", r"show\s+storage",
     ]),
     ("list_large_files", [
         r"large\s+files?", r"biggest?\s+files?", r"largest?\s+files?",
         r"top\s+\d*\s*files?", r"show.*files.*size", r"what.*taking.*space",
-        r"أكبر.*ملفات?", r"ملفات.*كبيرة", r"اعرض.*ملفات.*كبيرة",
-        r"الملفات.*الأكبر", r"عرض.*أكبر", r"أي.*ملفات.*تأخذ",
+        r"files?\s+by\s+size",
     ]),
     ("organize_folder_by_type", [
         r"organiz(?:e|ing)\b", r"\bsort\s+files?\b", r"\barrange\s+files?\b",
         r"\btidy\s+(?:up\s+)?files?\b", r"clean\s+up\s+(?:the\s+)?folder",
-        r"رتّب", r"رتب", r"نظّم", r"نظم", r"صنّف", r"اعمل.*نظام",
-        r"رتب.*مجلد", r"نظم.*مجلد", r"تنظيم.*مجلد",
+        r"group\s+files?\s+by\s+type",
     ]),
     ("find_duplicates", [
         r"duplicates?", r"duplicate\s+files?", r"repeated\s+files?",
         r"find.*same\s+files?", r"identical\s+files?",
-        r"مكرر", r"مكررة", r"ملفات.*مكررة", r"ابحث.*مكرر",
-        r"الملفات.*المتكررة", r"ملفات.*متشابهة",
+        r"redundant\s+files?",
     ]),
     ("backup_folder", [
         r"back\s*up\b", r"\bbackup\b", r"copy\s+folder", r"make.*copy",
-        r"احتياطي", r"نسخة.*احتياطية", r"انسخ.*احتياط",
-        r"نسخ.*احتياطي", r"احفظ.*نسخة",
+        r"create.*backup", r"mirror\s+folder",
     ]),
     ("convert_video_to_mp3", [
         r"convert.*(?:video|mp4|mkv|avi|mov)\b.*(?:mp3|audio)\b",
         r"extract.*audio\b", r"(?:mp3|audio)\s+from\b",
         r"to\s+mp3\b", r"as\s+mp3\b",
-        r"حوّل.*(?:فيديو|mp4|mkv|avi).*(?:mp3|صوت)",
-        r"حول.*(?:فيديو|فيلم).*(?:mp3|صوت)",
-        r"استخرج.*صوت", r"تحويل.*فيديو.*صوت", r"إلى.*mp3",
+        r"rip.*audio",
     ]),
     ("compress_images", [
         r"compress\s+images?", r"resize\s+images?", r"shrink\s+images?",
         r"optimize\s+images?", r"reduce\s+image\s+size",
-        r"ضغط.*صور", r"اضغط.*صور", r"تصغير.*صور", r"ضغّط.*صور",
     ]),
     ("safe_rename_files", [
         r"rename\s+files?", r"batch\s+rename",
-        r"إعادة.*تسمية", r"غيّر.*(?:اسم|أسماء)", r"أعد.*تسمية",
+        r"bulk\s+rename",
     ]),
     ("safe_move_files", [
         r"move\s+(?:the\s+)?(?:file|folder|directory)\b",
         r"move\s+/", r"transfer\s+files?\b",
-        r"انقل", r"نقل.*ملفات?", r"انقل.*مجلد",
+        r"relocate\s+files?\b",
     ]),
 ]
 
@@ -73,11 +64,10 @@ HIGH_RISK_INTENTS = {
     "safe_rename_files",
 }
 
-_PATH_RE = re.compile(r'(?:^|[\s"\'])(/[^\s"\'،,\u060C]+)')
+_PATH_RE = re.compile(r'(?:^|[\s"\'])(/[^\s"\',:;]+)')
 _QUOTED_RE = re.compile(r'["\']([^"\']+)["\']')
 _TO_SEP_RE = re.compile(
-    r'(?:\bto\b|\bإلى\b|\bإلي\b)'
-    r'\s+["\']?(/[^\s"\'،,\u060C]+)["\']?',
+    r'\bto\b\s+["\']?(/[^\s"\',:;]+)["\']?',
     re.IGNORECASE
 )
 
@@ -105,7 +95,7 @@ def _extract_all_paths(command: str) -> list[str]:
             seen.add(candidate)
 
     for m in _PATH_RE.finditer(command):
-        candidate = m.group(1).strip().rstrip(".,;)،")
+        candidate = m.group(1).strip().rstrip(".,;)")
         if candidate not in seen:
             paths.append(candidate)
             seen.add(candidate)
@@ -116,7 +106,7 @@ def _extract_all_paths(command: str) -> list[str]:
 def _extract_source_target(command: str) -> tuple[Optional[str], Optional[str]]:
     to_match = _TO_SEP_RE.search(command)
     if to_match:
-        target_path = to_match.group(1).strip().rstrip(".,;)،")
+        target_path = to_match.group(1).strip().rstrip(".,;)")
         all_paths = _extract_all_paths(command)
         source_path = None
         for p in all_paths:
@@ -138,7 +128,7 @@ def _extract_source_target(command: str) -> tuple[Optional[str], Optional[str]]:
 def extract_options(command: str, intent: str) -> dict:
     options: dict = {}
 
-    top_n_match = re.search(r"(?:top|أكبر|أعلى)\s+(\d+)", command, re.IGNORECASE)
+    top_n_match = re.search(r"\btop\s+(\d+)", command, re.IGNORECASE)
     if top_n_match:
         options["top_n"] = int(top_n_match.group(1))
 
