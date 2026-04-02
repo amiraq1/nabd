@@ -197,6 +197,46 @@ def show_files(
     }
 
 
+def show_folders(directory: str) -> dict[str, Any]:
+    """
+    List only the immediate subfolders in a directory with item counts.
+    Read-only. Item count is a best-effort scan of each subfolder's direct children.
+    """
+    if not os.path.isdir(directory):
+        raise ToolError(f"Directory does not exist: {directory}")
+
+    folders: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    try:
+        for entry in os.scandir(directory):
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    item_count: int | None = sum(1 for _ in os.scandir(entry.path))
+                except (OSError, PermissionError):
+                    item_count = None
+                folders.append({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "item_count": item_count,
+                })
+            except (OSError, PermissionError) as e:
+                errors.append(str(e))
+    except (OSError, PermissionError) as e:
+        raise ToolError(f"Cannot read directory '{directory}': {e}")
+
+    folders.sort(key=lambda x: x["name"].lower())
+
+    return {
+        "directory": directory,
+        "folder_count": len(folders),
+        "folders": folders,
+        "errors": errors,
+    }
+
+
 def list_media(
     directory: str,
     recursive: bool = False,
