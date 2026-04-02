@@ -14,6 +14,7 @@ def _default_source(intent_name: str) -> str:
         "find_duplicates": "/sdcard/Download",
         "compress_images": "/sdcard/Pictures",
         "show_files": "/sdcard/Download",
+        "show_folders": "/sdcard/Download",
         "list_media": "/sdcard/Download",
     }
     return defaults.get(intent_name, "/sdcard/Download")
@@ -33,6 +34,7 @@ def plan(intent: ParsedIntent) -> ExecutionPlan:
         "list_large_files": _plan_list_large_files,
         # ── Browse ─────────────────────────────────────────────────────────────
         "show_files": _plan_show_files,
+        "show_folders": _plan_show_folders,
         "list_media": _plan_list_media,
         # ── File management ────────────────────────────────────────────────────
         "organize_folder_by_type": _plan_organize_folder,
@@ -48,6 +50,7 @@ def plan(intent: ParsedIntent) -> ExecutionPlan:
         "open_app": _plan_open_app,
         # ── Browser ────────────────────────────────────────────────────────────
         "browser_search": _plan_browser_search,
+        "browser_page_title": _plan_browser_page_title,
         "browser_extract_text": _plan_browser_extract_text,
         "browser_list_links": _plan_browser_list_links,
     }
@@ -154,6 +157,22 @@ def _plan_show_files(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
             arguments={"directory": directory, "sort_by": sort_by, "limit": limit},
         )],
         preview_summary=f"List files in: {directory} (sorted by {sort_by})",
+    )
+
+
+def _plan_show_folders(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    directory = intent.source_path or _default_source("show_folders")
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="files",
+            function_name="show_folders",
+            arguments={"directory": directory},
+        )],
+        preview_summary=f"List subfolders in: {directory}",
     )
 
 
@@ -425,6 +444,27 @@ def _plan_browser_search(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
             arguments={"query": query},
         )],
         preview_summary=f"Open web search: '{query}'",
+    )
+
+
+def _plan_browser_page_title(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    url = intent.url
+    if not url:
+        raise ValidationError(
+            "Please specify the URL to fetch the title from.\n"
+            "  Example: show page title from https://example.com"
+        )
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="browser",
+            function_name="browser_page_title",
+            arguments={"url": url},
+        )],
+        preview_summary=f"Fetch page title from: {url}",
     )
 
 
