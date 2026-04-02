@@ -10,6 +10,36 @@ def _section(title: str) -> str:
     return f"\n{SEPARATOR}\n  {title}\n{SEPARATOR}"
 
 
+def _tls_fallback_lines(url: str) -> list[str]:
+    """
+    Build the structured TLS environment-error block shown when browser_extract_text
+    or browser_list_links fails due to SSL certificate verification.
+
+    Shows concrete alternative commands using the actual URL the user provided,
+    so they can take action immediately without editing the suggestion.
+    """
+    # Extract bare domain for the 'search for' suggestion
+    domain = url
+    for prefix in ("https://", "http://"):
+        if domain.startswith(prefix):
+            domain = domain[len(prefix):]
+            break
+    domain = domain.split("/")[0]   # strip any path
+
+    return [
+        f"\n  ✗  SSL certificate error — cannot fetch {url}",
+        "     Local CA trust store is missing or incomplete.",
+        "     This is an environment issue, not a problem with the URL.",
+        "",
+        "     Try these instead (no local TLS needed):",
+        f"       open {url}",
+        f"       search for {domain}",
+        "",
+        "     Fix (Termux):  pkg install ca-certificates",
+        "     Verify:        run 'doctor'",
+    ]
+
+
 def report_parsed_intent(intent: ParsedIntent) -> str:
     lines = [_section("PARSED INTENT")]
     lines.append(f"  Intent       : {intent.intent}")
@@ -400,11 +430,7 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         if not success:
             error_type = raw.get("error_type", "")
             if error_type == "tls":
-                lines.append(f"\n  ✗  SSL certificate error — cannot fetch: {url}")
-                lines.append("     The local CA trust store is missing or incomplete.")
-                lines.append("     What still works:  open https://...  |  search for ...")
-                lines.append("     Fix (Termux):      pkg install ca-certificates")
-                lines.append("     Verify:            run 'doctor'")
+                lines.extend(_tls_fallback_lines(url))
             else:
                 lines.append(f"\n  ✗  Could not fetch: {url}")
                 error = raw.get("error", "")
@@ -433,11 +459,7 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         if not success:
             error_type = raw.get("error_type", "")
             if error_type == "tls":
-                lines.append(f"\n  ✗  SSL certificate error — cannot fetch: {url}")
-                lines.append("     The local CA trust store is missing or incomplete.")
-                lines.append("     What still works:  open https://...  |  search for ...")
-                lines.append("     Fix (Termux):      pkg install ca-certificates")
-                lines.append("     Verify:            run 'doctor'")
+                lines.extend(_tls_fallback_lines(url))
             else:
                 lines.append(f"\n  ✗  Could not fetch: {url}")
                 error = raw.get("error", "")
