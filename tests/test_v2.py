@@ -737,6 +737,6 @@ class TestHelpTextShellSection:
         help_text = self._get_help_text()
         assert "mv" in help_text
 
-    def test_help_text_version_is_v021(self):
+    def test_help_text_version_is_current(self):
         help_text = self._get_help_text()
-        assert "v0.2.1" in help_text
+        assert "v0.4" in help_text
