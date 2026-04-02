@@ -484,7 +484,62 @@ If the history log can't be written, check that the `data/` directory inside the
 
 ---
 
+### HTTPS fetch / certificate errors on Termux
+
+`browser_extract_text` and `browser_list_links` make direct HTTPS requests from Python.  
+If you see an error like:
+
+```
+SSL: CERTIFICATE_VERIFY_FAILED
+Verify return code: 20 (unable to get local issuer certificate)
+```
+
+this means Python cannot verify the server's certificate because the local CA trust bundle is missing or incomplete. This is a common Termux environment issue — it does **not** affect opening URLs or running searches (those delegate to the Android browser).
+
+**What is NOT affected:**
+
+```
+open https://example.com        → still works (Android browser handles TLS)
+search for latest news          → still works (Android browser handles TLS)
+```
+
+**What IS affected:**
+
+```
+extract text from https://...   → requires valid CA certs in Python's SSL stack
+list links from https://...     → requires valid CA certs in Python's SSL stack
+```
+
+**Fix:**
+
+```bash
+# Install the CA certificate bundle for Termux:
+pkg install ca-certificates
+
+# Confirm with Nabd's built-in check:
+doctor
+```
+
+After running `pkg install ca-certificates`, restart Nabd and run `doctor` — the `HTTPS / CA certificates` check should show `ok`.
+
+**Why certificate verification is always on:**  
+Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, or equivalent). Disabling verification would silently expose all HTTPS fetches to man-in-the-middle attacks. The correct fix is to install a proper CA bundle, not to bypass verification.
+
+---
+
 ## Changelog
+
+### v0.4.1
+- **Browser TLS resilience**: `_fetch_html` now distinguishes SSL certificate errors (`error_type="tls"`) from plain network failures (`error_type="network"`)
+- **Actionable TLS error messages**: when `extract text` or `list links` fails with an SSL error, Nabd shows the exact fix (`pkg install ca-certificates`) and confirms that `open https://...` and `search for` are unaffected
+- **Reporter TLS hint**: `browser_extract_text` and `browser_list_links` display a structured, five-line TLS guidance block instead of a raw error string
+- **`check_browser_tls()` function** added to `tools/browser.py`: attempts a real HTTPS fetch, distinguishes TLS failures from offline/no-network states, returns `{"status": "ok"|"warn"|"error", "detail": "..."}`
+- **Doctor check #6** (`HTTPS / CA certificates`): `run_doctor()` now calls `check_browser_tls()` and reports TLS status alongside the existing five checks
+- **`error_type` field** added to all three browser tool result dicts (`browser_extract_text`, `browser_list_links`, `browser_search`)
+- **`_is_tls_error()` helper** centralises SSL exception detection across `urllib.error.URLError`, `ssl.SSLCertVerificationError`, `ssl.SSLError`, and string-reason cases
+- Certificate verification is never disabled (no `ssl.CERT_NONE`, no `verify=False` equivalents)
+- 56 new tests in `test_v4_1_tls.py` (453 total)
+- README: new "HTTPS fetch / certificate errors on Termux" troubleshooting section
 
 ### v0.4
 - **Phone status**: `show battery status`, `show network status` (via termux-api JSON)
