@@ -261,6 +261,33 @@ class TestParserShowFolders(unittest.TestCase):
         i = self._parse("show folder in /sdcard/Download")
         self.assertEqual(i.intent, "show_folders")
 
+    def test_list_directories(self):
+        i = self._parse("list directories in /sdcard/Download")
+        self.assertEqual(i.intent, "show_folders")
+
+    def test_show_directory(self):
+        i = self._parse("show directory in /sdcard")
+        self.assertEqual(i.intent, "show_folders")
+
+    def test_what_folder_is_in(self):
+        # "is" (singular) must also be recognised — fixed regression
+        i = self._parse("what folder is in /sdcard/Music")
+        self.assertEqual(i.intent, "show_folders")
+        self.assertEqual(i.source_path, "/sdcard/Music")
+
+    def test_what_directory_is_in(self):
+        i = self._parse("what directory is in /sdcard")
+        self.assertEqual(i.intent, "show_folders")
+
+    def test_what_subdirectory_is_in(self):
+        i = self._parse("what subdirectory is in /sdcard/Download")
+        self.assertEqual(i.intent, "show_folders")
+
+    def test_what_folders_no_verb(self):
+        # "what folders in" without is/are should also match
+        i = self._parse("what folders in /sdcard/Download")
+        self.assertEqual(i.intent, "show_folders")
+
     def test_does_not_match_show_files(self):
         i = self._parse("show files in /sdcard/Download")
         self.assertEqual(i.intent, "show_files")
