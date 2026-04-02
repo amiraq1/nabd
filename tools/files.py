@@ -2,8 +2,10 @@ import os
 import shutil
 from typing import Any
 
-from tools.utils import get_category, scan_files, unique_dest_path
+from tools.utils import get_category, human_readable_size, scan_files, unique_dest_path
 from core.exceptions import ToolError
+
+MEDIA_CATEGORIES = {"images", "videos", "audio"}
 
 
 def organize_folder_by_type(
@@ -135,5 +137,122 @@ def safe_move_files(
         "dry_run": dry_run,
         "planned": planned,
         "moved": moved,
+        "errors": errors,
+    }
+
+
+def show_files(
+    directory: str,
+    sort_by: str = "name",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """
+    List files in a directory with name, size, and last-modified time.
+    sort_by: 'name' | 'size' | 'modified'
+    """
+    if not os.path.isdir(directory):
+        raise ToolError(f"Directory does not exist: {directory}")
+
+    entries: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    try:
+        for entry in os.scandir(directory):
+            try:
+                stat = entry.stat(follow_symlinks=False)
+                is_dir = entry.is_dir(follow_symlinks=False)
+                entries.append({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "is_dir": is_dir,
+                    "size_bytes": stat.st_size if not is_dir else 0,
+                    "size_human": human_readable_size(stat.st_size) if not is_dir else "—",
+                    "modified_ts": stat.st_mtime,
+                    "ext": os.path.splitext(entry.name)[1].lower() if not is_dir else "",
+                })
+            except (OSError, PermissionError) as e:
+                errors.append(str(e))
+    except (OSError, PermissionError) as e:
+        raise ToolError(f"Cannot read directory '{directory}': {e}")
+
+    if sort_by == "size":
+        entries.sort(key=lambda x: -x["size_bytes"])
+    elif sort_by == "modified":
+        entries.sort(key=lambda x: -x["modified_ts"])
+    else:
+        entries.sort(key=lambda x: (x["is_dir"] is False, x["name"].lower()))
+
+    dirs = [e for e in entries if e["is_dir"]]
+    files = [e for e in entries if not e["is_dir"]]
+
+    return {
+        "directory": directory,
+        "total_entries": len(entries),
+        "file_count": len(files),
+        "dir_count": len(dirs),
+        "entries": entries[:limit],
+        "truncated": max(0, len(entries) - limit),
+        "sort_by": sort_by,
+        "errors": errors,
+    }
+
+
+def list_media(
+    directory: str,
+    recursive: bool = False,
+) -> dict[str, Any]:
+    """
+    List all media files (images, videos, audio) in a directory.
+    Groups results by category and returns per-category counts and sizes.
+    """
+    if not os.path.isdir(directory):
+        raise ToolError(f"Directory does not exist: {directory}")
+
+    groups: dict[str, list[dict[str, Any]]] = {
+        "images": [],
+        "videos": [],
+        "audio": [],
+    }
+    errors: list[str] = []
+    total_size = 0
+
+    for fpath in scan_files(directory, recursive=recursive):
+        try:
+            ext = os.path.splitext(fpath)[1].lower()
+            cat = get_category(ext)
+            if cat not in MEDIA_CATEGORIES:
+                continue
+            size = os.path.getsize(fpath)
+            total_size += size
+            groups[cat].append({
+                "path": fpath,
+                "name": os.path.basename(fpath),
+                "size_bytes": size,
+                "size_human": human_readable_size(size),
+                "ext": ext,
+            })
+        except (OSError, PermissionError) as e:
+            errors.append(str(e))
+
+    summary: dict[str, Any] = {}
+    for cat, items in groups.items():
+        items.sort(key=lambda x: x["name"].lower())
+        cat_size = sum(i["size_bytes"] for i in items)
+        summary[cat] = {
+            "count": len(items),
+            "total_size_human": human_readable_size(cat_size),
+            "total_size_bytes": cat_size,
+        }
+
+    total_count = sum(len(v) for v in groups.values())
+
+    return {
+        "directory": directory,
+        "recursive": recursive,
+        "total_media_count": total_count,
+        "total_size_human": human_readable_size(total_size),
+        "total_size_bytes": total_size,
+        "groups": groups,
+        "summary": summary,
         "errors": errors,
     }
