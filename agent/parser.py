@@ -49,6 +49,13 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
     ]),
 
     # ── Browser (specific URL/action patterns, before generic open/browse) ────
+    ("browser_page_title", [
+        r"(?:show|get|fetch)\s+(?:the\s+)?(?:page\s+)?title\b",
+        r"\bpage\s+title\b",
+        r"title\s+of\s+https?://",
+        r"what(?:'s|\s+is)\s+(?:the\s+)?(?:page\s+)?title\b",
+        r"get\s+title\s+(?:from|of)\b",
+    ]),
     ("browser_extract_text", [
         r"extract\s+text\s+(?:from|at|on)\b",
         r"get\s+text\s+(?:from|at|on)\b",
@@ -72,6 +79,14 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
     ]),
 
     # ── Browse / media ────────────────────────────────────────────────────────
+    ("show_folders", [
+        r"show\s+(?:sub)?folders?\s+in\b",
+        r"list\s+(?:sub)?folders?\s+in\b",
+        r"list\s+(?:sub)?director(?:y|ies)\s+in\b",
+        r"show\s+(?:sub)?director(?:y|ies)\s+in\b",
+        r"what\s+folders?\s+(?:are\s+)?in\b",
+        r"what\s+(?:sub)?director(?:y|ies)\s+(?:are\s+)?in\b",
+    ]),
     ("show_files", [
         r"show\s+files?\s+in\b",
         r"list\s+files?\s+in\b",
@@ -316,7 +331,7 @@ def parse_command(command: str) -> ParsedIntent:
     app_name: Optional[str] = None
     query: Optional[str] = None
 
-    if intent in ("open_url", "browser_extract_text", "browser_list_links"):
+    if intent in ("open_url", "browser_extract_text", "browser_list_links", "browser_page_title"):
         url = _extract_url(command)
 
     if intent == "browser_search":
