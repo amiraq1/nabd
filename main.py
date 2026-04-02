@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nabd v0.4 — Local phone operations agent for Android/Termux.
+Nabd v0.4.1 — Local phone operations agent for Android/Termux.
 Interactive CLI entry point.
 """
 
@@ -28,7 +28,7 @@ from core.logging_db import log_operation
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
-║              Nabd  v0.4                          ║
+║              Nabd  v0.4.1                        ║
 ║   Local Phone Operations Agent for Termux        ║
 ╚══════════════════════════════════════════════════╝"""
 
@@ -57,7 +57,7 @@ RETURNING_HINT = "  Type 'help' for commands  |  'history' for recent runs  |  '
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
-  NABD COMMANDS  (v0.4)
+  NABD COMMANDS  (v0.4.1)
 ────────────────────────────────────────────────────
 
   DIAGNOSTICS
