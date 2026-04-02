@@ -6,16 +6,21 @@ from core.exceptions import ExecutionError, ToolError
 
 
 WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
-    "storage": {"get_storage_report", "list_large_files"},
-    "files": {"organize_folder_by_type", "safe_rename_files", "safe_move_files"},
-    "media": {"convert_video_to_mp3", "compress_images"},
-    "backup": {"backup_folder"},
+    "system":     {"run_doctor"},
+    "storage":    {"get_storage_report", "list_large_files"},
+    "files":      {"organize_folder_by_type", "safe_rename_files", "safe_move_files",
+                   "show_files", "list_media"},
+    "media":      {"convert_video_to_mp3", "compress_images"},
+    "backup":     {"backup_folder"},
     "duplicates": {"find_duplicates"},
 }
 
 
 def _get_tool_module(tool_name: str) -> Any:
-    if tool_name == "storage":
+    if tool_name == "system":
+        import tools.system as mod
+        return mod
+    elif tool_name == "storage":
         import tools.storage as mod
         return mod
     elif tool_name == "files":
@@ -36,7 +41,10 @@ def _get_tool_module(tool_name: str) -> Any:
 
 def _execute_action(action: ToolAction, confirmed: bool) -> dict[str, Any]:
     if action.tool_name not in WHITELISTED_FUNCTIONS:
-        raise ExecutionError(f"Tool not whitelisted: '{action.tool_name}'")
+        raise ExecutionError(
+            f"Tool '{action.tool_name}' is not whitelisted. "
+            f"Allowed tools: {sorted(WHITELISTED_FUNCTIONS)}"
+        )
 
     allowed_fns = WHITELISTED_FUNCTIONS[action.tool_name]
     if action.function_name not in allowed_fns:
@@ -62,7 +70,6 @@ def _execute_action(action: ToolAction, confirmed: bool) -> dict[str, Any]:
 def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
     """
     Execute the plan.
-
     confirmed=True  → modifying actions run for real.
     confirmed=False → modifying actions run in dry-run mode (no changes).
     Read-only actions always run regardless of confirmed.
