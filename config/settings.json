@@ -1,0 +1,12 @@
+{
+  "app_name": "nabd",
+  "version": "0.1.0",
+  "log_db_path": "data/nabd_history.db",
+  "max_large_files": 20,
+  "large_file_threshold_mb": 10,
+  "backup_suffix": "_backup",
+  "image_compress_quality": 75,
+  "duplicate_chunk_size_kb": 64,
+  "dry_run_default": false,
+  "require_confirmation_for_modifying": true
+}
