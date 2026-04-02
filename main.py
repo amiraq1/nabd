@@ -57,7 +57,7 @@ RETURNING_HINT = "  Type 'help' for commands  |  'history' for recent runs  |  '
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
-  NABD COMMANDS  (v0.4.1)
+  NABD COMMANDS  (v0.4.2)
 ────────────────────────────────────────────────────
 
   DIAGNOSTICS
@@ -77,9 +77,13 @@ HELP_TEXT = """
     show files in /sdcard/Download sorted by size
       List every file and folder in a directory.
 
+    show folders in /sdcard/Download
+      List only subfolders with item counts (no files shown).
+
     list media in /sdcard/Download
     list media in /sdcard/Pictures recursively
       List images, videos, and audio files grouped by type.
+      Add 'recursively' to scan subfolders too.
 
   FIND
     find duplicates /sdcard/Download
@@ -141,6 +145,9 @@ HELP_TEXT = """
     google for android tips
       Open a web search in the default browser.
 
+    show page title from https://example.com
+      Fetch only the page title. Fast and minimal.
+
     extract text from https://example.com
       Fetch a page and return its readable text (no account needed).
 
@@ -162,11 +169,13 @@ HELP_TEXT = """
   supported here. Type 'exit' to return to Termux.
 
   Shell → Nabd equivalent:
-    ls <path>     →  show files in <path>
-    find <path>   →  find duplicates <path>
-    du <path>     →  storage report <path>
-    mv <f> <d>    →  move <f> to <d>
-    cp -r <s> <d> →  back up <s> to <d>
+    ls <path>         →  show files in <path>
+    ls -d */ <path>   →  show folders in <path>
+    find <path>       →  find duplicates <path>
+    du <path>         →  storage report <path>
+    mv <f> <d>        →  move <f> to <d>
+    cp -r <s> <d>     →  back up <s> to <d>
+    python script.py  →  (use Termux for scripting)
 ────────────────────────────────────────────────────
 """
 
@@ -195,7 +204,8 @@ SHELL_COMMANDS: dict[str, str] = {
     "chown": "  Nabd does not change file ownership.",
     "touch": "  Nabd does not create empty files.",
     "stat":  "  Nabd equivalent: show files in /sdcard/Download",
-    "tree":  "  Nabd equivalent: show files in /sdcard/Download",
+    "tree":   "  Nabd equivalent: show files in /sdcard/Download",
+    "python": "  Nabd does not run Python scripts.\n  Use Termux for scripting: python3 script.py",
 }
 
 
