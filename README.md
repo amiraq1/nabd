@@ -1,221 +1,330 @@
 # Nabd
 
-A local-first phone operations agent for Android/Termux.
+A local-first, safety-first phone operations agent for Android/Termux.
+
+Nabd accepts natural-language commands in English, turns them into structured intents, validates every path against an allowlist, shows a preview before making any change, and asks for confirmation before anything modifying is applied.
+
+**v0.2.0** — 237 tests passing.
 
 ---
 
-## Overview
+## Design principles
 
-Nabd is a safe, deterministic CLI assistant for managing files on your Android device via Termux. It accepts natural language commands in English, translates them into structured operations, previews changes before applying them, and requires your confirmation for any action that modifies files.
-
----
-
-## Product Boundaries
-
-Nabd is:
-- A controlled, local command assistant for file and storage operations
-- Designed for safety-first, deterministic execution
-- Runnable entirely offline on your Android device
-
-Nabd is NOT:
-- A general chatbot or AI agent
-- An unrestricted shell executor
-- A cloud service or web application
-- An autonomous deletion or cleanup bot
+- **Local-only** — no cloud, no network, no external AI APIs.
+- **Safety first** — every path is checked against `config/allowed_paths.json`. Path traversal (`..`) is blocked at the parser.
+- **Preview before apply** — modifying operations run a dry-run pass first. You see exactly what will change.
+- **Explicit confirmation** — you type `y` before any file is moved, renamed, or overwritten.
+- **English-only** — clean input; no multi-language ambiguity.
 
 ---
 
-## Safety Model
+## Requirements
 
-- All file access is restricted to paths listed in `config/allowed_paths.json`
-- Path traversal attacks (`..`, `//`, null bytes) are detected and rejected
-- All modifying operations require explicit yes/no confirmation
-- High-risk operations (compress, rename) are flagged clearly
-- No arbitrary shell commands are ever executed
-- No destructive action is taken without your approval
-- All operations are logged to a local SQLite database
+| Dependency | Used for | Install |
+|---|---|---|
+| Python 3.10+ | core runtime | built-in on Termux |
+| ffmpeg | video → MP3 conversion | `pkg install ffmpeg` |
+| Pillow | image compression | `pip install Pillow` |
 
----
-
-## Architecture
-
-```
-nabd/
-  main.py               — Interactive CLI entry point
-  requirements.txt      — Python dependencies
-  README.md             — This file
-  agent/
-    models.py           — Typed data models (ParsedIntent, ExecutionPlan, etc.)
-    parser.py           — Rule-based English command parser
-    planner.py          — Maps intents to deterministic execution plans
-    safety.py           — Central safety enforcement layer
-    executor.py         — Executes only whitelisted tool functions
-    reporter.py         — Generates readable result summaries
-    prompts.py          — Placeholder for future LLM integration
-  tools/
-    storage.py          — Storage reports, large file listing
-    files.py            — Organize, rename, move files
-    media.py            — Video-to-MP3 conversion, image compression
-    backup.py           — Safe folder backup
-    duplicates.py       — Duplicate file detection via SHA-256 hashing
-    utils.py            — Shared helpers (size formatting, file scanning, hashing)
-  core/
-    config.py           — Loads JSON configuration
-    paths.py            — Safe path resolution and validation
-    logging_db.py       — SQLite operation history logging
-    exceptions.py       — Custom exception hierarchy
-  config/
-    allowed_paths.json  — List of allowed root directories
-    settings.json       — Application settings
-  data/                 — SQLite log database (auto-created)
-  tests/
-    test_parser.py      — Parser intent detection tests
-    test_safety.py      — Path safety validation tests
-    test_tools.py       — Tool function tests
-```
+Run `doctor` inside Nabd to check all dependencies at once.
 
 ---
 
-## Supported Commands
-
-| Intent | Example |
-|---|---|
-| Storage report | `storage report /sdcard/Download` |
-| List large files | `list large files /sdcard/Download` |
-| Organize folder | `organize /sdcard/Download` |
-| Find duplicates | `find duplicates /sdcard/Download` |
-| Backup folder | `back up /sdcard/Documents to /sdcard/Backup` |
-| Convert to MP3 | `convert /sdcard/Movies/film.mp4 to mp3` |
-| Compress images | `compress images /sdcard/Pictures` |
-| Safe rename | `rename files /sdcard/Download prefix old_` |
-| Safe move | `move /sdcard/Download/file.txt to /sdcard/Documents` |
-
----
-
-## Termux Installation
-
-### 1. Update Termux
+## Installation (Termux)
 
 ```bash
 pkg update && pkg upgrade
-```
-
-### 2. Install Python
-
-```bash
-pkg install python
-```
-
-### 3. Install ffmpeg (required for video conversion)
-
-```bash
-pkg install ffmpeg
-```
-
-### 4. Grant storage permission
-
-```bash
-termux-setup-storage
-```
-
-This creates symlinks under `~/storage/` pointing to `/sdcard/`.
-
-### 5. Clone the repository
-
-```bash
-git clone https://github.com/amiraq1/nabd.git
+pkg install python ffmpeg
+termux-setup-storage       # grant storage permission
+git clone https://github.com/amiraq1/nabd
 cd nabd
-```
-
-### 6. Install Python dependencies
-
-```bash
 pip install -r requirements.txt
-```
-
-Pillow is required for image compression. All other features use only the Python standard library.
-
----
-
-## Running Nabd
-
-```bash
 python main.py
 ```
 
-You will see an interactive prompt:
+---
+
+## Commands
+
+### Diagnostics
 
 ```
-nabd>
+doctor
+check setup
 ```
-
-Type a command and press Enter. Type `exit` to quit.
+Checks Python version, ffmpeg, Pillow, allowed paths, and the history-log directory.
+No files are touched.
 
 ---
 
-## Configuration
+### Storage
 
-### `config/allowed_paths.json`
+```
+storage report /sdcard/Download
+storage report
+```
+Shows total size, file count, free space, and a breakdown by file category.
 
-Defines the directories the agent is permitted to access. Edit this file to add or remove allowed roots.
+```
+list large files /sdcard/Download
+list large files /sdcard/Download top 10
+```
+Lists the biggest files, sorted by size.
+
+---
+
+### Browse
+
+```
+show files in /sdcard/Download
+show files in /sdcard/Download sorted by size
+show files in /sdcard/Download sorted by modified
+```
+Lists every file and folder in a directory.
+
+```
+list media in /sdcard/Download
+list media in /sdcard/Pictures
+list media in /sdcard recursively
+show photos in /sdcard/Pictures
+find videos in /sdcard/Movies
+```
+Lists images, videos, and audio files grouped by category with sizes.
+No confirmation needed — read-only.
+
+---
+
+### Find
+
+```
+find duplicates /sdcard/Download
+find duplicates
+```
+Scans for byte-identical files using SHA-256 hashing. Reports wasted space.
+No files are deleted.
+
+---
+
+### Organise
+
+```
+organize /sdcard/Download
+sort files /sdcard/Download
+```
+Moves files into category subfolders: `images/`, `videos/`, `documents/`, `audio/`, `archives/`, `code/`, `apks/`, `other/`.
+
+**Preview first. Asks for confirmation. Medium risk.**
+
+---
+
+### Backup
+
+```
+back up /sdcard/Documents to /sdcard/Backup
+```
+Copies a folder to a timestamped backup directory.
+
+**Preview first. Asks for confirmation. Medium risk.**
+
+---
+
+### Convert
+
+```
+convert /sdcard/Movies/film.mp4 to mp3
+extract audio from /sdcard/Movies/talk.mkv
+```
+Extracts audio from a video and saves it as an MP3. Requires ffmpeg.
+
+**Preview first. Asks for confirmation. Medium risk.**
+
+---
+
+### Compress
+
+```
+compress images /sdcard/Pictures
+compress images /sdcard/Pictures quality 60
+```
+Re-saves images at lower JPEG quality (overwrites originals). Requires Pillow.
+
+**Preview first. Asks for confirmation. HIGH risk — originals are overwritten.**
+
+---
+
+### Rename
+
+```
+rename files /sdcard/Download prefix bak_
+rename files /sdcard/Download suffix _old
+```
+Adds a prefix or suffix to every filename in a folder.
+
+**Preview first. Asks for confirmation. HIGH risk.**
+
+---
+
+### Move
+
+```
+move /sdcard/Download/report.pdf to /sdcard/Documents
+```
+Moves a file or folder to a new location.
+
+**Preview first. Asks for confirmation. Medium risk.**
+
+---
+
+### History
+
+```
+history
+```
+Shows your 20 most recent commands with status, timestamp, and intent.
+
+---
+
+## Session example
+
+```
+nabd> doctor
+
+  ✓  Python version              Python 3.11.14 (supported)
+  ✓  ffmpeg                      /data/data/com.termux/files/usr/bin/ffmpeg
+  ✓  Pillow (image compression)  version 10.4.0
+  ✓  Allowed paths               2/2 paths reachable
+  ✓  History log directory       /data/.../nabd/data (writable)
+
+  Summary: 5 ok. All checks passed.
+
+nabd> list media in /sdcard/Download
+
+  Directory : /sdcard/Download
+  Total     : 47 media file(s), 1.2 GB
+
+  Images  : 31 file(s), 450.0 MB
+  Videos  : 12 file(s), 700.0 MB
+  Audio   :  4 file(s), 50.0 MB
+
+nabd> find duplicates /sdcard/Download
+
+  Duplicate groups : 3
+  Duplicate files  : 8
+  Wasted space     : 120.5 MB
+
+  Group 1  (35.2 MB × 3 copies):
+    • /sdcard/Download/video.mp4
+    • /sdcard/Download/video_copy.mp4
+
+nabd> organize /sdcard/Download
+
+  Would move  : 143 file(s)
+    report.pdf  →  documents/
+    photo.jpg   →  images/
+    ...
+
+  [MEDIUM RISK] Apply these changes? [y/n]: y
+
+  ✓ 143 files moved.
+```
+
+---
+
+## Safety model
+
+All paths are validated against `config/allowed_paths.json` before any operation.
+
+Default allowed roots:
 
 ```json
 {
   "allowed_roots": [
     "/sdcard/Download",
     "/sdcard/Documents",
+    "/sdcard/Pictures",
     "/sdcard/Music",
     "/sdcard/Movies",
-    "/sdcard/Pictures"
+    "/sdcard/Backup"
   ]
 }
 ```
 
-Any path outside these roots will be rejected automatically.
+Edit this file to add or remove directories.
+Path traversal sequences (`..`, `//`, `%2e`) are blocked unconditionally.
+The executor uses an explicit function whitelist — only declared tool functions can be called.
 
-### `config/settings.json`
+---
 
-Application behavior settings:
+## Architecture
 
-```json
-{
-  "max_large_files": 20,
-  "large_file_threshold_mb": 10,
-  "image_compress_quality": 75,
-  "require_confirmation_for_modifying": true
-}
+```
+main.py  (CLI loop)
+  └── agent/
+        parser.py    — command → ParsedIntent (regex, English)
+        safety.py    — path validation + intent-level guards
+        planner.py   — ParsedIntent → ExecutionPlan + ToolActions
+        executor.py  — ExecutionPlan → ExecutionResult (whitelist enforced)
+        reporter.py  — ExecutionResult → human-readable text
+
+  tools/
+        storage.py   — storage_report, list_large_files
+        files.py     — organize, rename, move, show_files, list_media
+        media.py     — convert_video_to_mp3, compress_images
+        backup.py    — backup_folder
+        duplicates.py— find_duplicates
+        system.py    — run_doctor
+
+  core/
+        config.py    — load settings + allowed_paths
+        paths.py     — resolve + validate paths
+        logging_db.py— SQLite history log, is_first_run()
+        exceptions.py— typed exception hierarchy
 ```
 
 ---
 
-## Running Tests
+## Running tests
 
 ```bash
 cd nabd
 python -m pytest tests/ -v
 ```
 
-Tests cover:
-- Intent detection for all supported commands
-- Path traversal prevention
-- Allowed path enforcement
-- Dry-run and actual file operations
-- Duplicate detection
-- Storage report accuracy
-- Executor whitelist enforcement
+237 tests across `test_parser.py`, `test_tools.py`, `test_safety.py`, `test_planner.py`, `test_executor.py`, `test_integration.py`, and `test_v2.py`.
 
 ---
 
-## Future Roadmap
+## Changelog
+
+### v0.2.0
+- `doctor` command — checks Python, ffmpeg, Pillow, allowed paths, history log
+- `show files in <path>` — browse directory with sort-by-name/size/date options
+- `list media in <path>` — list images/videos/audio grouped by type; supports `recursively`
+- Improved `help` output: grouped by category with practical examples
+- First-run onboarding message (shown once on a fresh install)
+- Better error messages with actionable hints per intent
+- Duplicate-results UX: first 5 groups shown in full, remainder summarised
+- `history` command: table view with status icons and timestamps
+- 82 new tests in `test_v2.py`
+
+### v0.1.0
+- Initial release: storage report, large files, organise, find duplicates, backup, video→MP3, compress images, rename, move
+- Safety-first: path allowlist, traversal blocking, dry-run preview, explicit confirmation
+- SQLite history log
+- 155 tests
+
+---
+
+## Roadmap
 
 - Optional local LLM integration for more flexible command parsing
-- Scheduled operations (cron-style)
+- Recursive duplicate deletion with keeper selection
 - Undo / rollback for recent modifying operations
-- Rich terminal UI (curses or Textual)
-- Recursive duplicate deletion with keepers selection
-- WhatsApp media cleanup tool
+- Scheduled operations (cron-style)
+- Rich terminal UI (Textual)
 - Smart photo deduplication (perceptual hashing)
-- Export operation history to CSV
+- WhatsApp media cleanup tool
+- Export history to CSV
 
 ---
 
