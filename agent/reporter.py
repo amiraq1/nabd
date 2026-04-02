@@ -3,7 +3,6 @@ from typing import Any
 from agent.models import ExecutionPlan, OperationStatus, ParsedIntent
 from tools.utils import truncate_list
 
-
 SEPARATOR = "─" * 55
 
 
@@ -15,7 +14,8 @@ def report_parsed_intent(intent: ParsedIntent) -> str:
     lines = [_section("PARSED INTENT")]
     lines.append(f"  Intent       : {intent.intent}")
     lines.append(f"  Source Path  : {intent.source_path or '(not specified)'}")
-    lines.append(f"  Target Path  : {intent.target_path or '(not specified)'}")
+    if intent.target_path:
+        lines.append(f"  Target Path  : {intent.target_path}")
     lines.append(f"  Risk Level   : {intent.risk_level.value.upper()}")
     lines.append(f"  Needs Confirm: {'Yes' if intent.requires_confirmation else 'No'}")
     if intent.options:
@@ -28,7 +28,7 @@ def report_plan(plan: ExecutionPlan) -> str:
     lines = [_section("EXECUTION PLAN")]
     lines.append(f"  Intent     : {plan.intent}")
     lines.append(f"  Risk Level : {plan.risk_level.value.upper()}")
-    lines.append(f"  Dry Run    : {'Yes' if plan.dry_run else 'No'}")
+    lines.append(f"  Dry Run    : {'Yes — preview only, no changes' if plan.dry_run else 'No'}")
     lines.append(f"  Preview    : {plan.preview_summary}")
     lines.append(f"  Actions    : {len(plan.actions)}")
     for i, action in enumerate(plan.actions, 1):
@@ -79,7 +79,30 @@ def report_result(result: Any, intent_name: str, confirmed: bool) -> str:
 
 
 def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) -> None:
-    if intent == "storage_report":
+
+    if intent == "doctor":
+        checks = raw.get("checks", [])
+        ok = raw.get("ok_count", 0)
+        warn = raw.get("warn_count", 0)
+        err = raw.get("error_count", 0)
+        overall = raw.get("overall", "?")
+
+        icon_map = {"ok": "✓", "warn": "⚠", "missing": "✗", "error": "✗"}
+        lines.append("")
+        for check in checks:
+            icon = icon_map.get(check["status"], "?")
+            lines.append(f"  {icon}  {check['name']:<30} {check['detail']}")
+
+        lines.append("")
+        summary_parts = [f"{ok} ok"]
+        if warn:
+            summary_parts.append(f"{warn} warning{'s' if warn != 1 else ''}")
+        if err:
+            summary_parts.append(f"{err} issue{'s' if err != 1 else ''}")
+        overall_label = {"ok": "All checks passed.", "warn": "Ready with warnings.", "error": "Action required."}.get(overall, "")
+        lines.append(f"  Summary: {', '.join(summary_parts)}. {overall_label}")
+
+    elif intent == "storage_report":
         lines.append(f"\n  Directory    : {raw.get('directory', '')}")
         lines.append(f"  Total Size   : {raw.get('total_size_human', '')}")
         lines.append(f"  Files        : {raw.get('file_count', 0)}")
@@ -101,6 +124,55 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         if extra:
             lines.append(f"    ... and {extra} more")
 
+    elif intent == "show_files":
+        entries = raw.get("entries", [])
+        total = raw.get("total_entries", 0)
+        file_count = raw.get("file_count", 0)
+        dir_count = raw.get("dir_count", 0)
+        truncated = raw.get("truncated", 0)
+        sort_by = raw.get("sort_by", "name")
+
+        lines.append(f"\n  Directory : {raw.get('directory', '')}")
+        lines.append(f"  Contents  : {file_count} file(s), {dir_count} folder(s)  (sorted by {sort_by})")
+        lines.append("")
+
+        for entry in entries:
+            if entry["is_dir"]:
+                lines.append(f"    {'DIR':>10}  📁 {entry['name']}/")
+            else:
+                lines.append(f"    {entry['size_human']:>10}  {entry['name']}")
+
+        if truncated:
+            lines.append(f"\n    ... and {truncated} more entries (use 'limit N' to see more)")
+
+    elif intent == "list_media":
+        summary = raw.get("summary", {})
+        groups = raw.get("groups", {})
+        total = raw.get("total_media_count", 0)
+        total_size = raw.get("total_size_human", "0 B")
+        directory = raw.get("directory", "")
+        recursive = raw.get("recursive", False)
+
+        lines.append(f"\n  Directory : {directory}{'  (recursive)' if recursive else ''}")
+        lines.append(f"  Total     : {total} media file(s), {total_size}")
+        lines.append("")
+
+        CATEGORY_LABELS = {"images": "Images", "videos": "Videos", "audio": "Audio"}
+        for cat, label in CATEGORY_LABELS.items():
+            info = summary.get(cat, {})
+            count = info.get("count", 0)
+            size = info.get("total_size_human", "0 B")
+            items = groups.get(cat, [])
+            if count == 0:
+                lines.append(f"  {label:<8}: (none)")
+                continue
+            lines.append(f"  {label:<8}: {count} file(s), {size}")
+            shown, extra = truncate_list(items, 10)
+            for item in shown:
+                lines.append(f"    {item['size_human']:>10}  {item['name']}")
+            if extra:
+                lines.append(f"    ... and {extra} more")
+
     elif intent == "organize_folder_by_type":
         moves = raw.get("planned_moves", [])
         skipped = raw.get("skipped", [])
@@ -114,22 +186,42 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             lines.append(f"  Would skip  : {len(skipped)} (already in correct folder)")
             shown, extra = truncate_list(moves, 10)
             for m in shown:
-                lines.append(f"    {m.get('source', '')} → {m.get('destination', '')}")
+                src_name = m.get("source", "").split("/")[-1]
+                dest_dir = "/".join(m.get("destination", "").split("/")[:-1]).split("/")[-1]
+                lines.append(f"    {src_name}  →  {dest_dir}/")
             if extra:
                 lines.append(f"    ... and {extra} more")
 
     elif intent == "find_duplicates":
         groups = raw.get("duplicate_groups", [])
         total_wasted = raw.get("total_wasted_human", "0 B")
-        lines.append(f"\n  Duplicate groups : {len(groups)}")
+        total_groups = raw.get("total_groups", 0)
+        total_files = sum(len(g.get("paths", [])) for g in groups)
+
+        lines.append(f"\n  Duplicate groups : {total_groups}")
+        lines.append(f"  Duplicate files  : {total_files}")
         lines.append(f"  Wasted space     : {total_wasted}")
-        shown, extra = truncate_list(groups, 5)
-        for g in shown:
-            lines.append(f"\n  Group ({g.get('file_size_human', '?')} × {len(g.get('paths', []))} files):")
-            for p in g.get("paths", []):
+
+        if total_groups == 0:
+            lines.append("\n  No duplicates found.")
+            return
+
+        # Show first 5 groups in full, summarize the rest
+        shown_groups, extra_groups = truncate_list(groups, 5)
+        lines.append("")
+        for i, g in enumerate(shown_groups, 1):
+            size_human = g.get("file_size_human", "?")
+            paths = g.get("paths", [])
+            lines.append(f"  Group {i}  ({size_human} × {len(paths)} copies):")
+            shown_paths, extra_paths = truncate_list(paths, 4)
+            for p in shown_paths:
                 lines.append(f"    • {p}")
-        if extra:
-            lines.append(f"  ... and {extra} more groups")
+            if extra_paths:
+                lines.append(f"    ... and {extra_paths} more copies")
+
+        if extra_groups:
+            lines.append(f"\n  ... and {extra_groups} more group(s) not shown.")
+            lines.append("  Tip: use 'storage report' to see space usage by category.")
 
     elif intent == "backup_folder":
         lines.append(f"\n  Source      : {raw.get('source', '')}")
@@ -155,6 +247,12 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             lines.append(f"  Compressed : {len(compressed)} image(s)")
         else:
             lines.append(f"  Would compress : {len(planned)} image(s)")
+            if planned:
+                shown, extra = truncate_list(planned, 5)
+                for p in shown:
+                    lines.append(f"    • {p.split('/')[-1]}")
+                if extra:
+                    lines.append(f"    ... and {extra} more")
 
     elif intent == "safe_rename_files":
         planned = raw.get("planned_renames", [])
@@ -163,9 +261,11 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             lines.append(f"\n  Renamed : {len(renamed)} file(s)")
         else:
             lines.append(f"\n  Would rename : {len(planned)} file(s)")
-            shown, extra = truncate_list(planned, 10)
+            shown, extra = truncate_list(planned, 8)
             for r in shown:
-                lines.append(f"    {r.get('source', '')} → {r.get('destination', '')}")
+                src = r.get("source", "").split("/")[-1]
+                dst = r.get("destination", "").split("/")[-1]
+                lines.append(f"    {src}  →  {dst}")
             if extra:
                 lines.append(f"    ... and {extra} more")
 
@@ -176,4 +276,6 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             lines.append(f"\n  Moved : {len(moved)} item(s)")
         else:
             if isinstance(planned, dict):
-                lines.append(f"\n  Would move : {planned.get('source', '')} → {planned.get('destination', '')}")
+                src = planned.get("source", "").split("/")[-1]
+                dst = planned.get("destination", "")
+                lines.append(f"\n  Would move : {src}  →  {dst}")
