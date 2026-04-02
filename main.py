@@ -28,7 +28,7 @@ from core.logging_db import log_operation
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
-║              Nabd  v0.2.0                        ║
+║              Nabd  v0.2.1                        ║
 ║   Local Phone Operations Agent for Termux        ║
 ╚══════════════════════════════════════════════════╝"""
 
@@ -51,7 +51,7 @@ RETURNING_HINT = "  Type 'help' for commands  |  'history' for recent runs  |  '
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
-  NABD COMMANDS  (v0.2)
+  NABD COMMANDS  (v0.2.1)
 ────────────────────────────────────────────────────
 
   DIAGNOSTICS
@@ -115,11 +115,49 @@ HELP_TEXT = """
   OTHER
     help     — show this message
     exit     — quit Nabd
+
+────────────────────────────────────────────────────
+  NABD VS TERMUX SHELL
+────────────────────────────────────────────────────
+  Nabd is not a shell. Common shell commands are not
+  supported here. Type 'exit' to return to Termux.
+
+  Shell → Nabd equivalent:
+    ls <path>     →  show files in <path>
+    find <path>   →  find duplicates <path>
+    du <path>     →  storage report <path>
+    mv <f> <d>    →  move <f> to <d>
+    cp -r <s> <d> →  back up <s> to <d>
 ────────────────────────────────────────────────────
 """
 
 EXIT_COMMANDS = {"exit", "quit", "q", "bye"}
 HISTORY_COMMANDS = {"history", "hist"}
+
+# Shell commands that users might accidentally type inside Nabd
+SHELL_COMMANDS: dict[str, str] = {
+    "ls":    "  Nabd equivalent: show files in /sdcard/Download",
+    "ll":    "  Nabd equivalent: show files in /sdcard/Download sorted by size",
+    "dir":   "  Nabd equivalent: show files in /sdcard/Download",
+    "cd":    "  Nabd does not track a current directory.\n  Use a full path in each command, e.g. show files in /sdcard/Download",
+    "pwd":   "  Nabd does not track a current directory.\n  Use full absolute paths, e.g. /sdcard/Download",
+    "mkdir": "  Nabd does not create empty directories.\n  Directories are created automatically during organize and back up.",
+    "rm":    "  Nabd does not delete files — your data is safe.",
+    "rmdir": "  Nabd does not delete directories — your data is safe.",
+    "mv":    "  Nabd equivalent: move /sdcard/Download/file.txt to /sdcard/Documents",
+    "cp":    "  Nabd equivalent: back up /sdcard/Documents to /sdcard/Backup",
+    "find":  "  Nabd equivalents:\n    find duplicates /sdcard/Download\n    show files in /sdcard/Download",
+    "grep":  "  Nabd does not search inside file contents.",
+    "cat":   "  Nabd does not display file contents.",
+    "less":  "  Nabd does not display file contents.",
+    "du":    "  Nabd equivalent: storage report /sdcard/Download",
+    "df":    "  Nabd equivalent: storage report /sdcard/Download",
+    "chmod": "  Nabd does not change file permissions.",
+    "chown": "  Nabd does not change file ownership.",
+    "touch": "  Nabd does not create empty files.",
+    "stat":  "  Nabd equivalent: show files in /sdcard/Download",
+    "tree":  "  Nabd equivalent: show files in /sdcard/Download",
+}
 
 
 def prompt_confirmation(plan_summary: str, risk_label: str) -> bool:
@@ -287,6 +325,19 @@ def main() -> None:
 
         if command.lower() in {"help", "?"}:
             print(HELP_TEXT)
+            continue
+
+        # Friendly message for accidental shell commands
+        first_word = command.split()[0].lower() if command.split() else ""
+        if first_word in SHELL_COMMANDS:
+            hint = SHELL_COMMANDS[first_word]
+            print(
+                f"\n  [i] '{first_word}' is a shell command — Nabd is not a shell."
+                f"\n\n{hint}"
+                f"\n\n  Type 'exit' to return to Termux for shell use."
+                f"\n  Type 'help' to see all Nabd commands."
+            )
+            log_operation(command, None, None, "shell_command_hint")
             continue
 
         run_command(command)
