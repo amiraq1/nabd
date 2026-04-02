@@ -526,7 +526,8 @@ class TestExecutorWhitelist(unittest.TestCase):
     def test_browser_functions_whitelisted(self):
         from agent.executor import WHITELISTED_FUNCTIONS
         self.assertIn("browser", WHITELISTED_FUNCTIONS)
-        expected = {"browser_search", "browser_extract_text", "browser_list_links"}
+        expected = {"browser_search", "browser_extract_text", "browser_list_links",
+                    "browser_page_title"}
         self.assertEqual(WHITELISTED_FUNCTIONS["browser"], expected)
 
     def test_unlisted_phone_function_blocked(self):
