@@ -210,6 +210,30 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
                 f"\n          list media in {directory} recursively"
             )
 
+    elif intent == "show_folders":
+        directory = raw.get("directory", "")
+        folder_count = raw.get("folder_count", 0)
+        folders = raw.get("folders", [])
+        errors = raw.get("errors", [])
+        lines.append(f"\n  Directory  : {directory}")
+        lines.append(f"  Subfolders : {folder_count}")
+        if folder_count == 0:
+            lines.append("\n  No subfolders found.")
+        else:
+            lines.append("")
+            shown, extra = truncate_list(folders, 20)
+            for folder in shown:
+                name = folder.get("name", "")
+                count = folder.get("item_count")
+                count_str = f"({count} item{'s' if count != 1 else ''})" if count is not None else "(unreadable)"
+                lines.append(f"    {name + '/':<30} {count_str}")
+            if extra:
+                lines.append(f"    ... and {extra} more")
+        if errors:
+            lines.append("\n  Errors:")
+            for e in errors:
+                lines.append(f"    ! {e}")
+
     elif intent == "organize_folder_by_type":
         moves = raw.get("planned_moves", [])
         skipped = raw.get("skipped", [])
@@ -423,6 +447,23 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
                 lines.append(f"\n  You can copy this URL and open it manually:")
                 lines.append(f"     {search_url}")
             lines.append("  Hint: Install termux-api: pkg install termux-api")
+
+    elif intent == "browser_page_title":
+        success = raw.get("success", False)
+        url = raw.get("url", "?")
+        if not success:
+            error_type = raw.get("error_type", "")
+            if error_type == "tls":
+                lines.extend(_tls_fallback_lines(url))
+            else:
+                lines.append(f"\n  ✗  Could not fetch: {url}")
+                error = raw.get("error", "")
+                if error:
+                    lines.append(f"     {error}")
+            return
+        title = raw.get("title", "")
+        lines.append(f"\n  URL   : {url}")
+        lines.append(f"  Title : {title if title else '(no title found)'}")
 
     elif intent == "browser_extract_text":
         success = raw.get("success", False)
