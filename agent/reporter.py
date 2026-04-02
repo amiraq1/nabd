@@ -398,10 +398,18 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         success = raw.get("success", False)
         url = raw.get("url", "?")
         if not success:
-            lines.append(f"\n  ✗  Could not fetch: {url}")
-            error = raw.get("error", "")
-            if error:
-                lines.append(f"     {error}")
+            error_type = raw.get("error_type", "")
+            if error_type == "tls":
+                lines.append(f"\n  ✗  SSL certificate error — cannot fetch: {url}")
+                lines.append("     The local CA trust store is missing or incomplete.")
+                lines.append("     What still works:  open https://...  |  search for ...")
+                lines.append("     Fix (Termux):      pkg install ca-certificates")
+                lines.append("     Verify:            run 'doctor'")
+            else:
+                lines.append(f"\n  ✗  Could not fetch: {url}")
+                error = raw.get("error", "")
+                if error:
+                    lines.append(f"     {error}")
             return
         text = raw.get("text", "")
         char_count = raw.get("char_count", 0)
@@ -423,10 +431,18 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         success = raw.get("success", False)
         url = raw.get("url", "?")
         if not success:
-            lines.append(f"\n  ✗  Could not fetch: {url}")
-            error = raw.get("error", "")
-            if error:
-                lines.append(f"     {error}")
+            error_type = raw.get("error_type", "")
+            if error_type == "tls":
+                lines.append(f"\n  ✗  SSL certificate error — cannot fetch: {url}")
+                lines.append("     The local CA trust store is missing or incomplete.")
+                lines.append("     What still works:  open https://...  |  search for ...")
+                lines.append("     Fix (Termux):      pkg install ca-certificates")
+                lines.append("     Verify:            run 'doctor'")
+            else:
+                lines.append(f"\n  ✗  Could not fetch: {url}")
+                error = raw.get("error", "")
+                if error:
+                    lines.append(f"     {error}")
             return
         links = raw.get("links", [])
         link_count = raw.get("link_count", 0)
