@@ -84,8 +84,8 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"list\s+(?:sub)?folders?\s+in\b",
         r"list\s+(?:sub)?director(?:y|ies)\s+in\b",
         r"show\s+(?:sub)?director(?:y|ies)\s+in\b",
-        r"what\s+folders?\s+(?:are\s+)?in\b",
-        r"what\s+(?:sub)?director(?:y|ies)\s+(?:are\s+)?in\b",
+        r"what\s+folders?\s+(?:(?:is|are)\s+)?in\b",
+        r"what\s+(?:sub)?director(?:y|ies)\s+(?:(?:is|are)\s+)?in\b",
     ]),
     ("show_files", [
         r"show\s+files?\s+in\b",
