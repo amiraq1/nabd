@@ -532,7 +532,7 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 ### v0.4.1
 - **Browser TLS resilience**: `_fetch_html` now distinguishes SSL certificate errors (`error_type="tls"`) from plain network failures (`error_type="network"`)
 - **Actionable TLS error messages**: when `extract text` or `list links` fails with an SSL error, Nabd shows the exact fix (`pkg install ca-certificates`) and confirms that `open https://...` and `search for` are unaffected
-- **Reporter TLS hint**: `browser_extract_text` and `browser_list_links` display a structured, five-line TLS guidance block instead of a raw error string
+- **Browser-safe fallback UX**: when `browser_extract_text` or `browser_list_links` fails with a TLS error, Nabd presents a structured environment-error block with two concrete alternative commands — `open <the-exact-url>` and `search for <domain>` — so the user can act immediately without needing to edit anything; the block also states the fix and that `open`/`search` are unaffected
 - **`check_browser_tls()` function** added to `tools/browser.py`: attempts a real HTTPS fetch, distinguishes TLS failures from offline/no-network states, returns `{"status": "ok"|"warn"|"error", "detail": "..."}`
 - **Doctor check #6** (`HTTPS / CA certificates`): `run_doctor()` now calls `check_browser_tls()` and reports TLS status alongside the existing five checks
 - **`error_type` field** added to all three browser tool result dicts (`browser_extract_text`, `browser_list_links`, `browser_search`)
