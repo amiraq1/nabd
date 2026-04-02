@@ -246,12 +246,24 @@ def list_media(
 
     total_count = sum(len(v) for v in groups.values())
 
+    # Detect subdirectories so the reporter can suggest 'recursively' when 0 media found
+    has_subdirs = False
+    if not recursive:
+        try:
+            for _entry in os.scandir(directory):
+                if _entry.is_dir(follow_symlinks=False):
+                    has_subdirs = True
+                    break
+        except (OSError, PermissionError):
+            pass
+
     return {
         "directory": directory,
         "recursive": recursive,
         "total_media_count": total_count,
         "total_size_human": human_readable_size(total_size),
         "total_size_bytes": total_size,
+        "has_subdirs": has_subdirs,
         "groups": groups,
         "summary": summary,
         "errors": errors,
