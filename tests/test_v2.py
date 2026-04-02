@@ -193,7 +193,7 @@ class TestRunDoctor:
 
     def test_checks_count(self):
         result = run_doctor()
-        assert len(result["checks"]) == 5
+        assert len(result["checks"]) == 6
 
     def test_check_names_present(self):
         result = run_doctor()
