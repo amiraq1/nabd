@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nabd v0.2 — Local phone operations agent for Android/Termux.
+Nabd v0.4 — Local phone operations agent for Android/Termux.
 Interactive CLI entry point.
 """
 
@@ -28,7 +28,7 @@ from core.logging_db import log_operation
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
-║              Nabd  v0.2.1                        ║
+║              Nabd  v0.4                          ║
 ║   Local Phone Operations Agent for Termux        ║
 ╚══════════════════════════════════════════════════╝"""
 
@@ -42,6 +42,12 @@ ONBOARDING = """
     find duplicates /sdcard/Download      — find duplicate files
     organize /sdcard/Download             — sort files into subfolders
     back up /sdcard/Documents to /sdcard/Backup
+    show battery status                   — check battery (needs termux-api)
+    show network status                   — check wifi (needs termux-api)
+    open chrome                           — launch Chrome browser
+    search for local llm tools            — open a web search
+    open https://example.com              — open a URL in browser
+    extract text from https://example.com — read a page's text
 
   Type 'help' for the full command list.
   Type 'exit' to quit.
@@ -51,7 +57,7 @@ RETURNING_HINT = "  Type 'help' for commands  |  'history' for recent runs  |  '
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
-  NABD COMMANDS  (v0.2.1)
+  NABD COMMANDS  (v0.4)
 ────────────────────────────────────────────────────
 
   DIAGNOSTICS
@@ -107,6 +113,39 @@ HELP_TEXT = """
   MOVE
     move /sdcard/Download/file.txt to /sdcard/Documents
       Move a file or folder to a new location.
+
+  PHONE  (requires termux-api: pkg install termux-api)
+    show battery status
+      Check battery level, status, health, and temperature.
+
+    show network status
+      Check wifi connection name, IP, and signal.
+
+    open chrome
+    open settings
+    open files
+    open camera
+    open gallery
+    open calculator
+      Launch a supported Android app.
+      Asks for confirmation before opening URL / file.
+
+    open https://example.com
+      Open a URL in the default browser.
+
+    open file /sdcard/Download/report.pdf
+      Open a local file in the appropriate app.
+
+  BROWSER
+    search for local llm tools
+    google for android tips
+      Open a web search in the default browser.
+
+    extract text from https://example.com
+      Fetch a page and return its readable text (no account needed).
+
+    list links from https://example.com
+      Fetch a page and list all links found on it.
 
   HISTORY
     history
