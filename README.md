@@ -290,11 +290,96 @@ cd nabd
 python -m pytest tests/ -v
 ```
 
-237 tests across `test_parser.py`, `test_tools.py`, `test_safety.py`, `test_planner.py`, `test_executor.py`, `test_integration.py`, and `test_v2.py`.
+267 tests across `test_parser.py`, `test_tools.py`, `test_safety.py`, `test_planner.py`, `test_executor.py`, `test_integration.py`, and `test_v2.py`.
+
+---
+
+## Troubleshooting
+
+### "Path is outside all allowed directories"
+
+Nabd only operates inside the paths listed in `config/allowed_paths.json`.
+
+```bash
+# Check which paths are allowed:
+cat config/allowed_paths.json
+
+# Add a new root — edit the file and add your path:
+nano config/allowed_paths.json
+```
+
+Also confirm that storage permission has been granted in Termux:
+
+```bash
+termux-setup-storage
+```
+
+---
+
+### "No media found" but files exist in subfolders
+
+By default `list media` only checks the top-level folder. Add `recursively` to scan subfolders:
+
+```
+list media in /sdcard/Download recursively
+```
+
+Nabd will also show this hint automatically when it detects subdirectories in the scanned folder.
+
+---
+
+### ffmpeg not found
+
+The `convert video to mp3` command requires ffmpeg. Install it with:
+
+```bash
+pkg install ffmpeg
+```
+
+Then run `doctor` inside Nabd to confirm it is found.
+
+---
+
+### Pillow not found
+
+The `compress images` command requires Pillow. Install it with:
+
+```bash
+pip install Pillow
+```
+
+---
+
+### "I typed `ls` and nothing happened"
+
+Nabd is not a shell. Common shell commands (`ls`, `cd`, `find`, `mv`, `rm`, …) will show a friendly message with the Nabd equivalent instead of executing.
+
+| Shell | Nabd |
+|---|---|
+| `ls /sdcard/Download` | `show files in /sdcard/Download` |
+| `find /sdcard/Download` | `find duplicates /sdcard/Download` |
+| `du /sdcard/Download` | `storage report /sdcard/Download` |
+| `mv file.txt /sdcard/Docs` | `move /sdcard/Download/file.txt to /sdcard/Documents` |
+| `cp -r /sdcard/Docs /sdcard/Bak` | `back up /sdcard/Documents to /sdcard/Backup` |
+
+Type `exit` to return to Termux for direct shell use.
+
+---
+
+### History database error
+
+If the history log can't be written, check that the `data/` directory inside the Nabd folder is writable. Run `doctor` to confirm.
 
 ---
 
 ## Changelog
+
+### v0.2.1
+- `list media` now shows a hint suggesting `recursively` when 0 media are found but subfolders exist
+- Shell commands (`ls`, `cd`, `mkdir`, `find`, `rm`, `mv`, …) now return a friendly message with the Nabd equivalent instead of "command not recognised"
+- `help` includes a "Nabd vs Termux shell" quick-reference table
+- New troubleshooting section in README
+- 30 new tests (267 total)
 
 ### v0.2.0
 - `doctor` command — checks Python, ffmpeg, Pillow, allowed paths, history log
