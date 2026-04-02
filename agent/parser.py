@@ -1,0 +1,183 @@
+import os
+import re
+from typing import Optional
+
+from agent.models import ParsedIntent, RiskLevel
+from core.exceptions import UnknownIntentError
+
+
+INTENT_PATTERNS: list[tuple[str, list[str]]] = [
+    ("storage_report", [
+        r"storage\s+report", r"disk\s+usage", r"how\s+much\s+space",
+        r"storage\s+status", r"تقرير.*تخزين", r"استخدام.*مساحة",
+        r"كم.*مساحة", r"وضع.*تخزين", r"مساحة.*القرص",
+    ]),
+    ("list_large_files", [
+        r"large\s+files?", r"biggest?\s+files?", r"largest?\s+files?",
+        r"top\s+\d*\s*files?", r"show.*files.*size", r"what.*taking.*space",
+        r"أكبر.*ملفات?", r"ملفات.*كبيرة", r"اعرض.*ملفات.*كبيرة",
+        r"الملفات.*الأكبر", r"عرض.*أكبر", r"أي.*ملفات.*تأخذ",
+    ]),
+    ("organize_folder_by_type", [
+        r"organiz(?:e|ing)\b", r"\bsort\s+files?\b", r"\barrange\s+files?\b",
+        r"\btidy\s+(?:up\s+)?files?\b", r"clean\s+up\s+(?:the\s+)?folder",
+        r"رتّب", r"رتب", r"نظّم", r"نظم", r"صنّف", r"اعمل.*نظام",
+        r"رتب.*مجلد", r"نظم.*مجلد", r"تنظيم.*مجلد",
+    ]),
+    ("find_duplicates", [
+        r"duplicates?", r"duplicate\s+files?", r"repeated\s+files?",
+        r"find.*same\s+files?", r"identical\s+files?",
+        r"مكرر", r"مكررة", r"ملفات.*مكررة", r"ابحث.*مكرر",
+        r"الملفات.*المتكررة", r"ملفات.*متشابهة",
+    ]),
+    ("backup_folder", [
+        r"back\s*up\b", r"\bbackup\b", r"copy\s+folder", r"make.*copy",
+        r"احتياطي", r"نسخة.*احتياطية", r"انسخ.*احتياط",
+        r"نسخ.*احتياطي", r"احفظ.*نسخة",
+    ]),
+    ("convert_video_to_mp3", [
+        r"convert.*(?:video|mp4|mkv|avi|mov)\b.*(?:mp3|audio)\b",
+        r"extract.*audio\b", r"(?:mp3|audio)\s+from\b",
+        r"to\s+mp3\b", r"as\s+mp3\b",
+        r"حوّل.*(?:فيديو|mp4|mkv|avi).*(?:mp3|صوت)",
+        r"حول.*(?:فيديو|فيلم).*(?:mp3|صوت)",
+        r"استخرج.*صوت", r"تحويل.*فيديو.*صوت", r"إلى.*mp3",
+    ]),
+    ("compress_images", [
+        r"compress\s+images?", r"resize\s+images?", r"shrink\s+images?",
+        r"optimize\s+images?", r"reduce\s+image\s+size",
+        r"ضغط.*صور", r"اضغط.*صور", r"تصغير.*صور", r"ضغّط.*صور",
+    ]),
+    ("safe_rename_files", [
+        r"rename\s+files?", r"batch\s+rename",
+        r"إعادة.*تسمية", r"غيّر.*(?:اسم|أسماء)", r"أعد.*تسمية",
+    ]),
+    ("safe_move_files", [
+        r"move\s+(?:the\s+)?(?:file|folder|directory)\b",
+        r"move\s+/", r"transfer\s+files?\b",
+        r"انقل", r"نقل.*ملفات?", r"انقل.*مجلد",
+    ]),
+]
+
+MODIFYING_INTENTS = {
+    "organize_folder_by_type",
+    "backup_folder",
+    "convert_video_to_mp3",
+    "compress_images",
+    "safe_rename_files",
+    "safe_move_files",
+}
+
+HIGH_RISK_INTENTS = {
+    "compress_images",
+    "safe_rename_files",
+}
+
+_PATH_RE = re.compile(r'(?:^|[\s"\'])(/[^\s"\'،,\u060C]+)')
+_QUOTED_RE = re.compile(r'["\']([^"\']+)["\']')
+_TO_SEP_RE = re.compile(
+    r'(?:\bto\b|\bإلى\b|\bإلي\b)'
+    r'\s+["\']?(/[^\s"\'،,\u060C]+)["\']?',
+    re.IGNORECASE
+)
+
+
+def detect_intent(command: str) -> str:
+    text = command.lower().strip()
+    for intent_name, patterns in INTENT_PATTERNS:
+        for pattern in patterns:
+            if re.search(pattern, text):
+                return intent_name
+    raise UnknownIntentError(
+        f"Could not determine intent from command: '{command}'\n"
+        "  Tip: type 'help' to see supported commands."
+    )
+
+
+def _extract_all_paths(command: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    for m in _QUOTED_RE.finditer(command):
+        candidate = m.group(1).strip()
+        if candidate.startswith("/") and candidate not in seen:
+            paths.append(candidate)
+            seen.add(candidate)
+
+    for m in _PATH_RE.finditer(command):
+        candidate = m.group(1).strip().rstrip(".,;)،")
+        if candidate not in seen:
+            paths.append(candidate)
+            seen.add(candidate)
+
+    return paths
+
+
+def _extract_source_target(command: str) -> tuple[Optional[str], Optional[str]]:
+    to_match = _TO_SEP_RE.search(command)
+    if to_match:
+        target_path = to_match.group(1).strip().rstrip(".,;)،")
+        all_paths = _extract_all_paths(command)
+        source_path = None
+        for p in all_paths:
+            if p != target_path:
+                source_path = p
+                break
+        if source_path is None and all_paths:
+            source_path = all_paths[0]
+        return source_path, target_path
+
+    all_paths = _extract_all_paths(command)
+    if len(all_paths) >= 2:
+        return all_paths[0], all_paths[1]
+    elif len(all_paths) == 1:
+        return all_paths[0], None
+    return None, None
+
+
+def extract_options(command: str, intent: str) -> dict:
+    options: dict = {}
+
+    top_n_match = re.search(r"(?:top|أكبر|أعلى)\s+(\d+)", command, re.IGNORECASE)
+    if top_n_match:
+        options["top_n"] = int(top_n_match.group(1))
+
+    if intent == "safe_rename_files":
+        prefix_match = re.search(r"prefix\s+[\"']?(\S+)[\"']?", command, re.IGNORECASE)
+        suffix_match = re.search(r"suffix\s+[\"']?(\S+)[\"']?", command, re.IGNORECASE)
+        if prefix_match:
+            options["prefix"] = prefix_match.group(1)
+        if suffix_match:
+            options["suffix"] = suffix_match.group(1)
+
+    if intent == "compress_images":
+        quality_match = re.search(r"quality\s+(\d+)", command, re.IGNORECASE)
+        if quality_match:
+            q = int(quality_match.group(1))
+            options["quality"] = max(1, min(95, q))
+
+    return options
+
+
+def parse_command(command: str) -> ParsedIntent:
+    command = command.strip()
+    intent = detect_intent(command)
+    source_path, target_path = _extract_source_target(command)
+    options = extract_options(command, intent)
+
+    is_modifying = intent in MODIFYING_INTENTS
+    is_high_risk = intent in HIGH_RISK_INTENTS
+
+    risk_level = RiskLevel.LOW
+    if is_modifying:
+        risk_level = RiskLevel.HIGH if is_high_risk else RiskLevel.MEDIUM
+
+    return ParsedIntent(
+        intent=intent,
+        source_path=source_path,
+        target_path=target_path,
+        options=options,
+        risk_level=risk_level,
+        requires_confirmation=is_modifying,
+        raw_command=command,
+    )
