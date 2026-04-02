@@ -4,16 +4,17 @@ A local-first, safety-first phone operations agent for Android/Termux.
 
 Nabd accepts natural-language commands in English, turns them into structured intents, validates every path against an allowlist, shows a preview before making any change, and asks for confirmation before anything modifying is applied.
 
-**v0.2.0** — 237 tests passing.
+**v0.4** — 397 tests passing.
 
 ---
 
 ## Design principles
 
-- **Local-only** — no cloud, no network, no external AI APIs.
-- **Safety first** — every path is checked against `config/allowed_paths.json`. Path traversal (`..`) is blocked at the parser.
+- **Local-only** — no cloud, no network, no external AI APIs required for core functionality.
+- **Safety first** — every path is checked against `config/allowed_paths.json`. Path traversal (`..`) is blocked at the parser. URL schemes are validated (only `https://` and `http://` permitted).
 - **Preview before apply** — modifying operations run a dry-run pass first. You see exactly what will change.
-- **Explicit confirmation** — you type `y` before any file is moved, renamed, or overwritten.
+- **Explicit confirmation** — you type `y` before any file is moved, renamed, or overwritten, or before a URL/file is opened.
+- **Whitelisted execution** — only explicitly declared tool functions can be called. No arbitrary shell execution. No arbitrary browser automation.
 - **English-only** — clean input; no multi-language ambiguity.
 
 ---
@@ -25,6 +26,7 @@ Nabd accepts natural-language commands in English, turns them into structured in
 | Python 3.10+ | core runtime | built-in on Termux |
 | ffmpeg | video → MP3 conversion | `pkg install ffmpeg` |
 | Pillow | image compression | `pip install Pillow` |
+| termux-api | phone/browser commands | `pkg install termux-api` |
 
 Run `doctor` inside Nabd to check all dependencies at once.
 
@@ -40,6 +42,12 @@ git clone https://github.com/amiraq1/nabd
 cd nabd
 pip install -r requirements.txt
 python main.py
+```
+
+For phone and browser commands, also install termux-api:
+
+```bash
+pkg install termux-api
 ```
 
 ---
@@ -184,6 +192,110 @@ Shows your 20 most recent commands with status, timestamp, and intent.
 
 ---
 
+### Phone — status
+
+```
+show battery status
+battery level
+```
+Returns battery percentage, charging status, health, and temperature.
+Requires `termux-api` (`pkg install termux-api`). Read-only, no confirmation.
+
+```
+show network status
+wifi status
+connection info
+```
+Returns SSID, IP address, link speed, and signal strength.
+Requires `termux-api`. Read-only, no confirmation.
+
+---
+
+### Phone — launch app
+
+```
+open chrome
+open settings
+open files
+open camera
+open gallery
+open calculator
+```
+Launches a supported Android app using a safe, fixed command.
+Unsupported app names are rejected with a list of supported names.
+**No confirmation required.** Medium risk.
+
+---
+
+### Phone — open URL
+
+```
+open https://example.com
+visit https://github.com
+go to https://wikipedia.org
+```
+Opens a URL in the default browser via `termux-open-url`.
+Only `https://` and `http://` schemes are accepted.
+`javascript:`, `file:`, `intent:`, `data:` and similar are always blocked.
+**Asks for confirmation before opening.**
+
+---
+
+### Phone — open file
+
+```
+open file /sdcard/Download/report.pdf
+open /sdcard/Pictures/photo.jpg
+```
+Opens a local file in the appropriate app via `termux-open`.
+Path must be inside the allowed roots in `config/allowed_paths.json`.
+**Asks for confirmation before opening.**
+
+---
+
+### Browser — search
+
+```
+search for local llm tools
+google android tips
+look up termux api commands
+```
+Constructs a Google search URL and opens it in the default browser.
+No web request is made by Nabd itself — the browser handles it.
+No confirmation required.
+
+---
+
+### Browser — extract text
+
+```
+extract text from https://example.com
+get text from https://example.com
+read page from https://example.com
+```
+Fetches the URL using Python's standard `urllib` (no external libraries) and
+returns the page's readable text with HTML tags stripped.
+Returns up to 3,000 characters. Read-only, no confirmation.
+
+**Limitations:**
+- Only works on publicly accessible pages (no login required).
+- Does not execute JavaScript — fetches raw HTML only.
+- Some pages may block automated fetches.
+
+---
+
+### Browser — list links
+
+```
+list links from https://example.com
+find links on https://example.com
+```
+Fetches the URL and returns all unique links found in `<a href>` elements.
+Returns up to 50 links. Relative links are resolved to absolute URLs.
+Read-only, no confirmation.
+
+---
+
 ## Session example
 
 ```
@@ -290,7 +402,7 @@ cd nabd
 python -m pytest tests/ -v
 ```
 
-267 tests across `test_parser.py`, `test_tools.py`, `test_safety.py`, `test_planner.py`, `test_executor.py`, `test_integration.py`, and `test_v2.py`.
+397 tests across `test_parser.py`, `test_tools.py`, `test_safety.py`, `test_planner.py`, `test_executor.py`, `test_integration.py`, `test_v2.py`, and `test_v4_phone_browser.py`.
 
 ---
 
@@ -373,6 +485,20 @@ If the history log can't be written, check that the `data/` directory inside the
 ---
 
 ## Changelog
+
+### v0.4
+- **Phone status**: `show battery status`, `show network status` (via termux-api JSON)
+- **Launch app**: `open chrome`, `open settings`, `open files`, `open camera`, `open gallery`, `open calculator` — fixed safe allowlist, no arbitrary packages
+- **Open URL**: `open https://...` — validates scheme (https/http only), blocks javascript:, file:, intent:, data:, vbscript:; confirms before opening
+- **Open file**: `open file /path` — validates against allowed roots; confirms before opening
+- **Browser search**: `search for X`, `google X`, `look up X` — constructs search URL, opens in browser
+- **Browser extract text**: `extract text from https://...` — stdlib fetch, HTML tag stripping, up to 3,000 chars
+- **Browser list links**: `list links from https://...` — stdlib fetch, deduped, relative → absolute, up to 50 links
+- Extended `ParsedIntent` with `url`, `app_name`, `query` fields
+- Extended `ExecutionResult` with `opened_target`, `extracted_text_summary`, `listed_links` fields
+- Executor whitelist extended with `phone` and `browser` tool modules
+- 130 new tests in `test_v4_phone_browser.py` (397 total)
+- README updated with Phone and Browser sections
 
 ### v0.2.1
 - `list media` now shows a hint suggesting `recursively` when 0 media are found but subfolders exist
