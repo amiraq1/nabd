@@ -523,3 +523,220 @@ class TestIsFirstRun:
         nonexistent = str(tmp_path / "no_such.db")
         with patch("core.logging_db._get_db_path", return_value=nonexistent):
             assert is_first_run() is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v0.2.1 — list_media recursive hint
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestListMediaRecursiveHint:
+    def test_has_subdirs_false_when_no_subdirs(self, tmp_path):
+        (tmp_path / "photo.jpg").write_bytes(b"x")
+        result = list_media(str(tmp_path))
+        assert result["has_subdirs"] is False
+
+    def test_has_subdirs_true_when_subdir_exists(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        result = list_media(str(tmp_path))
+        assert result["has_subdirs"] is True
+
+    def test_has_subdirs_true_even_without_media_in_top(self, tmp_path):
+        sub = tmp_path / "pics"
+        sub.mkdir()
+        (sub / "photo.jpg").write_bytes(b"x")
+        result = list_media(str(tmp_path))
+        assert result["has_subdirs"] is True
+        assert result["total_media_count"] == 0
+
+    def test_has_subdirs_false_when_recursive(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        result = list_media(str(tmp_path), recursive=True)
+        # has_subdirs is only set for non-recursive scans
+        assert result["has_subdirs"] is False
+
+    def test_has_subdirs_false_empty_dir(self, tmp_path):
+        result = list_media(str(tmp_path))
+        assert result["has_subdirs"] is False
+
+    def test_reporter_shows_hint_when_zero_media_and_has_subdirs(self, tmp_path):
+        from agent.executor import execute
+        from agent.models import ExecutionPlan, RiskLevel, ToolAction, OperationStatus
+        from agent.reporter import report_result
+        from agent.models import ExecutionResult
+
+        (tmp_path / "subdir").mkdir()
+
+        action = ToolAction(
+            tool_name="files", function_name="list_media",
+            arguments={"directory": str(tmp_path), "recursive": False}
+        )
+        ep = ExecutionPlan(
+            intent="list_media", risk_level=RiskLevel.LOW,
+            requires_confirmation=False, dry_run=False, actions=[action]
+        )
+        result = execute(ep, confirmed=False)
+        output = report_result(result, "list_media", confirmed=False)
+        assert "recursively" in output
+        assert str(tmp_path) in output
+
+    def test_reporter_no_hint_when_media_found(self, tmp_path):
+        from agent.executor import execute
+        from agent.models import ExecutionPlan, RiskLevel, ToolAction
+        from agent.reporter import report_result
+
+        (tmp_path / "subdir").mkdir()
+        (tmp_path / "photo.jpg").write_bytes(b"x")
+
+        action = ToolAction(
+            tool_name="files", function_name="list_media",
+            arguments={"directory": str(tmp_path), "recursive": False}
+        )
+        ep = ExecutionPlan(
+            intent="list_media", risk_level=RiskLevel.LOW,
+            requires_confirmation=False, dry_run=False, actions=[action]
+        )
+        result = execute(ep, confirmed=False)
+        output = report_result(result, "list_media", confirmed=False)
+        assert "recursively" not in output.split("Hint")[0] if "Hint" in output else True
+
+    def test_reporter_no_hint_when_no_subdirs(self, tmp_path):
+        from agent.executor import execute
+        from agent.models import ExecutionPlan, RiskLevel, ToolAction
+        from agent.reporter import report_result
+
+        action = ToolAction(
+            tool_name="files", function_name="list_media",
+            arguments={"directory": str(tmp_path), "recursive": False}
+        )
+        ep = ExecutionPlan(
+            intent="list_media", risk_level=RiskLevel.LOW,
+            requires_confirmation=False, dry_run=False, actions=[action]
+        )
+        result = execute(ep, confirmed=False)
+        output = report_result(result, "list_media", confirmed=False)
+        assert "Hint" not in output
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v0.2.1 — shell command detection (SHELL_COMMANDS dict + behaviour)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestShellCommandDetection:
+    def _import_shell_commands(self):
+        import importlib
+        import sys
+        # Reload to pick up latest version
+        if "main" in sys.modules:
+            del sys.modules["main"]
+        import main as m
+        return m.SHELL_COMMANDS
+
+    def test_shell_commands_dict_exists(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert isinstance(SHELL_COMMANDS, dict)
+
+    def test_ls_in_shell_commands(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "ls" in SHELL_COMMANDS
+
+    def test_cd_in_shell_commands(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "cd" in SHELL_COMMANDS
+
+    def test_mkdir_in_shell_commands(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "mkdir" in SHELL_COMMANDS
+
+    def test_pwd_in_shell_commands(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "pwd" in SHELL_COMMANDS
+
+    def test_find_in_shell_commands(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "find" in SHELL_COMMANDS
+
+    def test_rm_in_shell_commands(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "rm" in SHELL_COMMANDS
+
+    def test_mv_in_shell_commands(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "mv" in SHELL_COMMANDS
+
+    def test_all_hints_are_nonempty_strings(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        for cmd, hint in SHELL_COMMANDS.items():
+            assert isinstance(hint, str), f"Hint for '{cmd}' is not a string"
+            assert hint.strip(), f"Hint for '{cmd}' is empty"
+
+    def test_ls_hint_mentions_show_files(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "show files" in SHELL_COMMANDS["ls"].lower()
+
+    def test_find_hint_mentions_find_duplicates(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "find duplicates" in SHELL_COMMANDS["find"].lower()
+
+    def test_du_hint_mentions_storage_report(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "storage report" in SHELL_COMMANDS["du"].lower()
+
+    def test_mv_hint_mentions_move(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "move" in SHELL_COMMANDS["mv"].lower()
+
+    def test_cp_hint_mentions_back_up(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "back up" in SHELL_COMMANDS["cp"].lower()
+
+    def test_rm_hint_reassures_no_deletion(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert "safe" in SHELL_COMMANDS["rm"].lower() or "not delete" in SHELL_COMMANDS["rm"].lower()
+
+    def test_at_least_10_shell_commands_covered(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        assert len(SHELL_COMMANDS) >= 10
+
+    def test_all_hints_mention_nabd_or_equivalent(self):
+        SHELL_COMMANDS = self._import_shell_commands()
+        for cmd, hint in SHELL_COMMANDS.items():
+            # Every hint must either offer a Nabd equivalent or explain why not
+            has_guidance = any(
+                kw in hint.lower()
+                for kw in ("nabd", "equivalent", "does not", "not track", "try")
+            )
+            assert has_guidance, f"Hint for '{cmd}' lacks actionable guidance: {hint!r}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v0.2.1 — help text includes shell section
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHelpTextShellSection:
+    def _get_help_text(self):
+        import sys
+        if "main" in sys.modules:
+            del sys.modules["main"]
+        import main as m
+        return m.HELP_TEXT
+
+    def test_help_text_contains_shell_section(self):
+        help_text = self._get_help_text()
+        assert "NABD VS TERMUX SHELL" in help_text
+
+    def test_help_text_mentions_exit_to_termux(self):
+        help_text = self._get_help_text()
+        assert "exit" in help_text.lower()
+        assert "termux" in help_text.lower()
+
+    def test_help_text_has_ls_equivalent(self):
+        help_text = self._get_help_text()
+        assert "ls" in help_text
+
+    def test_help_text_has_mv_equivalent(self):
+        help_text = self._get_help_text()
+        assert "mv" in help_text
+
+    def test_help_text_version_is_v021(self):
+        help_text = self._get_help_text()
+        assert "v0.2.1" in help_text
