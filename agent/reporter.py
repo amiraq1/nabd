@@ -173,6 +173,13 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             if extra:
                 lines.append(f"    ... and {extra} more")
 
+        if total == 0 and not recursive and raw.get("has_subdirs"):
+            lines.append(
+                f"\n  Hint: No media found directly in this folder, but subfolders exist."
+                f"\n        To scan them too, try:"
+                f"\n          list media in {directory} recursively"
+            )
+
     elif intent == "organize_folder_by_type":
         moves = raw.get("planned_moves", [])
         skipped = raw.get("skipped", [])
