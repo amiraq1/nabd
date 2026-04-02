@@ -376,9 +376,103 @@ class TestDoctorTlsIntegration(unittest.TestCase):
         self.assertEqual(https_check["detail"], detail_text)
 
 
+# ── _tls_fallback_lines unit tests ────────────────────────────────────────────
+
+class TestTlsFallbackLines(unittest.TestCase):
+    def setUp(self):
+        from agent.reporter import _tls_fallback_lines
+        self.fn = _tls_fallback_lines
+
+    def test_returns_list(self):
+        result = self.fn("https://example.com")
+        self.assertIsInstance(result, list)
+        self.assertGreater(len(result), 0)
+
+    def test_contains_ssl_certificate_error(self):
+        lines = self.fn("https://example.com")
+        combined = "\n".join(lines)
+        self.assertIn("SSL certificate error", combined)
+
+    def test_contains_exact_url_in_open_suggestion(self):
+        url = "https://example.com/path/to/page"
+        lines = self.fn(url)
+        combined = "\n".join(lines)
+        self.assertIn(f"open {url}", combined)
+
+    def test_contains_domain_in_search_suggestion(self):
+        lines = self.fn("https://example.com/some/path?q=1")
+        combined = "\n".join(lines)
+        self.assertIn("search for example.com", combined)
+
+    def test_http_url_domain_extracted_correctly(self):
+        lines = self.fn("http://docs.python.org/3/library/ssl.html")
+        combined = "\n".join(lines)
+        self.assertIn("search for docs.python.org", combined)
+
+    def test_no_scheme_prefix_in_search_suggestion(self):
+        lines = self.fn("https://example.com")
+        combined = "\n".join(lines)
+        self.assertNotIn("search for https://", combined)
+        self.assertNotIn("search for http://", combined)
+
+    def test_contains_fix_instruction(self):
+        lines = self.fn("https://example.com")
+        combined = "\n".join(lines)
+        self.assertIn("pkg install ca-certificates", combined)
+
+    def test_contains_doctor_reference(self):
+        lines = self.fn("https://example.com")
+        combined = "\n".join(lines)
+        self.assertIn("doctor", combined)
+
+    def test_contains_no_local_tls_needed(self):
+        lines = self.fn("https://example.com")
+        combined = "\n".join(lines)
+        self.assertIn("no local TLS needed", combined)
+
+    def test_contains_environment_issue_note(self):
+        lines = self.fn("https://example.com")
+        combined = "\n".join(lines)
+        self.assertIn("environment issue", combined)
+
+    def test_url_in_error_header_line(self):
+        url = "https://example.com"
+        lines = self.fn(url)
+        self.assertIn(url, lines[0])
+
+    def test_different_urls_produce_different_open_suggestions(self):
+        lines_a = self.fn("https://aaa.com")
+        lines_b = self.fn("https://bbb.com")
+        combined_a = "\n".join(lines_a)
+        combined_b = "\n".join(lines_b)
+        self.assertIn("open https://aaa.com", combined_a)
+        self.assertIn("open https://bbb.com", combined_b)
+        self.assertNotIn("open https://bbb.com", combined_a)
+        self.assertNotIn("open https://aaa.com", combined_b)
+
+
 # ── Reporter TLS hint ─────────────────────────────────────────────────────────
 
 class TestReporterTlsHint(unittest.TestCase):
+    _TLS_URL = "https://example.com"
+    _TLS_RAW_EXTRACT = {
+        "success": False,
+        "url": _TLS_URL,
+        "error": "SSL: CERTIFICATE_VERIFY_FAILED — ...",
+        "error_type": "tls",
+        "text": "",
+        "char_count": 0,
+        "truncated": False,
+    }
+    _TLS_RAW_LINKS = {
+        "success": False,
+        "url": _TLS_URL,
+        "error": "SSL: CERTIFICATE_VERIFY_FAILED — ...",
+        "error_type": "tls",
+        "links": [],
+        "link_count": 0,
+    }
+
     def _make_result(self, intent: str, raw: dict) -> str:
         from agent.models import ExecutionResult, OperationStatus
         from agent.reporter import report_result
@@ -390,60 +484,41 @@ class TestReporterTlsHint(unittest.TestCase):
         )
         return report_result(result, intent, confirmed=True)
 
-    # browser_extract_text — TLS error
-    def test_extract_text_tls_error_shows_ssl_message(self):
-        raw = {
-            "success": False,
-            "url": "https://example.com",
-            "error": "SSL: CERTIFICATE_VERIFY_FAILED — ...",
-            "error_type": "tls",
-            "text": "",
-            "char_count": 0,
-            "truncated": False,
-        }
-        output = self._make_result("browser_extract_text", raw)
+    # ── browser_extract_text: TLS error ──────────────────────────────────────
+
+    def test_extract_text_tls_shows_ssl_certificate_error(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
         self.assertIn("SSL certificate error", output)
 
-    def test_extract_text_tls_error_mentions_fix(self):
-        raw = {
-            "success": False,
-            "url": "https://example.com",
-            "error": "SSL: CERTIFICATE_VERIFY_FAILED",
-            "error_type": "tls",
-            "text": "",
-            "char_count": 0,
-            "truncated": False,
-        }
-        output = self._make_result("browser_extract_text", raw)
+    def test_extract_text_tls_shows_exact_url_in_open_suggestion(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
+        self.assertIn(f"open {self._TLS_URL}", output)
+
+    def test_extract_text_tls_shows_domain_in_search_suggestion(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
+        self.assertIn("search for example.com", output)
+
+    def test_extract_text_tls_search_suggestion_has_no_scheme(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
+        self.assertNotIn("search for https://", output)
+
+    def test_extract_text_tls_mentions_fix(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
         self.assertIn("pkg install ca-certificates", output)
 
-    def test_extract_text_tls_error_mentions_browser_still_works(self):
-        raw = {
-            "success": False,
-            "url": "https://example.com",
-            "error": "SSL: CERTIFICATE_VERIFY_FAILED",
-            "error_type": "tls",
-            "text": "",
-            "char_count": 0,
-            "truncated": False,
-        }
-        output = self._make_result("browser_extract_text", raw)
-        self.assertIn("still works", output.lower())
-
-    def test_extract_text_tls_error_mentions_doctor(self):
-        raw = {
-            "success": False,
-            "url": "https://example.com",
-            "error": "SSL: CERTIFICATE_VERIFY_FAILED",
-            "error_type": "tls",
-            "text": "",
-            "char_count": 0,
-            "truncated": False,
-        }
-        output = self._make_result("browser_extract_text", raw)
+    def test_extract_text_tls_mentions_doctor(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
         self.assertIn("doctor", output.lower())
 
-    def test_extract_text_non_tls_error_no_ssl_message(self):
+    def test_extract_text_tls_mentions_no_local_tls(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
+        self.assertIn("no local TLS needed", output)
+
+    def test_extract_text_tls_mentions_environment_issue(self):
+        output = self._make_result("browser_extract_text", self._TLS_RAW_EXTRACT)
+        self.assertIn("environment issue", output)
+
+    def test_extract_text_non_tls_error_shows_no_ssl_block(self):
         raw = {
             "success": False,
             "url": "https://example.com",
@@ -457,45 +532,20 @@ class TestReporterTlsHint(unittest.TestCase):
         self.assertNotIn("SSL certificate error", output)
         self.assertIn("HTTP 404", output)
 
-    # browser_list_links — TLS error
-    def test_list_links_tls_error_shows_ssl_message(self):
+    def test_extract_text_non_tls_error_shows_no_open_suggestion(self):
         raw = {
             "success": False,
             "url": "https://example.com",
-            "error": "SSL: CERTIFICATE_VERIFY_FAILED — ...",
-            "error_type": "tls",
-            "links": [],
-            "link_count": 0,
+            "error": "HTTP 404: Not Found",
+            "error_type": "http",
+            "text": "",
+            "char_count": 0,
+            "truncated": False,
         }
-        output = self._make_result("browser_list_links", raw)
-        self.assertIn("SSL certificate error", output)
+        output = self._make_result("browser_extract_text", raw)
+        self.assertNotIn("no local TLS needed", output)
 
-    def test_list_links_tls_error_mentions_fix(self):
-        raw = {
-            "success": False,
-            "url": "https://example.com",
-            "error": "SSL: CERTIFICATE_VERIFY_FAILED",
-            "error_type": "tls",
-            "links": [],
-            "link_count": 0,
-        }
-        output = self._make_result("browser_list_links", raw)
-        self.assertIn("pkg install ca-certificates", output)
-
-    def test_list_links_non_tls_error_no_ssl_message(self):
-        raw = {
-            "success": False,
-            "url": "https://example.com",
-            "error": "Cannot reach URL: [Errno 101] Network is unreachable",
-            "error_type": "network",
-            "links": [],
-            "link_count": 0,
-        }
-        output = self._make_result("browser_list_links", raw)
-        self.assertNotIn("SSL certificate error", output)
-        self.assertIn("Cannot reach URL", output)
-
-    def test_extract_text_success_no_tls_noise(self):
+    def test_extract_text_success_has_no_ssl_noise(self):
         raw = {
             "success": True,
             "url": "https://example.com",
@@ -508,6 +558,60 @@ class TestReporterTlsHint(unittest.TestCase):
         output = self._make_result("browser_extract_text", raw)
         self.assertNotIn("SSL", output)
         self.assertIn("Hello World", output)
+
+    # ── browser_list_links: TLS error ─────────────────────────────────────────
+
+    def test_list_links_tls_shows_ssl_certificate_error(self):
+        output = self._make_result("browser_list_links", self._TLS_RAW_LINKS)
+        self.assertIn("SSL certificate error", output)
+
+    def test_list_links_tls_shows_exact_url_in_open_suggestion(self):
+        output = self._make_result("browser_list_links", self._TLS_RAW_LINKS)
+        self.assertIn(f"open {self._TLS_URL}", output)
+
+    def test_list_links_tls_shows_domain_in_search_suggestion(self):
+        output = self._make_result("browser_list_links", self._TLS_RAW_LINKS)
+        self.assertIn("search for example.com", output)
+
+    def test_list_links_tls_mentions_fix(self):
+        output = self._make_result("browser_list_links", self._TLS_RAW_LINKS)
+        self.assertIn("pkg install ca-certificates", output)
+
+    def test_list_links_tls_mentions_doctor(self):
+        output = self._make_result("browser_list_links", self._TLS_RAW_LINKS)
+        self.assertIn("doctor", output.lower())
+
+    def test_list_links_non_tls_error_shows_no_ssl_block(self):
+        raw = {
+            "success": False,
+            "url": "https://example.com",
+            "error": "Cannot reach URL: [Errno 101] Network is unreachable",
+            "error_type": "network",
+            "links": [],
+            "link_count": 0,
+        }
+        output = self._make_result("browser_list_links", raw)
+        self.assertNotIn("SSL certificate error", output)
+        self.assertIn("Cannot reach URL", output)
+
+    # ── open suggestion uses full URL, search suggestion uses domain ──────────
+
+    def test_extract_text_tls_url_with_path_open_uses_full_url(self):
+        raw = {
+            **self._TLS_RAW_EXTRACT,
+            "url": "https://docs.python.org/3/library/ssl.html",
+        }
+        output = self._make_result("browser_extract_text", raw)
+        self.assertIn("open https://docs.python.org/3/library/ssl.html", output)
+
+    def test_extract_text_tls_url_with_path_search_uses_domain_only(self):
+        raw = {
+            **self._TLS_RAW_EXTRACT,
+            "url": "https://docs.python.org/3/library/ssl.html",
+        }
+        output = self._make_result("browser_extract_text", raw)
+        self.assertIn("search for docs.python.org", output)
+        self.assertNotIn("search for https://", output)
 
 
 # ── No verify=False in codebase ───────────────────────────────────────────────
