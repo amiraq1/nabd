@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-نبض (Nabd) — Local phone operations agent for Android/Termux.
+Nabd — Local phone operations agent for Android/Termux.
 Interactive CLI entry point.
 """
 
@@ -28,36 +28,26 @@ from core.logging_db import log_operation
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
-║          نبض  —  Nabd  v0.1.0                   ║
+║              Nabd  v0.1.0                        ║
 ║   Local Phone Operations Agent for Termux        ║
 ╚══════════════════════════════════════════════════╝
-Type a command in Arabic or English.
-Type 'help' for examples  |  'exit' or 'خروج' to quit.
+Type a command in English.
+Type 'help' for examples  |  'exit' to quit.
 """
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
   SUPPORTED COMMANDS
 ────────────────────────────────────────────────────
-  English examples:
-    storage report /sdcard/Download
-    list large files /sdcard/Download
-    organize /sdcard/Download
-    find duplicates /sdcard/Download
-    back up /sdcard/Documents to /sdcard/Backup
-    convert /sdcard/Movies/video.mp4 to mp3
-    compress images /sdcard/Pictures
-    rename files /sdcard/Download prefix backup_
-    move /sdcard/Download/file.txt to /sdcard/Documents
-
-  Arabic examples:
-    تقرير التخزين /sdcard/Download
-    اعرض أكبر الملفات /sdcard/Download
-    رتّب مجلد /sdcard/Download
-    ابحث عن الملفات المكررة /sdcard/Download
-    انسخ /sdcard/Documents احتياطيًا إلى /sdcard/Backup
-    حوّل /sdcard/Movies/video.mp4 إلى mp3
-    اضغط صور /sdcard/Pictures
+  storage report /sdcard/Download
+  list large files /sdcard/Download
+  organize /sdcard/Download
+  find duplicates /sdcard/Download
+  back up /sdcard/Documents to /sdcard/Backup
+  convert /sdcard/Movies/video.mp4 to mp3
+  compress images /sdcard/Pictures
+  rename files /sdcard/Download prefix backup_
+  move /sdcard/Download/file.txt to /sdcard/Documents
 
   Other commands:
     history    — show recent command history
@@ -66,15 +56,15 @@ HELP_TEXT = """
 ────────────────────────────────────────────────────
 """
 
-EXIT_COMMANDS = {"exit", "quit", "خروج", "q", "bye"}
-HISTORY_COMMANDS = {"history", "hist", "سجل", "السجل"}
+EXIT_COMMANDS = {"exit", "quit", "q", "bye"}
+HISTORY_COMMANDS = {"history", "hist"}
 
 
 def prompt_confirmation(plan_summary: str, risk_label: str) -> bool:
     print(f"\n  Preview: {plan_summary}")
     try:
         answer = input(f"\n  [{risk_label} RISK] Apply these changes? [y/n]: ").strip().lower()
-        return answer in {"y", "yes", "نعم", "موافق", "ok"}
+        return answer in {"y", "yes", "ok"}
     except (EOFError, KeyboardInterrupt):
         return False
 
@@ -179,23 +169,23 @@ def main() -> None:
 
     while True:
         try:
-            command = input("\nنبض> ").strip()
+            command = input("\nnabd> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n\n  Goodbye! / مع السلامة")
+            print("\n\n  Goodbye!")
             break
 
         if not command:
             continue
 
         if command.lower() in EXIT_COMMANDS:
-            print("\n  Goodbye! / مع السلامة")
+            print("\n  Goodbye!")
             break
 
         if command.lower() in HISTORY_COMMANDS:
             show_history()
             continue
 
-        if command.lower() in {"help", "مساعدة", "?"}:
+        if command.lower() in {"help", "?"}:
             print(HELP_TEXT)
             continue
 
