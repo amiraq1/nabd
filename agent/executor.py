@@ -9,13 +9,14 @@ WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
     "system":     {"run_doctor"},
     "storage":    {"get_storage_report", "list_large_files"},
     "files":      {"organize_folder_by_type", "safe_rename_files", "safe_move_files",
-                   "show_files", "list_media"},
+                   "show_files", "show_folders", "list_media"},
     "media":      {"convert_video_to_mp3", "compress_images"},
     "backup":     {"backup_folder"},
     "duplicates": {"find_duplicates"},
     "phone":      {"open_app", "open_file", "open_url",
                    "get_battery_status", "get_network_status"},
-    "browser":    {"browser_search", "browser_extract_text", "browser_list_links"},
+    "browser":    {"browser_search", "browser_extract_text", "browser_list_links",
+                   "browser_page_title"},
 }
 
 
