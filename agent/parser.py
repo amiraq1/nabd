@@ -6,7 +6,7 @@ from core.exceptions import UnknownIntentError
 
 
 INTENT_PATTERNS: list[tuple[str, list[str]]] = [
-    # ── Diagnostic ────────────────────────────────────────────────────────
+    # ── Diagnostic ────────────────────────────────────────────────────────────
     ("doctor", [
         r"\bdoctor\b",
         r"check\s+(?:setup|env(?:ironment)?|install(?:ation)?|dependencies)",
@@ -15,7 +15,23 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"verify\s+(?:setup|install)",
         r"is\s+(?:ffmpeg|pillow|python)\s+installed",
     ]),
-    # ── Storage ───────────────────────────────────────────────────────────
+
+    # ── Phone status (read-only, no path) ─────────────────────────────────────
+    ("phone_status_battery", [
+        r"\bbattery\b",
+        r"power\s+level",
+        r"charge\s+level",
+        r"charging\s+status",
+    ]),
+    ("phone_status_network", [
+        r"\bwifi\s+(?:status|info|connection)\b",
+        r"network\s+(?:status|info|connection|details?)\b",
+        r"internet\s+(?:status|info|connection)\b",
+        r"show\s+(?:my\s+)?(?:wifi|network)\b",
+        r"connection\s+info",
+    ]),
+
+    # ── Storage ───────────────────────────────────────────────────────────────
     ("storage_report", [
         r"storage\s+report", r"disk\s+usage", r"how\s+much\s+space",
         r"storage\s+status", r"check\s+storage", r"show\s+storage",
@@ -25,19 +41,44 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"top\s+\d+\s*files?", r"show.*files.*size", r"what.*taking.*space",
         r"files?\s+by\s+size",
     ]),
-    # ── Compress (before list_media to avoid "compress images in ..." ambiguity) ──
+
+    # ── Compress (before list_media to avoid "compress images in …" ambiguity) ─
     ("compress_images", [
         r"compress\s+images?", r"resize\s+images?", r"shrink\s+images?",
         r"optimize\s+images?", r"reduce\s+image\s+size",
     ]),
-    # ── Browse ────────────────────────────────────────────────────────────
+
+    # ── Browser (specific URL/action patterns, before generic open/browse) ────
+    ("browser_extract_text", [
+        r"extract\s+text\s+(?:from|at|on)\b",
+        r"get\s+text\s+(?:from|at|on)\b",
+        r"read\s+(?:page|content|text)\s+(?:from|at|on)\b",
+        r"scrape\s+text\b",
+        r"fetch\s+text\b",
+    ]),
+    ("browser_list_links", [
+        r"list\s+links?\s+(?:from|on|at|in)\b",
+        r"find\s+links?\s+(?:from|on|at|in)\b",
+        r"get\s+links?\s+(?:from|on|at|in)\b",
+        r"show\s+links?\s+(?:from|on|at|in)\b",
+        r"extract\s+links?\s+(?:from|on|at|in)\b",
+    ]),
+    ("browser_search", [
+        r"\bsearch\s+(?:the\s+web\s+)?(?:for\s+)?(?!files?\s|duplicate|large|same|identical)",
+        r"\bgoogle\s+(?:for\s+|search\s+)?",
+        r"\blook\s+up\b",
+        r"web\s+search\b",
+        r"online\s+search\b",
+    ]),
+
+    # ── Browse / media ────────────────────────────────────────────────────────
     ("show_files", [
         r"show\s+files?\s+in\b",
         r"list\s+files?\s+in\b",
         r"what\s+(?:files?\s+)?(?:is|are)\s+in\b",
         r"contents?\s+of\b",
         r"\bls\b(?:\s|$)",
-        r"browse\b",
+        r"browse\b(?!\s+(?:to\s+)?https?://)",
     ]),
     ("list_media", [
         r"list\s+media\b",
@@ -46,7 +87,8 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"(?:show|find|list)\s+(?:all\s+)?(?:photos?|images?|videos?|clips?|audio|music|songs?)\b",
         r"(?:photos?|images?|videos?|audio|music)\s+in\b",
     ]),
-    # ── File management ───────────────────────────────────────────────────
+
+    # ── File management ───────────────────────────────────────────────────────
     ("organize_folder_by_type", [
         r"organiz(?:e|ing)\b", r"\bsort\s+files?\b", r"\barrange\s+files?\b",
         r"\btidy\s+(?:up\s+)?files?\b", r"clean\s+up\s+(?:the\s+)?folder",
@@ -75,6 +117,29 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"move\s+/", r"transfer\s+files?\b",
         r"relocate\s+files?\b",
     ]),
+
+    # ── Open / launch (URL before file path, file path before app name) ───────
+    ("open_url", [
+        r"open\s+https?://",
+        r"visit\s+https?://",
+        r"go\s+to\s+https?://",
+        r"navigate\s+to\s+https?://",
+        r"browse\s+(?:to\s+)?https?://",
+        r"open\s+url\b",
+    ]),
+    ("open_file", [
+        r"open\s+(?:the\s+)?(?:file\s+)?/[^\s]",
+        r"view\s+(?:the\s+)?/[^\s]",
+        r"open\s+(?:the\s+)?file\b",
+        r"open\s+this\s+file\b",
+    ]),
+    ("open_app", [
+        r"open\s+(?:the\s+)?(?:chrome|files|settings|camera|gallery|calculator)\b",
+        r"launch\s+(?:the\s+)?(?:chrome|files|settings|camera|gallery|calculator)\b",
+        r"start\s+(?:the\s+)?(?:chrome|files|settings|camera|gallery|calculator)\b",
+        r"open\s+(?:the\s+)?app\b",
+        r"launch\s+app\b",
+    ]),
 ]
 
 MODIFYING_INTENTS = {
@@ -91,12 +156,36 @@ HIGH_RISK_INTENTS = {
     "safe_rename_files",
 }
 
+MEDIUM_RISK_INTENTS = {
+    "open_app",
+    "open_file",
+    "open_url",
+}
+
+# Intents that ask before proceeding (but are NOT file-modifying dry-runs)
+CONFIRM_INTENTS = {
+    "open_file",
+    "open_url",
+}
+
+# Regex helpers
 _PATH_RE = re.compile(r'(?:^|[\s"\'])(/[^\s"\',:;]+)')
 _QUOTED_RE = re.compile(r'["\']([^"\']+)["\']')
-_TO_SEP_RE = re.compile(
-    r'\bto\b\s+["\']?(/[^\s"\',:;]+)["\']?',
-    re.IGNORECASE
+_TO_SEP_RE = re.compile(r'\bto\b\s+["\']?(/[^\s"\',:;]+)["\']?', re.IGNORECASE)
+_URL_RE = re.compile(r'https?://[^\s"\']+', re.IGNORECASE)
+_SEARCH_RE = re.compile(
+    r"(?:search\s+(?:the\s+web\s+)?(?:for\s+)?|"
+    r"google\s+(?:for\s+)?|"
+    r"look\s+up\s+|"
+    r"web\s+search\s+(?:for\s+)?)(.+)",
+    re.IGNORECASE,
 )
+_APP_NAME_RE = re.compile(
+    r"(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?(\w+)(?:\s+app)?",
+    re.IGNORECASE,
+)
+
+KNOWN_APP_NAMES = {"chrome", "files", "settings", "camera", "gallery", "calculator"}
 
 
 def detect_intent(command: str) -> str:
@@ -152,6 +241,27 @@ def _extract_source_target(command: str) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _extract_url(command: str) -> Optional[str]:
+    m = _URL_RE.search(command)
+    return m.group(0).rstrip(".,;)") if m else None
+
+
+def _extract_query(command: str) -> Optional[str]:
+    m = _SEARCH_RE.search(command)
+    if m:
+        return m.group(1).strip().rstrip(".,;)")
+    return None
+
+
+def _extract_app_name(command: str) -> Optional[str]:
+    m = _APP_NAME_RE.search(command.lower())
+    if m:
+        candidate = m.group(1).lower()
+        if candidate in KNOWN_APP_NAMES:
+            return candidate
+    return None
+
+
 def extract_options(command: str, intent: str) -> dict:
     options: dict = {}
 
@@ -201,19 +311,43 @@ def parse_command(command: str) -> ParsedIntent:
     source_path, target_path = _extract_source_target(command)
     options = extract_options(command, intent)
 
+    # Extract intent-specific fields
+    url: Optional[str] = None
+    app_name: Optional[str] = None
+    query: Optional[str] = None
+
+    if intent in ("open_url", "browser_extract_text", "browser_list_links"):
+        url = _extract_url(command)
+
+    if intent == "browser_search":
+        query = _extract_query(command)
+
+    if intent == "open_app":
+        app_name = _extract_app_name(command)
+
+    # Risk level
     is_modifying = intent in MODIFYING_INTENTS
     is_high_risk = intent in HIGH_RISK_INTENTS
+    is_medium = intent in MEDIUM_RISK_INTENTS
 
-    risk_level = RiskLevel.LOW
-    if is_modifying:
-        risk_level = RiskLevel.HIGH if is_high_risk else RiskLevel.MEDIUM
+    if is_high_risk:
+        risk_level = RiskLevel.HIGH
+    elif is_modifying or is_medium:
+        risk_level = RiskLevel.MEDIUM
+    else:
+        risk_level = RiskLevel.LOW
+
+    requires_confirmation = is_modifying or (intent in CONFIRM_INTENTS)
 
     return ParsedIntent(
         intent=intent,
         source_path=source_path,
         target_path=target_path,
+        url=url,
+        app_name=app_name,
+        query=query,
         options=options,
         risk_level=risk_level,
-        requires_confirmation=is_modifying,
+        requires_confirmation=requires_confirmation,
         raw_command=command,
     )
