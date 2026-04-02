@@ -1,4 +1,4 @@
-# نبض (Nabd)
+# Nabd
 
 A local-first phone operations agent for Android/Termux.
 
@@ -6,18 +6,18 @@ A local-first phone operations agent for Android/Termux.
 
 ## Overview
 
-نبض (Nabd, Arabic for "pulse") is a safe, deterministic CLI assistant for managing files on your Android device via Termux. It accepts natural language commands in **Arabic or English**, translates them into structured operations, previews changes before applying them, and requires your confirmation for any action that modifies files.
+Nabd is a safe, deterministic CLI assistant for managing files on your Android device via Termux. It accepts natural language commands in English, translates them into structured operations, previews changes before applying them, and requires your confirmation for any action that modifies files.
 
 ---
 
 ## Product Boundaries
 
-نبض is:
+Nabd is:
 - A controlled, local command assistant for file and storage operations
 - Designed for safety-first, deterministic execution
 - Runnable entirely offline on your Android device
 
-نبض is NOT:
+Nabd is NOT:
 - A general chatbot or AI agent
 - An unrestricted shell executor
 - A cloud service or web application
@@ -46,7 +46,7 @@ nabd/
   README.md             — This file
   agent/
     models.py           — Typed data models (ParsedIntent, ExecutionPlan, etc.)
-    parser.py           — Rule-based Arabic/English command parser
+    parser.py           — Rule-based English command parser
     planner.py          — Maps intents to deterministic execution plans
     safety.py           — Central safety enforcement layer
     executor.py         — Executes only whitelisted tool functions
@@ -76,19 +76,19 @@ nabd/
 
 ---
 
-## Supported Features (MVP)
+## Supported Commands
 
-| Intent | English Example | Arabic Example |
-|---|---|---|
-| Storage report | `storage report /sdcard/Download` | `تقرير التخزين /sdcard/Download` |
-| List large files | `list large files /sdcard` | `اعرض أكبر الملفات /sdcard` |
-| Organize folder | `organize /sdcard/Download` | `رتّب مجلد /sdcard/Download` |
-| Find duplicates | `find duplicates /sdcard/Download` | `ابحث عن الملفات المكررة /sdcard/Download` |
-| Backup folder | `back up /sdcard/Documents to /sdcard/Backup` | `انسخ /sdcard/Documents احتياطيًا إلى /sdcard/Backup` |
-| Convert to MP3 | `convert /sdcard/Movies/film.mp4 to mp3` | `حوّل /sdcard/Movies/film.mp4 إلى mp3` |
-| Compress images | `compress images /sdcard/Pictures` | `اضغط صور /sdcard/Pictures` |
-| Safe rename | `rename files /sdcard/Download prefix old_` | `إعادة تسمية /sdcard/Download` |
-| Safe move | `move /sdcard/Download/file.txt to /sdcard/Documents` | `انقل /sdcard/Download/file.txt إلى /sdcard/Documents` |
+| Intent | Example |
+|---|---|
+| Storage report | `storage report /sdcard/Download` |
+| List large files | `list large files /sdcard/Download` |
+| Organize folder | `organize /sdcard/Download` |
+| Find duplicates | `find duplicates /sdcard/Download` |
+| Backup folder | `back up /sdcard/Documents to /sdcard/Backup` |
+| Convert to MP3 | `convert /sdcard/Movies/film.mp4 to mp3` |
+| Compress images | `compress images /sdcard/Pictures` |
+| Safe rename | `rename files /sdcard/Download prefix old_` |
+| Safe move | `move /sdcard/Download/file.txt to /sdcard/Documents` |
 
 ---
 
@@ -123,7 +123,7 @@ This creates symlinks under `~/storage/` pointing to `/sdcard/`.
 ### 5. Clone the repository
 
 ```bash
-git clone https://github.com/youruser/nabd.git
+git clone https://github.com/amiraq1/nabd.git
 cd nabd
 ```
 
@@ -137,7 +137,7 @@ Pillow is required for image compression. All other features use only the Python
 
 ---
 
-## Running نبض
+## Running Nabd
 
 ```bash
 python main.py
@@ -146,10 +146,10 @@ python main.py
 You will see an interactive prompt:
 
 ```
-نبض> 
+nabd>
 ```
 
-Type your command and press Enter. Type `exit` or `خروج` to quit.
+Type a command and press Enter. Type `exit` to quit.
 
 ---
 
@@ -196,12 +196,13 @@ python -m pytest tests/ -v
 ```
 
 Tests cover:
-- Intent detection in Arabic and English
+- Intent detection for all supported commands
 - Path traversal prevention
 - Allowed path enforcement
 - Dry-run and actual file operations
 - Duplicate detection
 - Storage report accuracy
+- Executor whitelist enforcement
 
 ---
 
