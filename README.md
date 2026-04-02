@@ -529,6 +529,15 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 
 ## Changelog
 
+### v0.4.2
+- **`show folders` intent**: `show folders in /path` — lists only immediate subfolders (no files), sorted alphabetically, each showing a best-effort item count
+- **`browser_page_title` intent**: `show page title from https://...` — fetches a URL via stdlib and returns the `<title>` tag content; full TLS-resilience (same `error_type="tls"` path as `browser_extract_text`)
+- **`_TitleExtractor` class** in `tools/browser.py`: stateful `html.parser.HTMLParser` that captures the first `<title>` tag, handles entities, collapses whitespace, stops at `</title>`
+- **`python` shell-command hint**: typing `python` inside Nabd now shows "Nabd does not run Python scripts — use Termux for scripting: `python3 script.py`"
+- **Help text updated to v0.4.2**: new `show folders` example under BROWSE; new `show page title from` example under BROWSER; `add 'recursively'` tip added to `list media`; Shell → Nabd table extended with `ls -d */`, `python`
+- Safety, planner, executor, reporter all wired for both new intents (read-only, LOW risk, no confirmation required)
+- 99 new tests in `test_v4_2.py` (552 total)
+
 ### v0.4.1
 - **Browser TLS resilience**: `_fetch_html` now distinguishes SSL certificate errors (`error_type="tls"`) from plain network failures (`error_type="network"`)
 - **Actionable TLS error messages**: when `extract text` or `list links` fails with an SSL error, Nabd shows the exact fix (`pkg install ca-certificates`) and confirms that `open https://...` and `search for` are unaffected
