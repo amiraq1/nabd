@@ -85,3 +85,17 @@ def get_history(limit: int = 20) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def is_first_run() -> bool:
+    """Return True if no operations have been logged yet (first launch)."""
+    try:
+        db_path = _get_db_path()
+        if not os.path.isfile(db_path):
+            return True
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+        conn.close()
+        return count == 0
+    except Exception:
+        return True
