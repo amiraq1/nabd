@@ -217,6 +217,32 @@ class _LinkExtractor(html.parser.HTMLParser):
         return self._links
 
 
+class _TitleExtractor(html.parser.HTMLParser):
+    """Extract the content of the first <title> tag from HTML."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_title = False
+        self._title_parts: list[str] = []
+        self._done = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag.lower() == "title" and not self._done:
+            self._in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "title" and self._in_title:
+            self._in_title = False
+            self._done = True   # stop collecting after first </title>
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self._title_parts.append(data)
+
+    def get_title(self) -> str:
+        return " ".join("".join(self._title_parts).split())   # collapse whitespace
+
+
 # ── Internal fetch helper ─────────────────────────────────────────────────────
 
 def _fetch_html(url: str) -> tuple[str, str, str]:
@@ -335,6 +361,39 @@ def browser_extract_text(url: str) -> dict[str, Any]:
         "text": text_summary,
         "char_count": len(full_text),
         "truncated": truncated,
+        "error": None,
+        "error_type": None,
+    }
+
+
+def browser_page_title(url: str) -> dict[str, Any]:
+    """
+    Fetch a URL and return only its <title> tag content.
+    Minimal fetch — reads just enough HTML to find the title.
+    Returns error_type="tls" if SSL certificate verification fails.
+    """
+    html_content, error, error_type = _fetch_html(url)
+    if error:
+        return {
+            "url": url,
+            "success": False,
+            "title": "",
+            "error": error,
+            "error_type": error_type,
+        }
+
+    extractor = _TitleExtractor()
+    try:
+        extractor.feed(html_content)
+    except Exception:
+        pass
+
+    title = extractor.get_title()
+
+    return {
+        "url": url,
+        "success": True,
+        "title": title,
         "error": None,
         "error_type": None,
     }
