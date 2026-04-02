@@ -6,15 +6,47 @@ from core.exceptions import UnknownIntentError
 
 
 INTENT_PATTERNS: list[tuple[str, list[str]]] = [
+    # ── Diagnostic ────────────────────────────────────────────────────────
+    ("doctor", [
+        r"\bdoctor\b",
+        r"check\s+(?:setup|env(?:ironment)?|install(?:ation)?|dependencies)",
+        r"diagnos(?:e|is|tic)",
+        r"health\s+check",
+        r"verify\s+(?:setup|install)",
+        r"is\s+(?:ffmpeg|pillow|python)\s+installed",
+    ]),
+    # ── Storage ───────────────────────────────────────────────────────────
     ("storage_report", [
         r"storage\s+report", r"disk\s+usage", r"how\s+much\s+space",
         r"storage\s+status", r"check\s+storage", r"show\s+storage",
     ]),
     ("list_large_files", [
         r"large\s+files?", r"biggest?\s+files?", r"largest?\s+files?",
-        r"top\s+\d*\s*files?", r"show.*files.*size", r"what.*taking.*space",
+        r"top\s+\d+\s*files?", r"show.*files.*size", r"what.*taking.*space",
         r"files?\s+by\s+size",
     ]),
+    # ── Compress (before list_media to avoid "compress images in ..." ambiguity) ──
+    ("compress_images", [
+        r"compress\s+images?", r"resize\s+images?", r"shrink\s+images?",
+        r"optimize\s+images?", r"reduce\s+image\s+size",
+    ]),
+    # ── Browse ────────────────────────────────────────────────────────────
+    ("show_files", [
+        r"show\s+files?\s+in\b",
+        r"list\s+files?\s+in\b",
+        r"what\s+(?:files?\s+)?(?:is|are)\s+in\b",
+        r"contents?\s+of\b",
+        r"\bls\b(?:\s|$)",
+        r"browse\b",
+    ]),
+    ("list_media", [
+        r"list\s+media\b",
+        r"show\s+media\b",
+        r"media\s+files?\b",
+        r"(?:show|find|list)\s+(?:all\s+)?(?:photos?|images?|videos?|clips?|audio|music|songs?)\b",
+        r"(?:photos?|images?|videos?|audio|music)\s+in\b",
+    ]),
+    # ── File management ───────────────────────────────────────────────────
     ("organize_folder_by_type", [
         r"organiz(?:e|ing)\b", r"\bsort\s+files?\b", r"\barrange\s+files?\b",
         r"\btidy\s+(?:up\s+)?files?\b", r"clean\s+up\s+(?:the\s+)?folder",
@@ -35,13 +67,8 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"to\s+mp3\b", r"as\s+mp3\b",
         r"rip.*audio",
     ]),
-    ("compress_images", [
-        r"compress\s+images?", r"resize\s+images?", r"shrink\s+images?",
-        r"optimize\s+images?", r"reduce\s+image\s+size",
-    ]),
     ("safe_rename_files", [
-        r"rename\s+files?", r"batch\s+rename",
-        r"bulk\s+rename",
+        r"rename\s+files?", r"batch\s+rename", r"bulk\s+rename",
     ]),
     ("safe_move_files", [
         r"move\s+(?:the\s+)?(?:file|folder|directory)\b",
@@ -79,8 +106,8 @@ def detect_intent(command: str) -> str:
             if re.search(pattern, text):
                 return intent_name
     raise UnknownIntentError(
-        f"Could not determine intent from command: '{command}'\n"
-        "  Tip: type 'help' to see supported commands."
+        f"Could not understand: '{command}'\n"
+        "  Type 'help' to see all supported commands."
     )
 
 
@@ -131,6 +158,25 @@ def extract_options(command: str, intent: str) -> dict:
     top_n_match = re.search(r"\btop\s+(\d+)", command, re.IGNORECASE)
     if top_n_match:
         options["top_n"] = int(top_n_match.group(1))
+
+    sort_match = re.search(r"\bsort(?:ed)?\s+by\s+(name|size|modified|date)\b", command, re.IGNORECASE)
+    if sort_match:
+        val = sort_match.group(1).lower()
+        options["sort_by"] = "modified" if val in ("modified", "date") else val
+
+    if intent == "show_files":
+        if not top_n_match:
+            limit_match = re.search(r"\b(?:limit|show|first|last)\s+(\d+)\b", command, re.IGNORECASE)
+            if limit_match:
+                options["limit"] = int(limit_match.group(1))
+        recursive_match = re.search(r"\b(?:recursive(?:ly)?|all\s+subfolders?|deep)\b", command, re.IGNORECASE)
+        if recursive_match:
+            options["recursive"] = True
+
+    if intent == "list_media":
+        recursive_match = re.search(r"\b(?:recursive(?:ly)?|all\s+subfolders?|deep)\b", command, re.IGNORECASE)
+        if recursive_match:
+            options["recursive"] = True
 
     if intent == "safe_rename_files":
         prefix_match = re.search(r"prefix\s+[\"']?(\S+)[\"']?", command, re.IGNORECASE)
