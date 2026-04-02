@@ -1,0 +1,16 @@
+{
+  "allowed_roots": [
+    "/sdcard/Download",
+    "/sdcard/Documents",
+    "/sdcard/Music",
+    "/sdcard/Movies",
+    "/sdcard/Pictures",
+    "/sdcard/DCIM",
+    "/storage/emulated/0/Download",
+    "/storage/emulated/0/Documents",
+    "/storage/emulated/0/Music",
+    "/storage/emulated/0/Movies",
+    "/storage/emulated/0/Pictures",
+    "/storage/emulated/0/DCIM"
+  ]
+}
