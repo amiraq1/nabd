@@ -106,6 +106,22 @@ def run_doctor() -> dict[str, Any]:
         ),
     })
 
+    # ── 6. HTTPS / CA certificate check (browser extract & list-links) ──────
+    try:
+        from tools.browser import check_browser_tls
+        tls_result = check_browser_tls()
+        checks.append({
+            "name": "HTTPS / CA certificates",
+            "status": tls_result["status"],
+            "detail": tls_result["detail"],
+        })
+    except Exception as e:
+        checks.append({
+            "name": "HTTPS / CA certificates",
+            "status": "warn",
+            "detail": f"TLS check skipped: {e}",
+        })
+
     ok_count = sum(1 for c in checks if c["status"] == "ok")
     warn_count = sum(1 for c in checks if c["status"] == "warn")
     error_count = sum(1 for c in checks if c["status"] in ("missing", "error"))
