@@ -29,11 +29,13 @@ URL_REQUIRED_INTENTS = {
     "open_url",
     "browser_extract_text",
     "browser_list_links",
+    "browser_page_title",
 }
 
 # Intents that require a local path
 PATH_REQUIRED_INTENTS = {
     "show_files",
+    "show_folders",
     "list_media",
     "organize_folder_by_type",
     "safe_rename_files",
