@@ -22,6 +22,9 @@ class ParsedIntent:
     intent: str
     source_path: str | None = None
     target_path: str | None = None
+    url: str | None = None
+    app_name: str | None = None
+    query: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     risk_level: RiskLevel = RiskLevel.LOW
     requires_confirmation: bool = False
@@ -53,3 +56,6 @@ class ExecutionResult:
     affected_paths: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     raw_results: list[dict[str, Any]] = field(default_factory=list)
+    opened_target: str | None = None
+    extracted_text_summary: str | None = None
+    listed_links: list[str] = field(default_factory=list)
