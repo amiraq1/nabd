@@ -13,6 +13,9 @@ WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
     "media":      {"convert_video_to_mp3", "compress_images"},
     "backup":     {"backup_folder"},
     "duplicates": {"find_duplicates"},
+    "phone":      {"open_app", "open_file", "open_url",
+                   "get_battery_status", "get_network_status"},
+    "browser":    {"browser_search", "browser_extract_text", "browser_list_links"},
 }
 
 
@@ -34,6 +37,12 @@ def _get_tool_module(tool_name: str) -> Any:
         return mod
     elif tool_name == "duplicates":
         import tools.duplicates as mod
+        return mod
+    elif tool_name == "phone":
+        import tools.phone as mod
+        return mod
+    elif tool_name == "browser":
+        import tools.browser as mod
         return mod
     else:
         raise ExecutionError(f"Unknown tool: '{tool_name}'")
@@ -85,11 +94,16 @@ def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
     all_errors: list[str] = []
     raw_results: list[dict] = []
 
+    opened_target: str | None = None
+    extracted_text_summary: str | None = None
+    listed_links: list[str] = []
+
     for action in plan.actions:
         try:
             result = _execute_action(action, confirmed=confirmed)
             raw_results.append(result)
             if isinstance(result, dict):
+                # Standard file-operation error lists
                 tool_errors = result.get("errors") or []
                 all_errors.extend(e for e in tool_errors if e)
                 for key in ("moved", "renamed", "compressed"):
@@ -99,6 +113,25 @@ def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
                 dest = result.get("destination")
                 if isinstance(dest, str) and dest:
                     all_affected.append(dest)
+
+                # Phone / browser specific fields
+                if not result.get("success", True) and result.get("error"):
+                    all_errors.append(result["error"])
+
+                if action.function_name in ("open_url", "open_file", "open_app"):
+                    opened_target = (
+                        result.get("url")
+                        or result.get("path")
+                        or result.get("app_name")
+                    )
+                elif action.function_name == "browser_extract_text":
+                    extracted_text_summary = result.get("text", "")
+                elif action.function_name == "browser_list_links":
+                    listed_links = [
+                        lnk.get("url", "") for lnk in result.get("links", [])
+                        if lnk.get("url")
+                    ]
+
         except (ToolError, ExecutionError) as e:
             all_errors.append(str(e))
         except Exception as e:
@@ -120,6 +153,9 @@ def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
         affected_paths=all_affected,
         errors=all_errors,
         raw_results=raw_results,
+        opened_target=opened_target,
+        extracted_text_summary=extracted_text_summary,
+        listed_links=listed_links,
     )
 
 
