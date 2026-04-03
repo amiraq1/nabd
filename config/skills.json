@@ -1,0 +1,9 @@
+{
+  "skills": [
+    {
+      "name": "ai_assist",
+      "enabled": false,
+      "description": "Advisory AI that suggests, explains, and clarifies Nabd commands."
+    }
+  ]
+}
