@@ -8,7 +8,7 @@ NOT neural inference probability. This is stated honestly in all outputs.
 from __future__ import annotations
 
 from llm.backend import LLMBackend
-from llm.schemas import CommandSuggestion, Clarification, IntentSuggestion, ResultExplanation
+from llm.schemas import BackendStatus, CommandSuggestion, Clarification, IntentSuggestion, ResultExplanation
 
 
 # ── Keyword → intent mapping ──────────────────────────────────────────────────
@@ -306,6 +306,15 @@ class LocalBackend(LLMBackend):
 
     def is_available(self) -> bool:
         return True
+
+    def get_status(self) -> BackendStatus:
+        return BackendStatus(
+            available=True,
+            backend_name="local",
+            transport=None,
+            healthy=True,
+            detail="Deterministic keyword matching — always available, no server required.",
+        )
 
     def suggest_command(
         self,
