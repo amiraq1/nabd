@@ -816,11 +816,11 @@ class TestMainV06(unittest.TestCase):
 
     def test_banner_says_current_version(self):
         from main import BANNER
-        self.assertIn("v0.", BANNER)
+        self.assertIn("v1.0", BANNER)
 
     def test_help_text_says_current_version(self):
         from main import HELP_TEXT
-        self.assertIn("v0.", HELP_TEXT)
+        self.assertIn("v1.0", HELP_TEXT)
 
     def test_help_text_has_ai_assist_section(self):
         from main import HELP_TEXT
@@ -847,10 +847,13 @@ class TestMainV06(unittest.TestCase):
         from main import HELP_TEXT
         self.assertIn("advisory only", HELP_TEXT.lower())
 
-    def test_session_state_exists(self):
+    def test_context_memory_exists(self):
         import main
-        self.assertIn("last_command", main._session)
-        self.assertIn("last_result", main._session)
+        from agent.context import ContextMemory
+        self.assertTrue(hasattr(main, "_ctx"))
+        self.assertIsInstance(main._ctx, ContextMemory)
+        self.assertTrue(hasattr(main._ctx, "last_command"))
+        self.assertTrue(hasattr(main._ctx, "last_result_msg"))
 
 
 # ── Config files ───────────────────────────────────────────────────────────────

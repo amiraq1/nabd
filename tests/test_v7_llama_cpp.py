@@ -1607,13 +1607,13 @@ class TestExistingCommandsUnaffectedV7(unittest.TestCase):
 
 class TestMainV07(unittest.TestCase):
 
-    def test_banner_says_v07(self):
+    def test_banner_says_v10(self):
         from main import BANNER
-        self.assertIn("v0.8", BANNER)
+        self.assertIn("v1.0", BANNER)
 
-    def test_help_text_says_v07(self):
+    def test_help_text_says_v10(self):
         from main import HELP_TEXT
-        self.assertIn("v0.8", HELP_TEXT)
+        self.assertIn("v1.0", HELP_TEXT)
 
     def test_help_text_mentions_ai_backend_status(self):
         from main import HELP_TEXT
@@ -1629,7 +1629,10 @@ class TestMainV07(unittest.TestCase):
 
     def test_ai_backend_status_not_in_session_update(self):
         import main
-        self.assertIn("_session", dir(main))
+        from agent.context import ContextMemory
+        # v1.0: _session dict replaced by ContextMemory (_ctx)
+        self.assertTrue(hasattr(main, "_ctx"))
+        self.assertIsInstance(main._ctx, ContextMemory)
 
 
 # ── Audit: M2 — CLI stderr capped at 80 chars ────────────────────────────────

@@ -4,7 +4,9 @@ A local-first, safety-first phone operations agent for Android/Termux.
 
 Nabd accepts natural-language commands in English, turns them into structured intents, validates every path against an allowlist, shows a preview before making any change, and asks for confirmation before anything modifying is applied.
 
-**v0.8** — current release.
+**v1.0** — 987 tests passing.
+
+v1.0 is a **contextual-assistant release, not an autonomy release.** It adds session context memory and proactive next-step suggestions while keeping the deterministic safety model entirely intact.
 
 ---
 
@@ -12,10 +14,9 @@ Nabd accepts natural-language commands in English, turns them into structured in
 
 - **Local-only** — no cloud, no network, no external AI APIs required for core functionality.
 - **Safety first** — every path is checked against `config/allowed_paths.json`. Path traversal (`..`) is blocked at the parser. URL schemes are validated (only `https://` and `http://` permitted).
-- **Preview before apply** — modifying operations run a dry-run pass first. If the preview fails, Nabd stops before confirmation or any real changes.
+- **Preview before apply** — modifying operations run a dry-run pass first. You see exactly what will change.
 - **Explicit confirmation** — you type `y` before any file is moved, renamed, or overwritten, or before a URL/file is opened.
 - **Whitelisted execution** — only explicitly declared tool functions can be called. No arbitrary shell execution. No arbitrary browser automation.
-- **Advisory AI suggestions only** — Nabd can suggest safe next commands based on the current result, recent history, and short-term safe session context, but it never auto-runs them.
 - **English-only** — clean input; no multi-language ambiguity.
 
 ---
@@ -190,65 +191,6 @@ Moves a file or folder to a new location.
 history
 ```
 Shows your 20 most recent commands with status, timestamp, and intent.
-
-```
-history search <term>
-history intent <intent>
-history show <id>
-```
-Filters and re-displays entries from the local history log. These commands only read the log; they never replay or execute past actions. Invalid intent names or missing IDs raise a clarification message before anything changes.
-
----
-
-### Session context
-
-Nabd keeps a small in-memory context for the current session only.
-It can reuse a recent unambiguous folder, URL, or result reference for simple follow-ups such as:
-
-```text
-show files in that folder
-list large files in it
-list links from it
-explain that result
-```
-
-Use these phrases whenever Nabd just described a folder, media scan, or browser result—the parser only accepts them when the reference is unambiguous, so Nabd will ask for clarification instead of guessing.
-
-Rules:
-
-- context is not persisted across restarts
-- context carryover is advisory and parser-side only
-- only unambiguous references are reused
-- if Nabd is not sure what `it` refers to, it asks you to clarify instead of guessing
-- all resolved commands still go through the normal parse → safety → planner → executor flow
-
----
-
-### Advisory suggestions
-
-After a command finishes, Nabd may show a short `ADVISORY SUGGESTIONS` block.
-These suggestions are:
-
-- informational only
-- never auto-executed
-- generated after the normal parse → safety → planner → executor flow
-- based on the current result, recent command history, and current-session safe context when available
-- filtered so recent history is only reused when embedded paths stay inside allowed roots and reused URL commands still pass Nabd's URL-safety checks
-
-Examples:
-
-```text
-ADVISORY SUGGESTIONS
-  - Review the biggest files next: list large files /sdcard/Download
-  - Check duplicates in the same folder: find duplicates /sdcard/Download
-```
-
-Typical advisory follow-ups include:
-
-- storage and folder-inspection next steps such as `list large files`, `find duplicates`, `list media`, and `show files`
-- browser follow-ups such as `list links from ...` after a successful text extract
-- environment recovery hints after `doctor` or TLS / Termux integration failures
-- post-change review commands such as checking a backup folder or reviewing a destination folder after a move
 
 ---
 
@@ -436,7 +378,6 @@ main.py  (CLI loop)
         safety.py    — path validation + intent-level guards
         planner.py   — ParsedIntent → ExecutionPlan + ToolActions
         executor.py  — ExecutionPlan → ExecutionResult (whitelist enforced)
-        advisor.py   — advisory-only next-step suggestions from result + history
         reporter.py  — ExecutionResult → human-readable text
 
   tools/
@@ -463,17 +404,7 @@ cd nabd
 python -m pytest tests/ -v
 ```
 
-Tests cover parser, safety, planner, executor, tools, phone/browser flows, TLS handling, advisory suggestions, and session-context carryover.
-
----
-
-### v0.8
-
-- Short-term in-memory session context for the current Nabd session
-- Safe follow-up references for simple unambiguous phrases such as `that folder`, `it`, and `that result`
-- Clarification-first behavior when context is ambiguous instead of guessing
-- Advisory suggestions improved with last command, last result, and recent safe session context
-- No auto-execution added; all existing safety checks and confirmation rules remain in place
+397 tests across `test_parser.py`, `test_tools.py`, `test_safety.py`, `test_planner.py`, `test_executor.py`, `test_integration.py`, `test_v2.py`, and `test_v4_phone_browser.py`.
 
 ---
 
@@ -599,6 +530,15 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 ---
 
 ## Changelog
+
+### v1.0 — Contextual Assistant Release
+- **Context memory** (`agent/context.py` — new): `ContextMemory` class tracks `last_intent`, `last_command`, `last_result_msg`, `last_source_path`, and `last_url` across commands; updates only on successful non-AI commands; never carries over failed or blocked results as context
+- **Follow-up phrase resolution**: explicit phrases — `that folder`, `that path`, `same folder`, `that url`, `that link`, `that page`, and `it` (unambiguous only) — are substituted before parsing; paths are revalidated against allowed roots at substitution time; mutating commands (`move`, `back up`, `rename`, `compress`, `organize`, `convert`) always require explicit operands; `ValidationError` is raised with a clear message when ambiguous or context unavailable
+- **Proactive advisor** (`agent/advisor.py` — new): `Advisor.suggest()` returns per-intent text suggestions after each successful command (e.g. `list media in <path>` after `show files`, `find duplicates` after `list media`); advisory text only — never executed; environment failure hints surface `pkg install` / `pip install` instructions when relevant
+- **Session state refactored**: `_session` dict (v0.6) replaced by `ContextMemory` instance (`_ctx`); `ai_explain_last_result` reads `_ctx.last_command` and `_ctx.last_result_msg`; AI meta-commands and skill-registry queries (`show_skills`, `skill_info`) do not update context
+- **Help text and onboarding updated to v1.0**: new `CONTEXT SHORTCUTS` section explains which reference phrases work, which commands require explicit paths, and when context is stored
+- **Safety model unchanged**: all three advisory isolation gates preserved; context resolution is pre-parse text substitution only — no changes to the parse → safety → plan → execute → report pipeline
+- **112 new tests** in `tests/test_context_memory.py`, `tests/test_advisor.py`, `tests/test_v1_contextual_assistant.py` (987 total, 0 failed)
 
 ### v0.7
 - **llama.cpp backend** (`llm/llama_cpp_backend.py`): optional real local LLM backend via the llama.cpp HTTP server's OpenAI-compatible API (`/v1/chat/completions`); stdlib only (`urllib`, `json`, `socket`) — no new dependencies
@@ -784,14 +724,17 @@ All backend responses are typed dataclasses (`llm/schemas.py`):
 
 ## Roadmap
 
-- Optional local LLM integration for more flexible command parsing
-- Recursive duplicate deletion with keeper selection
+- Recursive duplicate deletion with keeper selection (keeper prompt, not auto-delete)
 - Undo / rollback for recent modifying operations
 - Scheduled operations (cron-style)
 - Rich terminal UI (Textual)
 - Smart photo deduplication (perceptual hashing)
 - WhatsApp media cleanup tool
 - Export history to CSV
+
+Done in previous releases:
+- ✓ v1.0 — Context memory, follow-up phrase resolution, proactive advisor
+- ✓ v0.7 — Local llama.cpp LLM backend (optional, advisory-only)
 
 ---
 

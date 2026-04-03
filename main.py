@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
-Nabd v0.8 — Local phone operations agent for Android/Termux.
+Nabd v1.0 — Local phone operations agent for Android/Termux.
 Interactive CLI entry point.
 """
 
 import sys
 import os
-from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from agent.models import OperationStatus
-from agent.context import (
-    apply_session_context_to_intent,
-    new_session_context,
-    resolve_command_with_context,
-    update_session_context,
-)
 from agent.parser import parse_command
 from agent.planner import plan
 from agent.safety import validate_intent_safety
 from agent.executor import execute
 from agent.reporter import report_parsed_intent, report_plan, report_result
-from agent.advisor import format_advisory_suggestions, generate_advisory_suggestions
+from agent.context import ContextMemory
+from agent.advisor import Advisor
 from core.exceptions import (
     NabdError,
     SafetyError,
@@ -32,14 +26,13 @@ from core.exceptions import (
     UnknownIntentError,
     ConfigError,
 )
-from core.logging_db import get_history, log_operation
-from core.colors import Colors, colorize
+from core.logging_db import log_operation
 
-BANNER = f"""
-{Colors.OKCYAN}╔══════════════════════════════════════════════════╗
-║              Nabd  v0.8                          ║
+BANNER = """
+╔══════════════════════════════════════════════════╗
+║              Nabd  v1.0                          ║
 ║   Local Phone Operations Agent for Termux        ║
-╚══════════════════════════════════════════════════╝{Colors.ENDC}"""
+╚══════════════════════════════════════════════════╝"""
 
 ONBOARDING = """
   Welcome! Here are a few things to try:
@@ -57,9 +50,11 @@ ONBOARDING = """
     search for local llm tools            — open a web search
     open https://example.com              — open a URL in browser
     extract text from https://example.com — read a page's text
-    history                                — view the last 20 commands
-    history search storage               — filter history without replaying
-    show files in that folder             — keep working in the same folder
+
+  Context shortcuts (after running a command):
+    list media in that folder             — reuse the last folder
+    extract text from that url            — reuse the last URL
+    explain last result                   — explain what just happened
 
   Type 'help' for the full command list.
   Type 'exit' to quit.
@@ -69,7 +64,7 @@ RETURNING_HINT = "  Type 'help' for commands  |  'history' for recent runs  |  '
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
-  NABD COMMANDS  (v0.8)
+  NABD COMMANDS  (v1.0)
 ────────────────────────────────────────────────────
 
   DIAGNOSTICS
@@ -166,6 +161,21 @@ HELP_TEXT = """
     list links from https://example.com
       Fetch a page and list all links found on it.
 
+  CONTEXT SHORTCUTS  (v1.0 — after running a folder or URL command)
+    list media in that folder             — reuse the last folder
+    find duplicates that folder           — reuse the last folder
+    extract text from that url            — reuse the last URL
+    list links from that url              — reuse the last URL
+    show page title from it               — reuse the last URL (unambiguous)
+    explain last result                   — explain what just happened
+
+    Notes:
+      • Nabd resolves 'that folder', 'that path', 'same folder',
+        'that url', 'that link', 'that page', and 'it' (unambiguous only).
+      • Mutating commands (move, back up, rename, compress, convert)
+        always require an explicit path — context is never substituted.
+      • Context is only stored after a successful command.
+
   SKILLS
     show skills
       List all available Nabd skill modules.
@@ -202,18 +212,6 @@ HELP_TEXT = """
     history
       Show your 20 most recent Nabd commands.
 
-    history search <term>
-    history intent <intent>
-    history show <id>
-      Search or filter the history log without replaying commands.
-
-  CONTEXT & FOLLOW-UPS
-    show files in that folder
-    list media in that folder
-    list links from it
-    explain that result
-      Continue work on the last folder, media scan, or browser result when Nabd already described it. Nabd clarifies before acting if the reference is ambiguous.
-
   OTHER
     help     — show this message
     exit     — quit Nabd
@@ -236,10 +234,8 @@ HELP_TEXT = """
 """
 
 EXIT_COMMANDS = {"exit", "quit", "q", "bye"}
-HISTORY_COMMANDS = {"history", "hist"}
 
-# Session state — short-term current-session memory for explain/context/advisory
-_session: dict[str, Any] = new_session_context()
+HISTORY_COMMANDS = {"history", "hist"}
 
 # Shell commands that users might accidentally type inside Nabd
 SHELL_COMMANDS: dict[str, str] = {
@@ -267,6 +263,20 @@ SHELL_COMMANDS: dict[str, str] = {
     "python": "  Nabd does not run Python scripts.\n  Use Termux for scripting: python3 script.py",
 }
 
+# Session-level context memory and advisor (module-level singletons)
+_ctx = ContextMemory()
+_advisor = Advisor()
+
+# AI meta-intents that do not update context
+_AI_INTENTS: frozenset[str] = frozenset({
+    "ai_suggest_command",
+    "ai_explain_last_result",
+    "ai_clarify_request",
+    "ai_backend_status",
+    "show_skills",
+    "skill_info",
+})
+
 
 def prompt_confirmation(plan_summary: str, risk_label: str) -> bool:
     print(f"\n  Preview: {plan_summary}")
@@ -278,6 +288,7 @@ def prompt_confirmation(plan_summary: str, risk_label: str) -> bool:
 
 
 def show_history() -> None:
+    from core.logging_db import get_history
     entries = get_history(limit=20)
     if not entries:
         print("\n  No history yet. Run some commands first.")
@@ -320,19 +331,28 @@ def _friendly_error(e: Exception, intent: str = "") -> str:
     return msg
 
 
-def run_command(command: str) -> str | None:
+def run_command(command: str) -> None:
     intent_repr: str | None = None
     plan_repr: str | None = None
     log_status = "failure"
     affected_paths: list[str] = []
     error_detail: str | None = None
     confirmed = False
-    next_command: str | None = None
 
     try:
-        resolved_command = resolve_command_with_context(command, _session)
+        # ── Context resolution (v1.0) ─────────────────────────────────────────
+        # Resolve explicit follow-up phrases ("that folder", "that url", "it")
+        # before parsing. ValidationError is raised here if ambiguous or missing.
+        resolved_command = _ctx.resolve(command)
+
         parsed = parse_command(resolved_command)
-        parsed = apply_session_context_to_intent(parsed, _session)
+        # Keep original command in the intent for logging/explain purposes
+        parsed.raw_command = command
+
+        # Inject session context for 'explain last result'
+        if parsed.intent == "ai_explain_last_result":
+            parsed.options["last_command"] = _ctx.last_command
+            parsed.options["last_result"] = _ctx.last_result_msg
 
         print(report_parsed_intent(parsed))
 
@@ -343,101 +363,87 @@ def run_command(command: str) -> str | None:
         intent_repr = parsed.intent
         plan_repr = execution_plan.preview_summary
 
-        # Modifying plans support a real dry-run preview. Show the actual
-        # computed changes before asking for confirmation.
-        if execution_plan.requires_confirmation and execution_plan.dry_run:
-            preview_result = execute(execution_plan, confirmed=False)
-            print(report_result(preview_result, parsed.intent, confirmed=False))
-            if preview_result.status == OperationStatus.FAILURE:
-                update_session_context(_session, command, parsed, preview_result)
-                affected_paths = preview_result.affected_paths
-                log_status = preview_result.status.value
-                if preview_result.errors:
-                    error_detail = "; ".join(preview_result.errors)
-                return None
-
         if execution_plan.requires_confirmation:
             risk_label = execution_plan.risk_level.value.upper()
             confirmed = prompt_confirmation(execution_plan.preview_summary, risk_label)
             if not confirmed:
-                print(f"\n  {Colors.WARNING}Operation cancelled. No changes were made.{Colors.ENDC}")
+                print("\n  Operation cancelled. No changes were made.")
                 log_operation(command, intent_repr, plan_repr, "cancelled")
-                return None
+                return
         else:
             confirmed = False
 
         result = execute(execution_plan, confirmed=confirmed)
         print(report_result(result, parsed.intent, confirmed))
 
-        suggestions = generate_advisory_suggestions(
-            parsed,
-            result,
-            recent_history=get_history(limit=5),
-            session_context=_session,
-        )
-        advisory_text = format_advisory_suggestions(suggestions)
-        if advisory_text:
-            print(advisory_text)
-            try:
-                choice = input(f"\n  {Colors.OKCYAN}Run suggestion [1-{len(suggestions)}] or press Enter to skip:{Colors.ENDC} ").strip()
-                if choice.isdigit() and 1 <= int(choice) <= len(suggestions):
-                    selected = suggestions[int(choice) - 1]
-                    next_command = selected.split(": ")[-1].strip() if ": " in selected else selected
-            except (EOFError, KeyboardInterrupt):
-                pass
-
         affected_paths = result.affected_paths
         log_status = result.status.value
         if result.errors:
             error_detail = "; ".join(result.errors)
 
-        update_session_context(_session, command, parsed, result)
+        # ── Update context memory (v1.0) ──────────────────────────────────────
+        # Only update context for non-AI intents; only store path/url on success.
+        if parsed.intent not in _AI_INTENTS:
+            _ctx.update(
+                intent=parsed.intent,
+                command=command,
+                result_msg=result.message,
+                source_path=parsed.source_path,
+                url=parsed.url,
+                success=(result.status == OperationStatus.SUCCESS),
+            )
+
+        # ── Proactive advisor (v1.0) ──────────────────────────────────────────
+        # Produce advisory next-step suggestions; display if non-empty.
+        suggestions = _advisor.suggest(parsed.intent, result, _ctx)
+        if suggestions:
+            print("\n  Suggestions:")
+            for s in suggestions:
+                print(s)
 
     except UnknownIntentError:
         print(
-            f"\n  {Colors.FAIL}[?]{Colors.ENDC} Command not recognised."
-            f"\n      Type 'help' to see all supported commands."
+            "\n  [?] Command not recognised."
+            "\n      Type 'help' to see all supported commands."
         )
         log_status = "unknown_intent"
 
     except (PathTraversalError, PathNotAllowedError) as e:
-        print(f"\n  {Colors.FAIL}[SAFETY]{Colors.ENDC} {e}")
+        print(f"\n  [SAFETY] {e}")
         error_detail = str(e)
         log_status = "safety_blocked"
 
     except ValidationError as e:
         msg = _friendly_error(e, intent_repr or "")
-        print(f"\n  {Colors.WARNING}[!]{Colors.ENDC} {msg}")
+        print(f"\n  [!] {msg}")
         error_detail = str(e)
         log_status = "validation_error"
 
     except SafetyError as e:
-        print(f"\n  {Colors.FAIL}[SAFETY]{Colors.ENDC} {e}")
+        print(f"\n  [SAFETY] {e}")
         error_detail = str(e)
         log_status = "safety_error"
 
     except ConfigError as e:
         print(
-            f"\n  {Colors.FAIL}[CONFIG]{Colors.ENDC} {e}"
+            f"\n  [CONFIG] {e}"
             "\n  Check that config/allowed_paths.json and config/settings.json exist."
         )
         error_detail = str(e)
         log_status = "config_error"
 
     except NabdError as e:
-        print(f"\n  {Colors.FAIL}[ERROR]{Colors.ENDC} {e}")
+        print(f"\n  [ERROR] {e}")
         error_detail = str(e)
         log_status = "error"
 
     except Exception as e:
-        print(f"\n  {Colors.FAIL}[UNEXPECTED ERROR]{Colors.ENDC} {type(e).__name__}: {e}")
+        print(f"\n  [UNEXPECTED ERROR] {type(e).__name__}: {e}")
         error_detail = str(e)
         log_status = "unexpected_error"
 
     finally:
         log_operation(command, intent_repr, plan_repr, log_status, affected_paths, error_detail)
-
-    return next_command
 
 
 def main() -> None:
@@ -477,7 +483,7 @@ def main() -> None:
         if first_word in SHELL_COMMANDS:
             hint = SHELL_COMMANDS[first_word]
             print(
-                f"\n  {Colors.OKCYAN}[i]{Colors.ENDC} '{first_word}' is a shell command — Nabd is not a shell."
+                f"\n  [i] '{first_word}' is a shell command — Nabd is not a shell."
                 f"\n\n{hint}"
                 f"\n\n  Type 'exit' to return to Termux for shell use."
                 f"\n  Type 'help' to see all Nabd commands."
@@ -485,10 +491,7 @@ def main() -> None:
             log_operation(command, None, None, "shell_command_hint")
             continue
 
-        next_cmd = run_command(command)
-        while next_cmd:
-            print(f"\nnabd> {Colors.OKGREEN}{next_cmd}{Colors.ENDC}")
-            next_cmd = run_command(next_cmd)
+        run_command(command)
 
 
 if __name__ == "__main__":

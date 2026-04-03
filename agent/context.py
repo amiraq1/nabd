@@ -1,234 +1,269 @@
-import re
-from typing import Any
+"""
+Nabd v1.0 — Narrow, safe context memory.
 
-from agent.models import ExecutionResult, OperationStatus, ParsedIntent
-from agent.safety import validate_path_safety, validate_url_safety
+What it tracks (updated only on successful non-AI commands):
+  last_intent        — intent name of the last successful run
+  last_command       — raw text of the last successful command
+  last_result_msg    — result message of the last successful command
+  last_source_path   — filesystem path from the last successful read-path command
+  last_url           — URL from the last successful browser command
+
+What it does NOT do:
+  - carry over failed, blocked, or cancelled commands as context
+  - infer parameters from vague references
+  - resolve "it" when the referent is ambiguous
+  - bypass allowed-roots path validation at resolution time
+  - resolve context references for mutating operations
+
+Context resolution rules:
+  - only explicit follow-up phrases trigger substitution
+  - "explain that / that result / that error" are passed through to the AI intent
+  - mutating verbs always require explicit operands — no context substitution
+  - "it" resolves only when exactly one type of context (path OR url) is available
+  - stored paths are revalidated via allowed-roots before substitution
+"""
+from __future__ import annotations
+
+import re
+from typing import Optional
+
 from core.exceptions import ValidationError
 
 
-AI_META_INTENTS = {
+# ── Intent classification ─────────────────────────────────────────────────────
+
+# Intents whose source_path becomes canonical folder context.
+# Only read-path and inspection intents are included.
+_PATH_CONTEXT_INTENTS: frozenset[str] = frozenset({
+    "show_files",
+    "show_folders",
+    "list_media",
+    "find_duplicates",
+    "list_large_files",
+    "storage_report",
+    "compress_images",          # preview / dry-run result is safe as context
+    "organize_folder_by_type",  # preview / dry-run result is safe as context
+    "backup_folder",            # source path is safe for follow-up inspection
+})
+
+# Intents whose URL becomes canonical URL context.
+_URL_CONTEXT_INTENTS: frozenset[str] = frozenset({
+    "browser_page_title",
+    "browser_extract_text",
+    "browser_list_links",
+    "open_url",
+    "browser_search",
+})
+
+# Intents that must NOT update context (AI meta + registry queries).
+_CONTEXT_SKIP_INTENTS: frozenset[str] = frozenset({
     "ai_suggest_command",
     "ai_explain_last_result",
     "ai_clarify_request",
     "ai_backend_status",
     "show_skills",
     "skill_info",
-}
+})
 
-FOLDER_CONTEXT_INTENTS = {
-    "storage_report",
-    "list_large_files",
-    "find_duplicates",
-    "show_files",
-    "show_folders",
-    "list_media",
-    "organize_folder_by_type",
-    "compress_images",
-    "safe_rename_files",
-}
-URL_CONTEXT_INTENTS = {
-    "open_url",
-    "browser_extract_text",
-    "browser_list_links",
-    "browser_page_title",
-}
+# ── Reference patterns ────────────────────────────────────────────────────────
 
-FOLDER_REFERENCE_RE = re.compile(r"\b(that\s+folder|it)\b", re.IGNORECASE)
-URL_REFERENCE_RE = re.compile(r"\bit\b", re.IGNORECASE)
+# Explicit path follow-up phrases — "that folder", "same path", etc.
+_EXPLICIT_PATH_REF = re.compile(
+    r"\b(that\s+(?:folder|directory|dir|path)|same\s+(?:folder|directory|dir|path))\b",
+    re.IGNORECASE,
+)
 
+# Explicit URL follow-up phrases — "that url", "same link", etc.
+_EXPLICIT_URL_REF = re.compile(
+    r"\b(that\s+(?:url|link|site|page)|same\s+(?:url|link|site|page))\b",
+    re.IGNORECASE,
+)
 
-def new_session_context() -> dict[str, Any]:
-    return {
-        "last_command": "",
-        "last_result": "",
-        "last_intent": "",
-        "last_folder": "",
-        "last_url": "",
-        "recent_context": [],
-    }
+# "it" alone — disambiguated at resolution time.
+_IT_REF = re.compile(r"\bit\b", re.IGNORECASE)
 
+# "explain that / that result / that error" → handled by ai_explain_last_result;
+# do not intercept these.
+_AI_EXPLAIN_PASSTHROUGH = re.compile(
+    r"\b(explain\s+that|that\s+result|that\s+error|explain\s+last)\b",
+    re.IGNORECASE,
+)
 
-def resolve_command_with_context(command: str, session: dict[str, Any]) -> str:
-    lowered = command.lower().strip()
-
-    resolved_folder = _resolve_folder_followup(command, lowered, session)
-    if resolved_folder is not None:
-        return resolved_folder
-
-    resolved_url = _resolve_url_followup(command, lowered, session)
-    if resolved_url is not None:
-        return resolved_url
-
-    if _looks_like_ambiguous_path_reference(lowered):
-        raise ValidationError(
-            "Context reference 'it' is ambiguous here.\n"
-            "  Please name the exact file or folder path instead."
-        )
-
-    return command
+# Mutating verb patterns — these commands must not use stored context operands.
+# Use prefix stems instead of full words to match "organise", "organize", etc.
+_MUTATING_VERBS = re.compile(
+    r"\b(move|back\s*up|backup|rename|compress|organi[sz]e?|convert)\b",
+    re.IGNORECASE,
+)
 
 
-def apply_session_context_to_intent(parsed: ParsedIntent, session: dict[str, Any]) -> ParsedIntent:
-    if parsed.intent == "ai_explain_last_result":
-        last_command = (session.get("last_command") or "").strip()
-        last_result = (session.get("last_result") or "").strip()
-        if not last_command or not last_result:
+# ── ContextMemory ─────────────────────────────────────────────────────────────
+
+class ContextMemory:
+    """
+    Short-term session context for Nabd.
+
+    Updated after every successful non-AI command.
+    Resolved only when the user uses an explicit follow-up phrase.
+    """
+
+    def __init__(self) -> None:
+        self.last_intent: Optional[str] = None
+        self.last_command: str = ""
+        self.last_result_msg: str = ""
+        self.last_source_path: Optional[str] = None
+        self.last_url: Optional[str] = None
+
+    # ── Update ────────────────────────────────────────────────────────────────
+
+    def update(
+        self,
+        intent: str,
+        command: str,
+        result_msg: str,
+        source_path: Optional[str] = None,
+        url: Optional[str] = None,
+        *,
+        success: bool = True,
+    ) -> None:
+        """
+        Update context after a command completes.
+
+        Rules:
+          - Always updates last_intent, last_command, last_result_msg.
+          - Updates last_source_path only on success AND for a path-context intent.
+          - Updates last_url only on success AND for a URL-context intent.
+          - Skips AI meta-commands and skill-registry queries entirely.
+          - Failed or blocked commands do not become canonical path/url context.
+        """
+        if intent in _CONTEXT_SKIP_INTENTS:
+            return
+
+        self.last_intent = intent
+        self.last_command = command
+        self.last_result_msg = result_msg
+
+        if success and source_path and intent in _PATH_CONTEXT_INTENTS:
+            self.last_source_path = source_path
+
+        if success and url and intent in _URL_CONTEXT_INTENTS:
+            self.last_url = url
+
+    # ── Resolve ───────────────────────────────────────────────────────────────
+
+    def resolve(self, command: str) -> str:
+        """
+        Scan command for explicit context reference phrases and substitute them.
+
+        Returns:
+          The original command (unchanged) if no reference phrase is found.
+          The substituted command if exactly one reference resolves unambiguously.
+
+        Raises:
+          ValidationError — when a reference is found but:
+            - context is unavailable for that reference type, OR
+            - "it" is ambiguous (both path and url in context), OR
+            - the command contains a mutating verb (must specify explicitly).
+
+        Passes through without substitution:
+          - "explain that / that result / that error" (handled by AI intent).
+        """
+        # Fast path — no reference phrase present
+        has_path_ref = bool(_EXPLICIT_PATH_REF.search(command))
+        has_url_ref = bool(_EXPLICIT_URL_REF.search(command))
+        has_it_ref = bool(_IT_REF.search(command))
+
+        if not (has_path_ref or has_url_ref or has_it_ref):
+            return command
+
+        # AI explain passthrough — do not intercept
+        if _AI_EXPLAIN_PASSTHROUGH.search(command):
+            return command
+
+        # Mutating operations must specify operands explicitly
+        if _MUTATING_VERBS.search(command) and (has_path_ref or has_url_ref or has_it_ref):
             raise ValidationError(
-                "There is no recent result to explain yet.\n"
-                "  Run a command first, then try: explain last result"
+                "Please specify the path explicitly for this operation.\n"
+                "  Nabd does not apply stored context to mutating commands.\n"
+                "  Example: back up /sdcard/Documents to /sdcard/Backup"
             )
-        parsed.options["last_command"] = last_command
-        parsed.options["last_result"] = last_result
-    return parsed
 
+        # ── Explicit path reference ───────────────────────────────────────────
+        if has_path_ref:
+            if not self.last_source_path:
+                raise ValidationError(
+                    "No folder context is available yet.\n"
+                    "  Run a folder command first, then use 'that folder'.\n"
+                    "  Example: show files in /sdcard/Download\n"
+                    "           list media in that folder"
+                )
+            self._revalidate_path()
+            resolved = _EXPLICIT_PATH_REF.sub(self.last_source_path, command)
+            return resolved
 
-def update_session_context(
-    session: dict[str, Any],
-    command: str,
-    parsed: ParsedIntent,
-    result: ExecutionResult,
-) -> None:
-    if parsed.intent in AI_META_INTENTS:
-        return
+        # ── Explicit URL reference ────────────────────────────────────────────
+        if has_url_ref:
+            if not self.last_url:
+                raise ValidationError(
+                    "No URL context is available yet.\n"
+                    "  Fetch a URL first, then use 'that url'.\n"
+                    "  Example: show page title from https://example.com\n"
+                    "           extract text from that url"
+                )
+            resolved = _EXPLICIT_URL_REF.sub(self.last_url, command)
+            return resolved
 
-    session["last_command"] = command
-    session["last_result"] = result.message
-    session["last_intent"] = parsed.intent
-    session["last_folder"] = _safe_folder_context(parsed, result) or ""
-    session["last_url"] = _safe_url_context(parsed, result) or ""
+        # ── "it" — resolve only when unambiguous ─────────────────────────────
+        if has_it_ref:
+            has_path_ctx = bool(self.last_source_path)
+            has_url_ctx = bool(self.last_url)
 
-    entry: dict[str, str] = {
-        "intent": parsed.intent,
-        "command": command,
-        "result": result.message,
-    }
-    if session["last_folder"]:
-        entry["kind"] = "folder"
-        entry["value"] = session["last_folder"]
-    elif session["last_url"]:
-        entry["kind"] = "url"
-        entry["value"] = session["last_url"]
+            if has_path_ctx and has_url_ctx:
+                raise ValidationError(
+                    "'it' is ambiguous — I have both a folder and a URL in context.\n"
+                    "  Please be specific:\n"
+                    "    use 'that folder' to refer to the last folder, or\n"
+                    "    use 'that url' to refer to the last URL."
+                )
+            if has_path_ctx:
+                self._revalidate_path()
+                return _IT_REF.sub(self.last_source_path, command)
+            if has_url_ctx:
+                return _IT_REF.sub(self.last_url, command)
 
-    recent_context = list(session.get("recent_context") or [])
-    if entry.get("kind") and entry.get("value"):
-        recent_context = [
-            item for item in recent_context
-            if not (
-                item.get("kind") == entry["kind"]
-                and item.get("value") == entry["value"]
+            raise ValidationError(
+                "'it' has no context to refer to.\n"
+                "  Run a folder or URL command first."
             )
-        ]
-        recent_context.insert(0, entry)
-        recent_context = recent_context[:5]
-    session["recent_context"] = recent_context
 
+        return command  # unreachable, but satisfies the linter
 
-def _resolve_folder_followup(command: str, lowered: str, session: dict[str, Any]) -> str | None:
-    if not _looks_like_folder_followup(lowered):
-        return None
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
-    folder = (session.get("last_folder") or "").strip()
-    if not folder:
-        raise ValidationError(
-            "I don't have a recent folder in context for that follow-up.\n"
-            "  Please name the folder path explicitly."
+    def _revalidate_path(self) -> None:
+        """
+        Verify that the stored path still passes allowed-roots validation.
+        Clears last_source_path and raises ValidationError if it no longer passes.
+        """
+        if not self.last_source_path:
+            return
+        try:
+            from core.paths import validate_path
+            validate_path(self.last_source_path)
+        except Exception:
+            stale = self.last_source_path
+            self.last_source_path = None
+            raise ValidationError(
+                f"The stored folder '{stale}' is no longer accessible or allowed.\n"
+                "  Please specify the folder explicitly."
+            )
+
+    # ── Representation ────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"ContextMemory("
+            f"intent={self.last_intent!r}, "
+            f"path={self.last_source_path!r}, "
+            f"url={self.last_url!r})"
         )
-    try:
-        folder = validate_path_safety(folder)
-    except Exception:
-        raise ValidationError(
-            "The recent folder context is no longer safe to reuse.\n"
-            "  Please name the folder path explicitly."
-        )
-
-    return FOLDER_REFERENCE_RE.sub(folder, command, count=1)
-
-
-def _resolve_url_followup(command: str, lowered: str, session: dict[str, Any]) -> str | None:
-    if not _looks_like_url_followup(lowered):
-        return None
-
-    url = (session.get("last_url") or "").strip()
-    if not url:
-        raise ValidationError(
-            "I don't have a recent URL in context for that follow-up.\n"
-            "  Please include the full URL explicitly."
-        )
-    try:
-        url = validate_url_safety(url)
-    except Exception:
-        raise ValidationError(
-            "The recent URL context is no longer safe to reuse.\n"
-            "  Please include the full URL explicitly."
-        )
-
-    return URL_REFERENCE_RE.sub(url, command, count=1)
-
-
-def _looks_like_folder_followup(lowered: str) -> bool:
-    return bool(
-        re.search(r"\b(show|list|find|storage|organize|compress|rename)\b", lowered)
-        and (
-            "that folder" in lowered
-            or re.search(r"\bin\s+it\b", lowered)
-            or re.search(r"\borganize\s+it\b", lowered)
-            or re.search(r"\bcompress\s+images?\s+it\b", lowered)
-            or re.search(r"\brename\s+files?\s+it\b", lowered)
-        )
-    )
-
-
-def _looks_like_url_followup(lowered: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(extract\s+text|list\s+links?|show\s+(?:the\s+)?(?:page\s+)?title)\s+(?:from|on|at|of)\s+it\b",
-            lowered,
-        )
-    )
-
-
-def _looks_like_ambiguous_path_reference(lowered: str) -> bool:
-    return bool(
-        re.search(r"\b(move|back\s*up|backup|open\s+file)\b", lowered)
-        and re.search(r"\bit\b", lowered)
-    )
-
-
-def _safe_folder_context(parsed: ParsedIntent, result: ExecutionResult) -> str:
-    if result.status not in {OperationStatus.SUCCESS, OperationStatus.PARTIAL}:
-        return ""
-    candidate = _extract_folder_candidate(parsed, result)
-    if not candidate:
-        return ""
-    try:
-        return validate_path_safety(candidate)
-    except Exception:
-        return ""
-
-
-def _safe_url_context(parsed: ParsedIntent, result: ExecutionResult) -> str:
-    if parsed.intent not in URL_CONTEXT_INTENTS:
-        return ""
-    candidate = ""
-    if parsed.url:
-        candidate = parsed.url
-    elif result.raw_results and isinstance(result.raw_results[0], dict):
-        candidate = result.raw_results[0].get("url") or ""
-    if not candidate:
-        return ""
-    try:
-        return validate_url_safety(candidate)
-    except Exception:
-        return ""
-
-
-def _extract_folder_candidate(parsed: ParsedIntent, result: ExecutionResult) -> str:
-    if parsed.intent in FOLDER_CONTEXT_INTENTS and parsed.source_path:
-        return parsed.source_path
-
-    if result.raw_results and isinstance(result.raw_results[0], dict):
-        raw = result.raw_results[0]
-        if raw.get("directory"):
-            return raw["directory"]
-
-    return ""
