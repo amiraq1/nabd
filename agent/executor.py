@@ -6,7 +6,7 @@ from core.exceptions import ExecutionError, ToolError
 
 
 # Whitelisted functions for the skill registry (read-only, no tool module)
-_SKILL_FUNCTIONS: set[str] = {"list_skills", "skill_info"}
+_SKILL_FUNCTIONS: set[str] = {"list_skills", "skill_info", "backend_status"}
 
 # Whitelisted functions for the AI Assist skill (advisory only, never executes)
 _AI_SKILL_FUNCTIONS: set[str] = {
@@ -71,6 +71,12 @@ def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
                 "tags": info.tags,
             }
         }
+
+    if action.function_name == "backend_status":
+        skill = registry.get("ai_assist")
+        if skill is None:
+            return {"error": "AI Assist skill is not registered."}
+        return skill.get_backend_status()
 
     raise ExecutionError(f"Unhandled skill function: '{action.function_name}'")
 
