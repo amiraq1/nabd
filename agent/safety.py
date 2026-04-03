@@ -29,6 +29,7 @@ READ_ONLY_INTENTS = {
     "ai_suggest_command",
     "ai_explain_last_result",
     "ai_clarify_request",
+    "ai_backend_status",
 }
 
 # Browser intents that use a URL (not a local path)
