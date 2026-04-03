@@ -1597,5 +1597,132 @@ class TestMainV07(unittest.TestCase):
         self.assertIn("_session", dir(main))
 
 
+# ── Audit: M2 — CLI stderr capped at 80 chars ────────────────────────────────
+
+class TestCliStderrCapped(unittest.TestCase):
+
+    def _make_cli_backend(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        return LlamaCppBackend(
+            transport="cli",
+            binary_path="/usr/bin/llama-cli",
+            model_path="/sdcard/models/model.gguf",
+        )
+
+    def _cli_proc(self, stderr: str, returncode: int = 0, stdout: str = ""):
+        import subprocess
+        proc = MagicMock(spec=subprocess.CompletedProcess)
+        proc.returncode = returncode
+        proc.stdout = stdout
+        proc.stderr = stderr
+        return proc
+
+    def test_stderr_over_80_chars_is_truncated(self):
+        b = self._make_cli_backend()
+        long_stderr = "x" * 200
+        proc = self._cli_proc(long_stderr, returncode=1)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            with self.assertRaises(ConnectionError) as ctx:
+                b._chat_cli("sys", "user")
+        msg = str(ctx.exception)
+        self.assertIn("exited with code 1", msg)
+        self.assertIn("…", msg)
+        self.assertLessEqual(len(msg), 300)
+
+    def test_stderr_exactly_80_chars_is_not_truncated(self):
+        b = self._make_cli_backend()
+        stderr_80 = "e" * 80
+        proc = self._cli_proc(stderr_80, returncode=1)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            with self.assertRaises(ConnectionError) as ctx:
+                b._chat_cli("sys", "user")
+        msg = str(ctx.exception)
+        self.assertNotIn("…", msg)
+        self.assertIn("e" * 80, msg)
+
+    def test_stderr_under_80_chars_is_not_truncated(self):
+        b = self._make_cli_backend()
+        proc = self._cli_proc("short error", returncode=1)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            with self.assertRaises(ConnectionError) as ctx:
+                b._chat_cli("sys", "user")
+        self.assertIn("short error", str(ctx.exception))
+        self.assertNotIn("…", str(ctx.exception))
+
+    def test_empty_stderr_shows_no_stderr_message(self):
+        b = self._make_cli_backend()
+        proc = self._cli_proc("", returncode=1)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            with self.assertRaises(ConnectionError) as ctx:
+                b._chat_cli("sys", "user")
+        self.assertIn("no stderr", str(ctx.exception))
+
+    def test_stderr_content_in_fallback_rationale_is_short(self):
+        """End-to-end: oversized stderr must not make the rationale unreadably long."""
+        b = self._make_cli_backend()
+        proc = self._cli_proc("z" * 500, returncode=1)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            result = b.suggest_command("back up my files", ["backup_folder"])
+        self.assertLessEqual(len(result.rationale), 600)
+
+
+# ── Audit: M3 — Reporter distinguishes 0%-confidence fallback from real suggestion ──
+
+class TestReporterSuggestCommandFallback(unittest.TestCase):
+
+    def _make_report(self, confidence: float, rationale: str = "some reason") -> str:
+        from agent.reporter import report_result
+        from agent.models import ExecutionResult, OperationStatus
+        result = ExecutionResult(
+            status=OperationStatus.SUCCESS,
+            message="",
+            raw_results=[{
+                "success": True,
+                "type": "suggest_command",
+                "suggested_command": "doctor",
+                "rationale": rationale,
+                "confidence": confidence,
+            }],
+        )
+        return report_result(result, "ai_suggest_command", confirmed=False)
+
+    def test_zero_confidence_shows_unavailable_warning(self):
+        output = self._make_report(0.0, "AI backend unavailable (reason). 'doctor'...")
+        self.assertIn("unavailable", output.lower())
+        self.assertIn("safe default", output.lower())
+
+    def test_zero_confidence_still_shows_suggested_command(self):
+        output = self._make_report(0.0)
+        self.assertIn("doctor", output)
+        self.assertIn("0%", output)
+
+    def test_nonzero_confidence_does_not_show_unavailable_warning(self):
+        output = self._make_report(0.75, "checks your environment")
+        self.assertNotIn("unavailable", output.lower())
+        self.assertIn("75%", output)
+
+    def test_low_but_nonzero_confidence_no_unavailable_warning(self):
+        output = self._make_report(0.1, "weak match")
+        self.assertNotIn("unavailable", output.lower())
+        self.assertIn("10%", output)
+
+    def test_unavailable_warning_mentions_ai_backend_status(self):
+        output = self._make_report(0.0)
+        self.assertIn("ai backend status", output.lower())
+
+    def test_advisory_header_still_present_for_zero_confidence(self):
+        output = self._make_report(0.0)
+        self.assertIn("advisory only", output.lower())
+
+    def test_advisory_header_present_for_real_suggestion(self):
+        output = self._make_report(0.85)
+        self.assertIn("advisory only", output.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
