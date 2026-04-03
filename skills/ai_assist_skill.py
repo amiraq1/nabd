@@ -2,7 +2,7 @@
 AI Assist Skill — Nabd's optional advisory intelligence layer.
 
 What it IS:
-  - A deterministic, keyword-based command suggester (LocalBackend)
+  - A command suggester (LocalBackend: deterministic; LlamaCppBackend: LLM)
   - A plain-English result explainer
   - A request clarifier
 
@@ -10,11 +10,16 @@ What it is NOT:
   - An executor — it never calls tool functions
   - An autonomous agent — it never chains actions
   - A shell — it never generates arbitrary commands
-  - A bypass for safety validation
+  - A bypass for safety validation or confirmation rules
+
+Backends:
+  - "local"     — deterministic keyword matching, always available (default)
+  - "llama_cpp" — local llama.cpp HTTP server, advisory-only, optional
 """
 from __future__ import annotations
 import json
 import os
+from typing import Any
 
 from skills.base import SkillBase, SkillInfo
 from llm.schemas import CommandSuggestion, Clarification, IntentSuggestion, ResultExplanation
@@ -60,6 +65,11 @@ def _load_config() -> dict:
             "backend": "local",
             "mode": "assist_only",
             "fallback_intent_suggestion": False,
+            "llama_cpp": {
+                "server_url": "http://localhost:8080",
+                "timeout_seconds": 30,
+                "model_name": "nabd-assistant",
+            },
         }
 
 
@@ -69,7 +79,7 @@ class AIAssistSkill(SkillBase):
         "Advisory AI that suggests, explains, and clarifies Nabd commands. "
         "Never executes actions on your behalf."
     )
-    version = "0.1.0"
+    version = "0.2.0"
 
     def __init__(self) -> None:
         config = _load_config()
@@ -79,12 +89,21 @@ class AIAssistSkill(SkillBase):
         self.fallback_intent_suggestion: bool = config.get(
             "fallback_intent_suggestion", False
         )
+        self._llama_cfg: dict = config.get("llama_cpp", {})
         self._backend = None
 
     def _get_backend(self):
         if self._backend is None:
-            from llm.local_backend import LocalBackend
-            self._backend = LocalBackend()
+            if self.backend_name == "llama_cpp":
+                from llm.llama_cpp_backend import LlamaCppBackend
+                self._backend = LlamaCppBackend(
+                    server_url=self._llama_cfg.get("server_url", "http://localhost:8080"),
+                    timeout_seconds=self._llama_cfg.get("timeout_seconds", 30),
+                    model_name=self._llama_cfg.get("model_name"),
+                )
+            else:
+                from llm.local_backend import LocalBackend
+                self._backend = LocalBackend()
         return self._backend
 
     def get_info(self) -> SkillInfo:
@@ -95,6 +114,52 @@ class AIAssistSkill(SkillBase):
             enabled=self.enabled,
             tags=["ai", "advisory", "offline", "deterministic"],
         )
+
+    def get_backend_status(self) -> dict[str, Any]:
+        """
+        Return a status dict describing the active backend and its availability.
+        Safe to call whether or not AI Assist is enabled.
+        """
+        backend_name = self.backend_name
+        available: bool
+        detail: str
+
+        if backend_name == "llama_cpp":
+            server_url = self._llama_cfg.get("server_url", "http://localhost:8080")
+            timeout = self._llama_cfg.get("timeout_seconds", 30)
+            model = self._llama_cfg.get("model_name", "nabd-assistant")
+            try:
+                backend = self._get_backend()
+                available = backend.is_available()
+                if available:
+                    detail = f"Connected to {server_url}"
+                else:
+                    detail = (
+                        f"Server at {server_url} is not responding. "
+                        "Start llama.cpp with: ./server -m model.gguf --port 8080"
+                    )
+            except Exception as e:
+                available = False
+                detail = f"Error probing backend: {e}"
+            return {
+                "backend": "llama_cpp",
+                "available": available,
+                "enabled": self.enabled,
+                "server_url": server_url,
+                "timeout_seconds": timeout,
+                "model_name": model,
+                "detail": detail,
+            }
+        else:
+            return {
+                "backend": "local",
+                "available": True,
+                "enabled": self.enabled,
+                "detail": (
+                    "LocalBackend — deterministic keyword matching. "
+                    "Always available, no server required."
+                ),
+            }
 
     def _check_enabled(self) -> None:
         if not self.enabled:
@@ -132,7 +197,7 @@ class AIAssistSkill(SkillBase):
                 ),
             )
         suggestion = self._get_backend().suggest_intent(user_text, AVAILABLE_INTENTS)
-        # Safety gate: discard any intent not in the whitelist
+        # Safety gate — discard any intent not in the whitelist (defense in depth)
         if suggestion.intent and suggestion.intent not in AVAILABLE_INTENTS:
             suggestion.intent = None
             suggestion.confidence = 0.0
