@@ -529,6 +529,19 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 
 ## Changelog
 
+### v0.6
+- **Skills registry**: `skills/registry.py` — lazy singleton managing all Nabd skill modules; `show skills` and `skill info <name>` expose it to users
+- **AI Assist skill** (`skills/ai_assist_skill.py`): advisory-only, never auto-executes; reads `config/ai_assist.json` (default: `enabled: false`); `suggest_command`, `explain_result`, `clarify_request`, `suggest_intent`
+- **LocalBackend** (`llm/local_backend.py`): deterministic keyword-overlap matching, no ML, no network; always available; confidence scores are ratios (0.0–1.0), not neural probabilities
+- **LLM schemas** (`llm/schemas.py`): typed dataclasses — `CommandSuggestion`, `ResultExplanation`, `Clarification`, `IntentSuggestion`
+- **5 new intents** (all `READ_ONLY`, `LOW` risk, no confirmation): `show_skills`, `skill_info` (query=skill\_name), `ai_suggest_command` (query=user\_text), `ai_explain_last_result`, `ai_clarify_request` (query=user\_text)
+- **Executor skill routing**: `tool_name="skill"` → `_execute_skill_action`; `tool_name="ai_skill"` → `_execute_ai_skill_action`; both bypass the whitelisted-functions dict
+- **Session state** in `main.py`: `_session` dict tracks `last_command`/`last_result`; injected into `ai_explain_last_result` options before planning; not updated for AI meta-commands
+- **Fallback intent safety gate**: `suggest_intent()` silently discards any intent not in `AVAILABLE_INTENTS` — backend can never invent non-whitelisted actions
+- **Help text updated to v0.6**: SKILLS section + AI ASSIST section with advisory disclaimer and enable instructions
+- **Config files**: `config/ai_assist.json` (enabled=false, backend=local, mode=assist\_only) and `config/skills.json`
+- **122 new tests** in `tests/test_v6_ai_skill.py` covering registry, parser, safety, planner, executor, reporter, LocalBackend, AIAssistSkill, and safety gate (680 total)
+
 ### v0.4.2
 - **`show folders` intent**: `show folders in /path` — lists only immediate subfolders (no files), sorted alphabetically, each showing a best-effort item count
 - **`browser_page_title` intent**: `show page title from https://...` — fetches a URL via stdlib and returns the `<title>` tag content; full TLS-resilience (same `error_type="tls"` path as `browser_extract_text`)
