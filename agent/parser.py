@@ -29,6 +29,15 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"\bskill\s+details?\b",
     ]),
 
+    # ── AI backend status ─────────────────────────────────────────────────────
+    ("ai_backend_status", [
+        r"\bai\s+backend\s+status\b",
+        r"\bshow\s+ai\s+(?:backend|status)\b",
+        r"\bwhich\s+ai\s+backend\b",
+        r"\bai\s+status\b",
+        r"\bbackend\s+status\b",
+    ]),
+
     # ── AI Assist commands ────────────────────────────────────────────────────
     ("ai_suggest_command", [
         r"\bsuggest\s+(?:a\s+)?(?:nabd\s+)?command\s+for\b",
