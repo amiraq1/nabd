@@ -548,6 +548,34 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
 
     # ── AI Assist results ──────────────────────────────────────────────────────
 
+    elif intent == "ai_backend_status":
+        err = raw.get("error")
+        if err:
+            lines.append(f"\n  ✗  {err}")
+            return
+        backend = raw.get("backend", "?")
+        available = raw.get("available", False)
+        enabled = raw.get("enabled", False)
+        detail = raw.get("detail", "")
+        avail_str = "✓ reachable" if available else "✗ unreachable"
+        enabled_str = "Enabled" if enabled else "Disabled"
+        lines.append(f"\n  Backend  : {backend}")
+        lines.append(f"  Status   : {enabled_str}")
+        lines.append(f"  Reachable: {avail_str}")
+        if backend == "llama_cpp":
+            lines.append(f"  Server   : {raw.get('server_url', '?')}")
+            lines.append(f"  Model    : {raw.get('model_name', '?')}")
+            lines.append(f"  Timeout  : {raw.get('timeout_seconds', '?')}s")
+        if detail:
+            lines.append(f"  Detail   : {detail}")
+        if not enabled:
+            lines.append("")
+            lines.append('  To enable: edit config/ai_assist.json → "enabled": true')
+        if backend == "llama_cpp" and not available:
+            lines.append("")
+            lines.append("  To start llama.cpp server:")
+            lines.append("    ./server -m model.gguf --port 8080 --host 127.0.0.1")
+
     elif intent in ("ai_suggest_command", "ai_explain_last_result", "ai_clarify_request"):
         _append_ai_result(lines, raw)
 
@@ -602,7 +630,7 @@ def _append_ai_result(lines: list, raw: dict) -> None:
         pct = int(confidence * 100)
         lines.append(f"  Suggested command : {cmd}")
         lines.append(f"  Reason            : {rationale}")
-        lines.append(f"  Confidence        : {pct}% (keyword-match score)")
+        lines.append(f"  Confidence        : {pct}%")
         lines.append("")
         lines.append("  To run this command, type it exactly as shown above.")
 
