@@ -26,6 +26,13 @@ def plan(intent: ParsedIntent) -> ExecutionPlan:
     planners = {
         # ── Diagnostic ─────────────────────────────────────────────────────────
         "doctor": _plan_doctor,
+        # ── Skills system ──────────────────────────────────────────────────────
+        "show_skills": _plan_show_skills,
+        "skill_info": _plan_skill_info,
+        # ── AI Assist (advisory only — never executes tool actions) ────────────
+        "ai_suggest_command": _plan_ai_suggest_command,
+        "ai_explain_last_result": _plan_ai_explain_last_result,
+        "ai_clarify_request": _plan_ai_clarify_request,
         # ── Phone status ───────────────────────────────────────────────────────
         "phone_status_battery": _plan_phone_battery,
         "phone_status_network": _plan_phone_network,
@@ -60,6 +67,86 @@ def plan(intent: ParsedIntent) -> ExecutionPlan:
         raise UnknownIntentError(f"No planner for intent: '{intent.intent}'")
 
     return handler(intent, settings)
+
+
+# ── Skills system ──────────────────────────────────────────────────────────────
+
+def _plan_show_skills(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(tool_name="skill", function_name="list_skills", arguments={})],
+        preview_summary="List all registered Nabd skills",
+    )
+
+
+def _plan_skill_info(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    skill_name = intent.query or ""
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="skill",
+            function_name="skill_info",
+            arguments={"skill_name": skill_name},
+        )],
+        preview_summary=f"Show details for skill: '{skill_name}'",
+    )
+
+
+# ── AI Assist planners (advisory only — no tool actions executed) ──────────────
+
+def _plan_ai_suggest_command(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    user_text = intent.query or ""
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="ai_skill",
+            function_name="suggest_command",
+            arguments={"user_text": user_text},
+        )],
+        preview_summary=f"AI suggests a Nabd command for: '{user_text}'",
+    )
+
+
+def _plan_ai_explain_last_result(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    last_command = intent.options.get("last_command", "")
+    last_result = intent.options.get("last_result", "")
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="ai_skill",
+            function_name="explain_result",
+            arguments={"last_command": last_command, "last_result": last_result},
+        )],
+        preview_summary="AI explains the last result in plain English",
+    )
+
+
+def _plan_ai_clarify_request(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    user_text = intent.query or ""
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="ai_skill",
+            function_name="clarify_request",
+            arguments={"user_text": user_text},
+        )],
+        preview_summary=f"AI clarifies request: '{user_text}'",
+    )
 
 
 # ── Diagnostic ─────────────────────────────────────────────────────────────────
