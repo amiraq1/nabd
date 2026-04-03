@@ -14,11 +14,8 @@ from core.paths import is_under_allowed_root, resolve_path
 
 TRAVERSAL_INDICATORS = ["..", "//", "\x00", "%2e", "%2f"]
 
-# Intents that only read data — no path, URL, or confirmation required
+# Intents that only read data and require no path, URL, or confirmation
 READ_ONLY_INTENTS = {
-    "storage_report",
-    "list_large_files",
-    "find_duplicates",
     "doctor",
     "phone_status_battery",
     "phone_status_network",
@@ -30,6 +27,14 @@ READ_ONLY_INTENTS = {
     "ai_explain_last_result",
     "ai_clarify_request",
     "ai_backend_status",
+}
+
+# Read-only intents that may accept a user-supplied path. If a path is present,
+# it must still pass the allowlist.
+READ_ONLY_PATH_INTENTS = {
+    "storage_report",
+    "list_large_files",
+    "find_duplicates",
 }
 
 # Browser intents that use a URL (not a local path)
@@ -165,6 +170,10 @@ def validate_query_safety(query: str) -> str:
     return cleaned
 
 
+def _is_same_or_descendant(path: str, base: str) -> bool:
+    return path == base or path.startswith(base + os.sep)
+
+
 def validate_intent_safety(intent: ParsedIntent) -> None:
     """
     Run all safety checks for a parsed intent.
@@ -175,6 +184,12 @@ def validate_intent_safety(intent: ParsedIntent) -> None:
 
     # ── Phone status / doctor: no paths or URLs needed ────────────────────────
     if name in READ_ONLY_INTENTS:
+        return
+
+    # ── Read-only intents with optional paths ─────────────────────────────────
+    if name in READ_ONLY_PATH_INTENTS:
+        if intent.source_path:
+            validate_path_safety(intent.source_path)
         return
 
     # ── Browser search ────────────────────────────────────────────────────────
@@ -208,8 +223,11 @@ def validate_intent_safety(intent: ParsedIntent) -> None:
         return
 
     # ── Path-required file intents ────────────────────────────────────────────
+    resolved_source: str | None = None
+    resolved_target: str | None = None
+
     if intent.source_path:
-        validate_path_safety(intent.source_path)
+        resolved_source = validate_path_safety(intent.source_path)
     elif name in PATH_REQUIRED_INTENTS:
         raise ValidationError(
             f"Please specify a directory path for '{name}'.\n"
@@ -217,13 +235,18 @@ def validate_intent_safety(intent: ParsedIntent) -> None:
         )
 
     if intent.target_path:
-        validate_path_safety(intent.target_path)
+        resolved_target = validate_path_safety(intent.target_path)
 
     if name == "backup_folder":
         if not intent.target_path:
             raise ValidationError(
                 "Please specify the destination for the backup.\n"
                 "  Example: back up /sdcard/Documents to /sdcard/Backup"
+            )
+        if resolved_source and resolved_target and _is_same_or_descendant(resolved_target, resolved_source):
+            raise SafetyError(
+                "Backup destination must be outside the source folder.\n"
+                "  Choose a separate destination root, not the same folder or one of its subfolders."
             )
 
     if name == "safe_move_files":
@@ -232,6 +255,23 @@ def validate_intent_safety(intent: ParsedIntent) -> None:
                 "Please specify the destination directory.\n"
                 "  Example: move /sdcard/Download/file.txt to /sdcard/Documents"
             )
+        if resolved_source and resolved_target:
+            source_parent = os.path.dirname(resolved_source.rstrip(os.sep)) or os.sep
+            if resolved_target == resolved_source:
+                raise SafetyError(
+                    "Move destination cannot be the same as the source path.\n"
+                    "  Choose a different destination directory."
+                )
+            if resolved_target == source_parent:
+                raise SafetyError(
+                    "Move destination cannot be the source's current parent directory.\n"
+                    "  That would be a no-op or an unintended rename."
+                )
+            if _is_same_or_descendant(resolved_target, resolved_source):
+                raise SafetyError(
+                    "Cannot move a folder into itself or one of its subfolders.\n"
+                    "  Choose a destination outside the source folder."
+                )
 
     if name == "convert_video_to_mp3":
         if intent.source_path:
