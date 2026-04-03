@@ -30,6 +30,7 @@ def plan(intent: ParsedIntent) -> ExecutionPlan:
         "show_skills": _plan_show_skills,
         "skill_info": _plan_skill_info,
         # ── AI Assist (advisory only — never executes tool actions) ────────────
+        "ai_backend_status": _plan_ai_backend_status,
         "ai_suggest_command": _plan_ai_suggest_command,
         "ai_explain_last_result": _plan_ai_explain_last_result,
         "ai_clarify_request": _plan_ai_clarify_request,
@@ -99,6 +100,21 @@ def _plan_skill_info(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
 
 
 # ── AI Assist planners (advisory only — no tool actions executed) ──────────────
+
+def _plan_ai_backend_status(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="skill",
+            function_name="backend_status",
+            arguments={},
+        )],
+        preview_summary="Show AI Assist backend status and availability",
+    )
+
 
 def _plan_ai_suggest_command(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
     user_text = intent.query or ""
