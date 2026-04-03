@@ -1778,5 +1778,174 @@ class TestReporterSuggestCommandFallback(unittest.TestCase):
         self.assertIn("advisory only", output.lower())
 
 
+class TestNullFieldCoercion(unittest.TestCase):
+    """
+    Null JSON fields (JSON null → Python None) must never surface as the
+    string "None" in user-facing output.  Each method must either use a
+    safe default or fall back gracefully.
+    """
+
+    def _make_backend(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        return LlamaCppBackend(endpoint="http://127.0.0.1:8080")
+
+    # ── suggest_command ────────────────────────────────────────────────────────
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_suggested_command_triggers_fallback(self, mock_chat):
+        """null suggested_command must NOT produce the string 'None' as a command."""
+        mock_chat.return_value = {"suggested_command": None, "rationale": "fine", "confidence": 0.9}
+        result = self._make_backend().suggest_command("do something", ["doctor"])
+        self.assertNotEqual(result.suggested_command, "None")
+        # Must fall back to the safe default
+        self.assertEqual(result.suggested_command, "doctor")
+        self.assertEqual(result.confidence, 0.0)
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_rationale_uses_default_text(self, mock_chat):
+        """null rationale must NOT produce the string 'None' — uses 'No rationale provided.'"""
+        mock_chat.return_value = {"suggested_command": "doctor", "rationale": None, "confidence": 0.8}
+        result = self._make_backend().suggest_command("do something", ["doctor"])
+        self.assertNotEqual(result.rationale, "None")
+        self.assertEqual(result.rationale, "No rationale provided.")
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_confidence_in_suggest_command_falls_back(self, mock_chat):
+        """null confidence cannot be float()-coerced — must fall back gracefully."""
+        mock_chat.return_value = {"suggested_command": "doctor", "rationale": "ok", "confidence": None}
+        result = self._make_backend().suggest_command("do something", ["doctor"])
+        # confidence=None → float(None or 0.0) = 0.0 — still produces a valid result
+        # (this path is NOT a fallback since 'or 0.0' handles None safely)
+        self.assertIsInstance(result.confidence, float)
+        self.assertNotIn("None", result.rationale)
+
+    # ── explain_result ─────────────────────────────────────────────────────────
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_summary_triggers_fallback(self, mock_chat):
+        """null summary must NOT produce 'None' — must fall back to safe message."""
+        mock_chat.return_value = {
+            "summary": None, "safety_note": None, "suggested_next_step": None
+        }
+        result = self._make_backend().explain_result("doctor", "ok")
+        self.assertNotEqual(result.summary, "None")
+        self.assertNotIn("None", result.summary)
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_safety_note_becomes_none_not_string(self, mock_chat):
+        """null safety_note must be Python None, not the string 'None'."""
+        mock_chat.return_value = {
+            "summary": "All good.", "safety_note": None, "suggested_next_step": None
+        }
+        result = self._make_backend().explain_result("doctor", "ok")
+        self.assertIsNone(result.safety_note)
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_next_step_becomes_none_not_string(self, mock_chat):
+        """null suggested_next_step must be Python None, not the string 'None'."""
+        mock_chat.return_value = {
+            "summary": "All good.", "safety_note": None, "suggested_next_step": None
+        }
+        result = self._make_backend().explain_result("doctor", "ok")
+        self.assertIsNone(result.suggested_next_step)
+
+    # ── clarify_request ────────────────────────────────────────────────────────
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_clarification_question_becomes_none(self, mock_chat):
+        """null clarification_question must be Python None, not the string 'None'."""
+        mock_chat.return_value = {
+            "clarification_needed": True,
+            "clarification_question": None,
+            "candidate_intents": [],
+        }
+        result = self._make_backend().clarify_request("hmm", ["doctor"])
+        self.assertIsNone(result.clarification_question)
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_clarification_needed_defaults_to_true(self, mock_chat):
+        """null clarification_needed must default to True (ask for clarification), not False."""
+        mock_chat.return_value = {
+            "clarification_needed": None,
+            "clarification_question": "What do you mean?",
+            "candidate_intents": [],
+        }
+        result = self._make_backend().clarify_request("hmm", ["doctor"])
+        self.assertTrue(result.clarification_needed)
+
+    # ── suggest_intent ─────────────────────────────────────────────────────────
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_explanation_uses_default_text(self, mock_chat):
+        """null explanation must NOT produce the string 'None' — uses 'No explanation provided.'"""
+        mock_chat.return_value = {
+            "intent": "doctor", "confidence": 0.8, "explanation": None
+        }
+        result = self._make_backend().suggest_intent("check my phone", ["doctor"])
+        self.assertNotEqual(result.explanation, "None")
+        self.assertEqual(result.explanation, "No explanation provided.")
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend._chat")
+    def test_null_intent_treated_as_no_match(self, mock_chat):
+        """null intent from model must be treated as no confident match."""
+        mock_chat.return_value = {
+            "intent": None, "confidence": 0.8, "explanation": "unclear"
+        }
+        result = self._make_backend().suggest_intent("check my phone", ["doctor"])
+        self.assertIsNone(result.intent)
+
+    # ── _coerce_str helper directly ────────────────────────────────────────────
+
+    def test_coerce_str_with_none_returns_default(self):
+        from llm.llama_cpp_backend import _coerce_str
+        self.assertEqual(_coerce_str(None), "")
+
+    def test_coerce_str_with_string_returns_stripped(self):
+        from llm.llama_cpp_backend import _coerce_str
+        self.assertEqual(_coerce_str("  hello  "), "hello")
+
+    def test_coerce_str_with_int_returns_str(self):
+        from llm.llama_cpp_backend import _coerce_str
+        self.assertEqual(_coerce_str(42), "42")
+
+    def test_coerce_str_custom_default_returned_for_none(self):
+        from llm.llama_cpp_backend import _coerce_str
+        self.assertEqual(_coerce_str(None, default="fallback"), "fallback")
+
+
+class TestServerStatusDetail(unittest.TestCase):
+    """
+    _server_status() detail message must be concise.
+    The reporter footer already prints the startup command — the detail
+    field must NOT duplicate it.
+    """
+
+    def _make_backend(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        return LlamaCppBackend(endpoint="http://127.0.0.1:8080")
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend.is_available", return_value=False)
+    def test_unreachable_detail_does_not_contain_start_with(self, _):
+        """Detail must not repeat the startup command — reporter footer already shows it."""
+        backend = self._make_backend()
+        status = backend.get_status()
+        self.assertNotIn("Start with:", status.detail)
+        self.assertNotIn("./server", status.detail)
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend.is_available", return_value=False)
+    def test_unreachable_detail_contains_endpoint(self, _):
+        """Detail must still identify which endpoint is not responding."""
+        backend = self._make_backend()
+        status = backend.get_status()
+        self.assertIn("127.0.0.1:8080", status.detail)
+
+    @patch("llm.llama_cpp_backend.LlamaCppBackend.is_available", return_value=True)
+    def test_reachable_detail_contains_connected(self, _):
+        """When server is up, detail says 'Connected to <endpoint>'."""
+        backend = self._make_backend()
+        status = backend.get_status()
+        self.assertIn("Connected to", status.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

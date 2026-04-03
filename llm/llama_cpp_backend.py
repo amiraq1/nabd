@@ -136,10 +136,7 @@ class LlamaCppBackend(LLMBackend):
         if available:
             detail = f"Connected to {self._endpoint}"
         else:
-            detail = (
-                f"Server at {self._endpoint} is not responding. "
-                "Start with: ./server -m model.gguf --port 8080 --host 127.0.0.1"
-            )
+            detail = f"Server at {self._endpoint} is not responding."
         return BackendStatus(
             available=available,
             backend_name="llama_cpp",
@@ -326,12 +323,12 @@ class LlamaCppBackend(LLMBackend):
         )
         try:
             data = self._chat(LLAMA_SYSTEM_PROMPT, user_prompt)
-            cmd = str(data.get("suggested_command", "")).strip()
-            rationale = str(data.get("rationale", "")).strip()
-            confidence = float(data.get("confidence", 0.0))
+            cmd = _coerce_str(data.get("suggested_command"))
+            rationale = _coerce_str(data.get("rationale"))
+            confidence = float(data.get("confidence") or 0.0)
             confidence = max(0.0, min(1.0, confidence))
             if not cmd:
-                raise ValueError("'suggested_command' field is empty")
+                raise ValueError("'suggested_command' field is empty or null")
             return CommandSuggestion(
                 suggested_command=cmd,
                 rationale=rationale or "No rationale provided.",
@@ -367,15 +364,11 @@ class LlamaCppBackend(LLMBackend):
         )
         try:
             data = self._chat(LLAMA_SYSTEM_PROMPT, user_prompt)
-            summary = str(data.get("summary", "")).strip()
-            safety_note = data.get("safety_note") or None
-            if safety_note:
-                safety_note = str(safety_note).strip() or None
-            next_step = data.get("suggested_next_step") or None
-            if next_step:
-                next_step = str(next_step).strip() or None
+            summary = _coerce_str(data.get("summary"))
+            safety_note = _coerce_str(data.get("safety_note")) or None
+            next_step = _coerce_str(data.get("suggested_next_step")) or None
             if not summary:
-                raise ValueError("'summary' field is empty")
+                raise ValueError("'summary' field is empty or null")
             return ResultExplanation(
                 summary=summary,
                 safety_note=safety_note,
@@ -406,8 +399,10 @@ class LlamaCppBackend(LLMBackend):
         )
         try:
             data = self._chat(LLAMA_SYSTEM_PROMPT, user_prompt)
-            needed = bool(data.get("clarification_needed", True))
-            question = str(data.get("clarification_question", "")).strip() or None
+            # null clarification_needed → default to True (ask for clarification)
+            needed_raw = data.get("clarification_needed")
+            needed = True if needed_raw is None else bool(needed_raw)
+            question = _coerce_str(data.get("clarification_question")) or None
             raw_candidates = data.get("candidate_intents", [])
             if not isinstance(raw_candidates, list):
                 raw_candidates = []
@@ -445,10 +440,10 @@ class LlamaCppBackend(LLMBackend):
             data = self._chat(LLAMA_SYSTEM_PROMPT, user_prompt)
             intent = data.get("intent") or None
             if intent:
-                intent = str(intent).strip()
-            confidence = float(data.get("confidence", 0.0))
+                intent = _coerce_str(intent) or None
+            confidence = float(data.get("confidence") or 0.0)
             confidence = max(0.0, min(1.0, confidence))
-            explanation = str(data.get("explanation", "")).strip()
+            explanation = _coerce_str(data.get("explanation"))
 
             # Safety gate 1 — discard any intent not in the allowed whitelist
             if intent and intent not in allowed_intents:
@@ -491,6 +486,19 @@ class LlamaCppBackend(LLMBackend):
 
 
 # ── Output parsing helpers ────────────────────────────────────────────────────
+
+
+def _coerce_str(value: Any, default: str = "") -> str:
+    """
+    Safely coerce a model field to str.
+
+    JSON null (Python None) and missing keys both return `default`.
+    This prevents the string "None" from appearing in user-facing output
+    when a model returns null for a required string field.
+    """
+    if value is None:
+        return default
+    return str(value).strip()
 
 
 def _parse_chat_response(raw: str) -> dict[str, Any]:
