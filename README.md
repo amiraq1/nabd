@@ -12,9 +12,10 @@ Nabd accepts natural-language commands in English, turns them into structured in
 
 - **Local-only** — no cloud, no network, no external AI APIs required for core functionality.
 - **Safety first** — every path is checked against `config/allowed_paths.json`. Path traversal (`..`) is blocked at the parser. URL schemes are validated (only `https://` and `http://` permitted).
-- **Preview before apply** — modifying operations run a dry-run pass first. You see exactly what will change.
+- **Preview before apply** — modifying operations run a dry-run pass first. If the preview fails, Nabd stops before confirmation or any real changes.
 - **Explicit confirmation** — you type `y` before any file is moved, renamed, or overwritten, or before a URL/file is opened.
 - **Whitelisted execution** — only explicitly declared tool functions can be called. No arbitrary shell execution. No arbitrary browser automation.
+- **Advisory AI suggestions only** — Nabd can suggest safe next commands based on the current result and recent history, but it never auto-runs them.
 - **English-only** — clean input; no multi-language ambiguity.
 
 ---
@@ -189,6 +190,34 @@ Moves a file or folder to a new location.
 history
 ```
 Shows your 20 most recent commands with status, timestamp, and intent.
+
+---
+
+### Advisory suggestions
+
+After a command finishes, Nabd may show a short `ADVISORY SUGGESTIONS` block.
+These suggestions are:
+
+- informational only
+- never auto-executed
+- generated after the normal parse → safety → planner → executor flow
+- based on the current result and recent command history when available
+- filtered so recent history is only reused when embedded paths stay inside allowed roots and reused URL commands still pass Nabd's URL-safety checks
+
+Examples:
+
+```text
+ADVISORY SUGGESTIONS
+  - Review the biggest files next: list large files /sdcard/Download
+  - Check duplicates in the same folder: find duplicates /sdcard/Download
+```
+
+Typical advisory follow-ups include:
+
+- storage and folder-inspection next steps such as `list large files`, `find duplicates`, `list media`, and `show files`
+- browser follow-ups such as `list links from ...` after a successful text extract
+- environment recovery hints after `doctor` or TLS / Termux integration failures
+- post-change review commands such as checking a backup folder or reviewing a destination folder after a move
 
 ---
 
@@ -376,6 +405,7 @@ main.py  (CLI loop)
         safety.py    — path validation + intent-level guards
         planner.py   — ParsedIntent → ExecutionPlan + ToolActions
         executor.py  — ExecutionPlan → ExecutionResult (whitelist enforced)
+        advisor.py   — advisory-only next-step suggestions from result + history
         reporter.py  — ExecutionResult → human-readable text
 
   tools/
@@ -402,7 +432,7 @@ cd nabd
 python -m pytest tests/ -v
 ```
 
-397 tests across `test_parser.py`, `test_tools.py`, `test_safety.py`, `test_planner.py`, `test_executor.py`, `test_integration.py`, `test_v2.py`, and `test_v4_phone_browser.py`.
+Tests cover parser, safety, planner, executor, tools, phone/browser flows, TLS handling, and advisory suggestions.
 
 ---
 

@@ -15,6 +15,7 @@ from agent.planner import plan
 from agent.safety import validate_intent_safety
 from agent.executor import execute
 from agent.reporter import report_parsed_intent, report_plan, report_result
+from agent.advisor import format_advisory_suggestions, generate_advisory_suggestions
 from core.exceptions import (
     NabdError,
     SafetyError,
@@ -24,7 +25,7 @@ from core.exceptions import (
     UnknownIntentError,
     ConfigError,
 )
-from core.logging_db import log_operation
+from core.logging_db import get_history, log_operation
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
@@ -254,7 +255,6 @@ def prompt_confirmation(plan_summary: str, risk_label: str) -> bool:
 
 
 def show_history() -> None:
-    from core.logging_db import get_history
     entries = get_history(limit=20)
     if not entries:
         print("\n  No history yet. Run some commands first.")
@@ -322,6 +322,18 @@ def run_command(command: str) -> None:
         intent_repr = parsed.intent
         plan_repr = execution_plan.preview_summary
 
+        # Modifying plans support a real dry-run preview. Show the actual
+        # computed changes before asking for confirmation.
+        if execution_plan.requires_confirmation and execution_plan.dry_run:
+            preview_result = execute(execution_plan, confirmed=False)
+            print(report_result(preview_result, parsed.intent, confirmed=False))
+            if preview_result.status == OperationStatus.FAILURE:
+                affected_paths = preview_result.affected_paths
+                log_status = preview_result.status.value
+                if preview_result.errors:
+                    error_detail = "; ".join(preview_result.errors)
+                return
+
         if execution_plan.requires_confirmation:
             risk_label = execution_plan.risk_level.value.upper()
             confirmed = prompt_confirmation(execution_plan.preview_summary, risk_label)
@@ -334,6 +346,15 @@ def run_command(command: str) -> None:
 
         result = execute(execution_plan, confirmed=confirmed)
         print(report_result(result, parsed.intent, confirmed))
+
+        suggestions = generate_advisory_suggestions(
+            parsed,
+            result,
+            recent_history=get_history(limit=5),
+        )
+        advisory_text = format_advisory_suggestions(suggestions)
+        if advisory_text:
+            print(advisory_text)
 
         affected_paths = result.affected_paths
         log_status = result.status.value
