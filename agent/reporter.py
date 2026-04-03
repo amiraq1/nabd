@@ -494,6 +494,63 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         else:
             lines.append("  (no readable text found)")
 
+    # ── Skills system ──────────────────────────────────────────────────────────
+
+    elif intent == "show_skills":
+        skills = raw.get("skills", [])
+        count = len(skills)
+        lines.append(f"\n  {count} skill(s) registered\n")
+        for s in skills:
+            status = "✓ enabled " if s.get("enabled") else "- disabled"
+            name = s.get("name", "?")
+            ver = s.get("version", "?")
+            desc = s.get("description", "")
+            tags = ", ".join(s.get("tags", []))
+            lines.append(f"  {status}  {name:<20} v{ver}")
+            lines.append(f"              {desc}")
+            if tags:
+                lines.append(f"              Tags: {tags}")
+            lines.append("")
+        if count == 0:
+            lines.append("  No skills registered.")
+
+    elif intent == "skill_info":
+        err = raw.get("error")
+        if err:
+            lines.append(f"\n  ✗  {err}")
+            lines.append("     Type 'show skills' to see available skills.")
+            return
+        s = raw.get("skill", {}) or {}
+        name = s.get("name", "?")
+        ver = s.get("version", "?")
+        desc = s.get("description", "")
+        enabled = s.get("enabled", False)
+        tags = ", ".join(s.get("tags", []))
+        lines.append(f"\n  Name       : {name}")
+        lines.append(f"  Version    : v{ver}")
+        lines.append(f"  Status     : {'Enabled' if enabled else 'Disabled'}")
+        lines.append(f"  Description: {desc}")
+        if tags:
+            lines.append(f"  Tags       : {tags}")
+        if name == "ai_assist":
+            lines.append("")
+            lines.append("  Commands:")
+            lines.append("    suggest command for <text>")
+            lines.append("    explain last result")
+            lines.append("    help me with <text>")
+            lines.append("")
+            lines.append("  Note: AI suggestions are advisory only.")
+            lines.append("        Actions are never executed automatically.")
+            if not enabled:
+                lines.append("")
+                lines.append("  To enable:")
+                lines.append('    Edit config/ai_assist.json → set "enabled": true')
+
+    # ── AI Assist results ──────────────────────────────────────────────────────
+
+    elif intent in ("ai_suggest_command", "ai_explain_last_result", "ai_clarify_request"):
+        _append_ai_result(lines, raw)
+
     elif intent == "browser_list_links":
         success = raw.get("success", False)
         url = raw.get("url", "?")
@@ -521,3 +578,52 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             lines.append(f"  {i:>3}.  {href}")
         if extra:
             lines.append(f"\n  ... and {extra} more link(s) not shown.")
+
+
+def _append_ai_result(lines: list, raw: dict) -> None:
+    """Format AI Assist results — suggest_command, explain_result, clarify_request."""
+    success = raw.get("success", True)
+    ai_type = raw.get("type", "")
+
+    # ── Disabled / error ──────────────────────────────────────────────────────
+    if not success:
+        error = raw.get("error", "AI Assist is unavailable.")
+        lines.append("\n  ✗  AI Assist unavailable.")
+        for line in error.strip().splitlines():
+            lines.append(f"     {line.strip()}")
+        return
+
+    lines.append("\n  ⓘ  Advisory only — no action has been taken.\n")
+
+    if ai_type == "suggest_command":
+        cmd = raw.get("suggested_command", "?")
+        rationale = raw.get("rationale", "")
+        confidence = raw.get("confidence", 0.0)
+        pct = int(confidence * 100)
+        lines.append(f"  Suggested command : {cmd}")
+        lines.append(f"  Reason            : {rationale}")
+        lines.append(f"  Confidence        : {pct}% (keyword-match score)")
+        lines.append("")
+        lines.append("  To run this command, type it exactly as shown above.")
+
+    elif ai_type == "explain_result":
+        summary = raw.get("summary", "")
+        safety_note = raw.get("safety_note")
+        next_step = raw.get("suggested_next_step")
+        if summary:
+            lines.append(f"  Summary   : {summary}")
+        if safety_note:
+            lines.append(f"  ⚠ Safety  : {safety_note}")
+        if next_step:
+            lines.append(f"  Next step : {next_step}")
+
+    elif ai_type == "clarify_request":
+        needed = raw.get("clarification_needed", False)
+        question = raw.get("clarification_question")
+        candidates = raw.get("candidate_intents", [])
+        if question:
+            lines.append(f"  Question  : {question}")
+        if candidates:
+            lines.append(f"  Candidates: {', '.join(candidates)}")
+        if not needed and not question:
+            lines.append("  Your request seems clear. Try typing it as a Nabd command.")
