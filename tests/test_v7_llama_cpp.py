@@ -144,6 +144,38 @@ class TestLlamaCppChat(unittest.TestCase):
                 backend._chat("sys", "user")
         self.assertIn("Expected JSON object", str(ctx.exception))
 
+    def test_chat_accepts_preparsed_dict_content(self):
+        """Some llama.cpp builds return content as a dict, not a JSON string."""
+        backend = self._make_backend()
+        content_dict = {"suggested_command": "doctor", "rationale": "ok", "confidence": 0.9}
+        # content field is a dict, not a JSON string
+        outer = {"choices": [{"message": {"content": content_dict}}]}
+        # We can't use _make_http_response directly since it json.dumps the whole body,
+        # which will serialize content_dict as a nested dict — exactly the format to test.
+        raw = json.dumps(outer).encode("utf-8")
+        resp = MagicMock()
+        resp.read.return_value = raw
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = backend._chat("sys", "user")
+        self.assertEqual(result["suggested_command"], "doctor")
+
+    def test_chat_preparsed_dict_used_in_suggest_command(self):
+        """End-to-end: pre-parsed dict content → valid CommandSuggestion, not fallback."""
+        backend = self._make_backend()
+        content_dict = {"suggested_command": "backup_folder", "rationale": "safest", "confidence": 0.88}
+        outer = {"choices": [{"message": {"content": content_dict}}]}
+        raw = json.dumps(outer).encode("utf-8")
+        resp = MagicMock()
+        resp.read.return_value = raw
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = backend.suggest_command("back up my files", ["backup_folder", "doctor"])
+        self.assertEqual(result.suggested_command, "backup_folder")
+        self.assertGreater(result.confidence, 0.0)
+
     def test_chat_sends_json_content_type(self):
         backend = self._make_backend()
         payload = {"suggested_command": "doctor", "rationale": "ok", "confidence": 0.5}
@@ -444,6 +476,60 @@ class TestLlamaCppSuggestIntent(unittest.TestCase):
         with patch("urllib.request.urlopen", return_value=resp):
             result = backend.suggest_intent("check", ["doctor"])
         self.assertIsNone(result.intent)
+
+    def test_low_confidence_gate_rejects_below_threshold(self):
+        """Spec §12: low-confidence results must not be treated as valid commands."""
+        backend = self._make_backend()
+        payload = {"intent": "doctor", "confidence": 0.2, "explanation": "weak match"}
+        with self._mock_chat(payload):
+            result = backend.suggest_intent("vague request", ["doctor"])
+        self.assertIsNone(result.intent)
+        self.assertAlmostEqual(result.confidence, 0.2)
+        self.assertIn("threshold", result.explanation.lower())
+
+    def test_low_confidence_gate_boundary_exactly_at_threshold(self):
+        """Confidence exactly == 0.4 is not 'below 0.4' — it passes through."""
+        backend = self._make_backend()
+        payload = {"intent": "doctor", "confidence": 0.4, "explanation": "borderline"}
+        with self._mock_chat(payload):
+            result = backend.suggest_intent("check", ["doctor"])
+        self.assertEqual(result.intent, "doctor")
+        self.assertAlmostEqual(result.confidence, 0.4)
+
+    def test_low_confidence_gate_boundary_just_below_threshold(self):
+        """Confidence 0.39 is below 0.4 → rejected."""
+        backend = self._make_backend()
+        payload = {"intent": "doctor", "confidence": 0.39, "explanation": "too weak"}
+        with self._mock_chat(payload):
+            result = backend.suggest_intent("vague", ["doctor"])
+        self.assertIsNone(result.intent)
+
+    def test_high_confidence_passes_gate(self):
+        """Confidence above threshold with whitelisted intent → accepted."""
+        backend = self._make_backend()
+        payload = {"intent": "doctor", "confidence": 0.75, "explanation": "checks env"}
+        with self._mock_chat(payload):
+            result = backend.suggest_intent("check my setup", ["doctor"])
+        self.assertEqual(result.intent, "doctor")
+        self.assertAlmostEqual(result.confidence, 0.75)
+
+    def test_low_confidence_non_whitelisted_still_whitelist_rejected(self):
+        """Whitelist check fires first — non-whitelisted intent with any confidence → None."""
+        backend = self._make_backend()
+        payload = {"intent": "rm_all_files", "confidence": 0.9, "explanation": "very sure"}
+        with self._mock_chat(payload):
+            result = backend.suggest_intent("delete everything", ["doctor"])
+        self.assertIsNone(result.intent)
+        self.assertEqual(result.confidence, 0.0)   # whitelist gate resets confidence to 0.0
+
+    def test_null_intent_with_any_confidence_passes_through(self):
+        """intent=null means 'no match' — always valid regardless of confidence."""
+        backend = self._make_backend()
+        payload = {"intent": None, "confidence": 0.1, "explanation": "no match"}
+        with self._mock_chat(payload):
+            result = backend.suggest_intent("xyzzy", ["doctor"])
+        self.assertIsNone(result.intent)
+        self.assertAlmostEqual(result.confidence, 0.1)
 
 
 # ── AIAssistSkill — llama_cpp backend selection ───────────────────────────────
