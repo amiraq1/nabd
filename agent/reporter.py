@@ -654,6 +654,9 @@ def _append_ai_result(lines: list, raw: dict) -> None:
         rationale = raw.get("rationale", "")
         confidence = raw.get("confidence", 0.0)
         pct = int(confidence * 100)
+        if pct == 0:
+            lines.append("\n  ⚠  AI backend unavailable — showing safe default, not an AI suggestion.")
+            lines.append("     Run 'ai backend status' to check your AI configuration.\n")
         lines.append(f"  Suggested command : {cmd}")
         lines.append(f"  Reason            : {rationale}")
         lines.append(f"  Confidence        : {pct}%")
