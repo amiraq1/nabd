@@ -43,6 +43,8 @@ _DEFAULT_TIMEOUT = 20        # if not in config
 _DEFAULT_MAX_TOKENS = 256
 _DEFAULT_TEMPERATURE = 0.2
 _DEFAULT_ENDPOINT = "http://127.0.0.1:8080"
+_LOW_CONFIDENCE_THRESHOLD = 0.4   # matches threshold stated in SUGGEST_INTENT_JSON_TEMPLATE
+_STDERR_SNIPPET_MAX = 80     # max chars of llama-cli stderr shown to user
 
 
 class LlamaCppBackend(LLMBackend):
@@ -286,7 +288,12 @@ class LlamaCppBackend(LLMBackend):
             raise ConnectionError(f"Failed to launch llama-cli: {e}")
 
         if proc.returncode != 0:
-            stderr_snippet = proc.stderr[:200] if proc.stderr else "(no stderr)"
+            raw_err = (proc.stderr or "").strip()
+            stderr_snippet = (
+                raw_err[:_STDERR_SNIPPET_MAX] + "…"
+                if len(raw_err) > _STDERR_SNIPPET_MAX
+                else raw_err or "(no stderr)"
+            )
             raise ConnectionError(
                 f"llama-cli exited with code {proc.returncode}: {stderr_snippet}"
             )
@@ -476,8 +483,6 @@ class LlamaCppBackend(LLMBackend):
 
 
 # ── Output parsing helpers ────────────────────────────────────────────────────
-
-_LOW_CONFIDENCE_THRESHOLD = 0.4   # matches the threshold stated in SUGGEST_INTENT_JSON_TEMPLATE
 
 
 def _parse_chat_response(raw: str) -> dict[str, Any]:
