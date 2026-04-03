@@ -66,9 +66,13 @@ def _load_config() -> dict:
             "mode": "assist_only",
             "fallback_intent_suggestion": False,
             "llama_cpp": {
-                "server_url": "http://localhost:8080",
-                "timeout_seconds": 30,
-                "model_name": "nabd-assistant",
+                "transport": "server",
+                "endpoint": "http://127.0.0.1:8080",
+                "binary_path": "",
+                "model_path": "",
+                "timeout_seconds": 20,
+                "max_tokens": 256,
+                "temperature": 0.2,
             },
         }
 
@@ -96,10 +100,22 @@ class AIAssistSkill(SkillBase):
         if self._backend is None:
             if self.backend_name == "llama_cpp":
                 from llm.llama_cpp_backend import LlamaCppBackend
+                cfg = self._llama_cfg
+                # Support both "endpoint" (spec) and "server_url" (legacy) config keys
+                endpoint = (
+                    cfg.get("endpoint")
+                    or cfg.get("server_url")
+                    or "http://127.0.0.1:8080"
+                )
                 self._backend = LlamaCppBackend(
-                    server_url=self._llama_cfg.get("server_url", "http://localhost:8080"),
-                    timeout_seconds=self._llama_cfg.get("timeout_seconds", 30),
-                    model_name=self._llama_cfg.get("model_name"),
+                    endpoint=endpoint,
+                    transport=cfg.get("transport", "server"),
+                    timeout_seconds=cfg.get("timeout_seconds", 20),
+                    max_tokens=cfg.get("max_tokens", 256),
+                    temperature=cfg.get("temperature", 0.2),
+                    model_name=cfg.get("model_name"),
+                    binary_path=cfg.get("binary_path", ""),
+                    model_path=cfg.get("model_path", ""),
                 )
             else:
                 from llm.local_backend import LocalBackend
@@ -119,47 +135,48 @@ class AIAssistSkill(SkillBase):
         """
         Return a status dict describing the active backend and its availability.
         Safe to call whether or not AI Assist is enabled.
+        Delegates to backend.get_status() for structured, transport-aware reporting.
         """
-        backend_name = self.backend_name
-        available: bool
-        detail: str
+        try:
+            backend = self._get_backend()
+            status = backend.get_status()
+        except Exception as e:
+            return {
+                "backend": self.backend_name,
+                "available": False,
+                "enabled": self.enabled,
+                "transport": None,
+                "detail": f"Error initialising backend: {e}",
+            }
 
-        if backend_name == "llama_cpp":
-            server_url = self._llama_cfg.get("server_url", "http://localhost:8080")
-            timeout = self._llama_cfg.get("timeout_seconds", 30)
-            model = self._llama_cfg.get("model_name", "nabd-assistant")
-            try:
-                backend = self._get_backend()
-                available = backend.is_available()
-                if available:
-                    detail = f"Connected to {server_url}"
-                else:
-                    detail = (
-                        f"Server at {server_url} is not responding. "
-                        "Start llama.cpp with: ./server -m model.gguf --port 8080"
-                    )
-            except Exception as e:
-                available = False
-                detail = f"Error probing backend: {e}"
-            return {
-                "backend": "llama_cpp",
-                "available": available,
-                "enabled": self.enabled,
-                "server_url": server_url,
-                "timeout_seconds": timeout,
-                "model_name": model,
-                "detail": detail,
-            }
-        else:
-            return {
-                "backend": "local",
-                "available": True,
-                "enabled": self.enabled,
-                "detail": (
-                    "LocalBackend — deterministic keyword matching. "
-                    "Always available, no server required."
-                ),
-            }
+        result: dict[str, Any] = {
+            "backend": status.backend_name,
+            "available": status.available,
+            "enabled": self.enabled,
+            "transport": status.transport,
+            "healthy": status.healthy,
+            "detail": status.detail,
+        }
+
+        if self.backend_name == "llama_cpp":
+            cfg = self._llama_cfg
+            endpoint = (
+                cfg.get("endpoint")
+                or cfg.get("server_url")
+                or "http://127.0.0.1:8080"
+            )
+            result["endpoint"] = endpoint
+            result["server_url"] = endpoint       # backward-compat alias
+            result["timeout_seconds"] = cfg.get("timeout_seconds", 20)
+            result["model_name"] = cfg.get("model_name", "")
+            result["max_tokens"] = cfg.get("max_tokens", 256)
+            result["temperature"] = cfg.get("temperature", 0.2)
+            transport = cfg.get("transport", "server")
+            if transport == "cli":
+                result["binary_path"] = cfg.get("binary_path", "")
+                result["model_path"] = cfg.get("model_path", "")
+
+        return result
 
     def _check_enabled(self) -> None:
         if not self.enabled:
