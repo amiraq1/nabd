@@ -106,12 +106,28 @@ class TestLlamaCppChat(unittest.TestCase):
             result = backend._chat("sys", "user")
         self.assertEqual(result["suggested_command"], "doctor")
 
-    def test_chat_raises_timeout_error(self):
+    def test_chat_raises_timeout_error_bare_socket_timeout(self):
+        """Bare socket.timeout — raised directly in some edge cases / test mocks."""
         backend = self._make_backend()
         with patch("urllib.request.urlopen", side_effect=socket.timeout()):
             with self.assertRaises(TimeoutError) as ctx:
                 backend._chat("sys", "user")
         self.assertIn("timed out", str(ctx.exception).lower())
+        self.assertIn("timeout_seconds", str(ctx.exception))
+
+    def test_chat_raises_timeout_error_via_urlerror_production_path(self):
+        """
+        Production-path timeout: urllib wraps socket.timeout as
+        URLError(reason=socket.timeout(...)).  This is how it fires in real usage.
+        The previous test covers the mock path; this test covers the real path.
+        """
+        backend = self._make_backend()
+        wrapped = urllib.error.URLError(socket.timeout("timed out"))
+        with patch("urllib.request.urlopen", side_effect=wrapped):
+            with self.assertRaises(TimeoutError) as ctx:
+                backend._chat("sys", "user")
+        self.assertIn("timed out", str(ctx.exception).lower())
+        self.assertIn("timeout_seconds", str(ctx.exception))
 
     def test_chat_raises_connection_error(self):
         backend = self._make_backend()
@@ -120,6 +136,14 @@ class TestLlamaCppChat(unittest.TestCase):
             with self.assertRaises(ConnectionError) as ctx:
                 backend._chat("sys", "user")
         self.assertIn("unavailable", str(ctx.exception).lower())
+
+    def test_chat_urlerror_non_timeout_reason_is_connection_error(self):
+        """A URLError whose reason is NOT socket.timeout → ConnectionError, not TimeoutError."""
+        backend = self._make_backend()
+        with patch("urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("Connection refused")):
+            with self.assertRaises(ConnectionError):
+                backend._chat("sys", "user")
 
     def test_chat_raises_value_error_on_invalid_json(self):
         backend = self._make_backend()
@@ -224,13 +248,24 @@ class TestLlamaCppSuggestCommand(unittest.TestCase):
             result = backend.suggest_command("check", ["doctor"])
         self.assertGreaterEqual(result.confidence, 0.0)
 
-    def test_falls_back_on_timeout(self):
+    def test_falls_back_on_timeout_bare(self):
         backend = self._make_backend()
         with patch("urllib.request.urlopen", side_effect=socket.timeout()):
             result = backend.suggest_command("check my setup", ["doctor"])
         self.assertEqual(result.suggested_command, "doctor")
         self.assertEqual(result.confidence, 0.0)
         self.assertIn("timed out", result.rationale.lower())
+
+    def test_falls_back_on_timeout_production_path(self):
+        """URLError(reason=socket.timeout) — the path that fires in real urllib usage."""
+        backend = self._make_backend()
+        wrapped = urllib.error.URLError(socket.timeout("timed out"))
+        with patch("urllib.request.urlopen", side_effect=wrapped):
+            result = backend.suggest_command("check my setup", ["doctor"])
+        self.assertEqual(result.suggested_command, "doctor")
+        self.assertEqual(result.confidence, 0.0)
+        self.assertIn("timed out", result.rationale.lower())
+        self.assertIn("unavailable", result.rationale.lower())
 
     def test_falls_back_on_connection_refused(self):
         backend = self._make_backend()
@@ -1674,8 +1709,18 @@ class TestCliStderrCapped(unittest.TestCase):
 # ── Audit: M3 — Reporter distinguishes 0%-confidence fallback from real suggestion ──
 
 class TestReporterSuggestCommandFallback(unittest.TestCase):
+    """
+    M3 audit fix: reporter must distinguish backend-unavailable fallback
+    (confidence==0.0 AND "unavailable" in rationale) from a genuine 0%-confidence
+    model response (which should NOT show the "AI unavailable" warning).
+    """
 
-    def _make_report(self, confidence: float, rationale: str = "some reason") -> str:
+    _FALLBACK_RATIONALE = (
+        "AI backend unavailable (timed out). "
+        "'doctor' checks your environment and is always a safe starting point."
+    )
+
+    def _make_report(self, confidence: float, rationale: str = "checks your setup") -> str:
         from agent.reporter import report_result
         from agent.models import ExecutionResult, OperationStatus
         result = ExecutionResult(
@@ -1691,36 +1736,45 @@ class TestReporterSuggestCommandFallback(unittest.TestCase):
         )
         return report_result(result, "ai_suggest_command", confirmed=False)
 
-    def test_zero_confidence_shows_unavailable_warning(self):
-        output = self._make_report(0.0, "AI backend unavailable (reason). 'doctor'...")
+    def test_explicit_fallback_shows_unavailable_warning(self):
+        """confidence==0.0 + 'unavailable' in rationale → show warning."""
+        output = self._make_report(0.0, self._FALLBACK_RATIONALE)
         self.assertIn("unavailable", output.lower())
         self.assertIn("safe default", output.lower())
 
-    def test_zero_confidence_still_shows_suggested_command(self):
-        output = self._make_report(0.0)
+    def test_explicit_fallback_still_shows_command_and_confidence(self):
+        output = self._make_report(0.0, self._FALLBACK_RATIONALE)
         self.assertIn("doctor", output)
         self.assertIn("0%", output)
 
+    def test_zero_confidence_without_unavailable_in_rationale_no_warning(self):
+        """
+        A model legitimately returning 0.0 confidence must NOT trigger the warning.
+        Only the explicit fallback (rationale contains 'unavailable') should.
+        """
+        output = self._make_report(0.0, "very uncertain match")
+        self.assertNotIn("safe default", output.lower())
+
     def test_nonzero_confidence_does_not_show_unavailable_warning(self):
         output = self._make_report(0.75, "checks your environment")
-        self.assertNotIn("unavailable", output.lower())
+        self.assertNotIn("safe default", output.lower())
         self.assertIn("75%", output)
 
     def test_low_but_nonzero_confidence_no_unavailable_warning(self):
         output = self._make_report(0.1, "weak match")
-        self.assertNotIn("unavailable", output.lower())
+        self.assertNotIn("safe default", output.lower())
         self.assertIn("10%", output)
 
     def test_unavailable_warning_mentions_ai_backend_status(self):
-        output = self._make_report(0.0)
+        output = self._make_report(0.0, self._FALLBACK_RATIONALE)
         self.assertIn("ai backend status", output.lower())
 
-    def test_advisory_header_still_present_for_zero_confidence(self):
-        output = self._make_report(0.0)
+    def test_advisory_header_always_present_for_fallback(self):
+        output = self._make_report(0.0, self._FALLBACK_RATIONALE)
         self.assertIn("advisory only", output.lower())
 
-    def test_advisory_header_present_for_real_suggestion(self):
-        output = self._make_report(0.85)
+    def test_advisory_header_always_present_for_real_suggestion(self):
+        output = self._make_report(0.85, "checks your environment")
         self.assertIn("advisory only", output.lower())
 
 
