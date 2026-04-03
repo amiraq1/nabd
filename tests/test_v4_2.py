@@ -524,9 +524,9 @@ class TestShellCommandPython(unittest.TestCase):
 
 class TestHelpText(unittest.TestCase):
 
-    def test_version_is_v06(self):
+    def test_version_is_v07(self):
         from main import HELP_TEXT
-        self.assertIn("v0.6", HELP_TEXT)
+        self.assertIn("v0.7", HELP_TEXT)
 
     def test_show_folders_in_help(self):
         from main import HELP_TEXT
