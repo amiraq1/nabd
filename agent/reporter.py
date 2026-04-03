@@ -147,12 +147,12 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
     elif intent == "list_large_files":
         files = raw if isinstance(raw, list) else raw.get("files", [])
         lines.append(f"\n  Found {len(files)} large file(s):")
-        shown, extra = truncate_list(files, 15)
+        shown, extra = truncate_list(files, 20)
         for item in shown:
             if isinstance(item, dict):
                 lines.append(f"    {item.get('size_human', '?'):>10}  {item.get('path', '')}")
         if extra:
-            lines.append(f"    ... and {extra} more large files (use 'list large files <path> limit N' to see more)")
+            lines.append(f"    ... and {extra} more")
 
     elif intent == "show_files":
         entries = raw.get("entries", [])
@@ -166,16 +166,14 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         lines.append(f"  Contents  : {file_count} file(s), {dir_count} folder(s)  (sorted by {sort_by})")
         lines.append("")
 
-        shown_entries, extra_entries = truncate_list(entries, 15)
-        for entry in shown_entries:
+        for entry in entries:
             if entry["is_dir"]:
                 lines.append(f"    {'DIR':>10}  📁 {entry['name']}/")
             else:
                 lines.append(f"    {entry['size_human']:>10}  {entry['name']}")
 
-        more_count = truncated or (len(entries) - len(shown_entries))
-        if more_count > 0:
-            lines.append(f"\n    ... and {more_count} more entries (use 'limit N' or a narrower path to see more)")
+        if truncated:
+            lines.append(f"\n    ... and {truncated} more entries (use 'limit N' to see more)")
 
     elif intent == "list_media":
         summary = raw.get("summary", {})
@@ -270,7 +268,7 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             return
 
         # Show first 5 groups in full, summarize the rest
-        shown_groups, extra_groups = truncate_list(groups, 3)
+        shown_groups, extra_groups = truncate_list(groups, 5)
         lines.append("")
         for i, g in enumerate(shown_groups, 1):
             size_human = g.get("file_size_human", "?")
@@ -284,32 +282,7 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
 
         if extra_groups:
             lines.append(f"\n  ... and {extra_groups} more group(s) not shown.")
-            lines.append("  Tip: run 'find duplicates' with tighter filters to inspect additional groups.")
-
-    elif intent in {"history_search", "history_intent"}:
-        entries = raw.get("entries", [])
-        count = raw.get("count", len(entries))
-        lines.append(f"\n  Found {count} matching history entr{'ies' if count != 1 else 'y'}:")
-        shown, extra = truncate_list(entries, 20)
-        for entry in shown:
-            lines.append(
-                f"    [{entry.get('id')}] {entry.get('status', '?'):>9} "
-                f"{entry.get('intent', '?'):>15} : {entry.get('command', '')}"
-            )
-        if extra:
-            lines.append(f"    ... and {extra} more entries")
-
-    elif intent == "history_show":
-        entry = raw.get("entry")
-        if entry:
-            ts = entry.get("timestamp", "")[:19].replace("T", " ")
-            lines.append(f"\n  Entry [{entry.get('id')}]  {entry.get('status', '?')}  {ts}")
-            lines.append(f"  Intent : {entry.get('intent', '')}")
-            lines.append(f"  Command: {entry.get('command', '')}")
-            if entry.get("error_details"):
-                lines.append(f"  Errors : {entry.get('error_details')}")
-        else:
-            lines.append(f"\n  {raw.get('message', 'No history entry found.')}")
+            lines.append("  Tip: use 'storage report' to see space usage by category.")
 
     elif intent == "backup_folder":
         lines.append(f"\n  Source      : {raw.get('source', '')}")
@@ -367,29 +340,6 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
                 src = planned.get("source", "").split("/")[-1]
                 dst = planned.get("destination", "")
                 lines.append(f"\n  Would move : {src}  →  {dst}")
-
-    # ── Scheduling ─────────────────────────────────────────────────────────────
-    elif intent == "schedule_create":
-        schedule = raw.get("schedule", {})
-        if schedule:
-            lines.append(f"\n  ID      : {schedule.get('id')}")
-            lines.append(f"  Command : {schedule.get('target_command')}")
-            lines.append(f"  Every   : {schedule.get('interval')}")
-            lines.append("  Status  : Scheduled (MVP)")
-
-    elif intent == "schedule_list":
-        schedules = raw.get("schedules", [])
-        lines.append(f"\n  Active Schedules: {len(schedules)}")
-        for s in schedules:
-            lines.append(f"    [{s.get('id')}] Every {s.get('interval'):<10} : {s.get('target_command')}")
-
-    elif intent == "schedule_delete":
-        deleted_id = raw.get("deleted_id")
-        error = raw.get("error")
-        if error:
-            lines.append(f"\n  Error   : {error}")
-        else:
-            lines.append(f"\n  Deleted : {deleted_id}")
 
     # ── Phone intents ──────────────────────────────────────────────────────────
 
@@ -610,11 +560,14 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         detail = raw.get("detail", "")
         avail_str = "✓ reachable" if available else "✗ unreachable"
         enabled_str = "Enabled" if enabled else "Disabled"
+
         lines.append(f"\n  Backend  : {backend}")
         lines.append(f"  Status   : {enabled_str}")
         if transport:
             lines.append(f"  Transport: {transport}")
         lines.append(f"  Reachable: {avail_str}")
+
+        # ── llama.cpp — endpoint/cli paths + performance config ───────────────
         if backend == "llama_cpp":
             transport_mode = transport or "server"
             if transport_mode == "cli":
@@ -635,22 +588,50 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             temperature = raw.get("temperature")
             if temperature is not None:
                 lines.append(f"  Temp     : {temperature}")
+
+        # ── Ollama — endpoint + model ─────────────────────────────────────────
+        elif backend == "ollama":
+            endpoint = raw.get("endpoint", "?")
+            lines.append(f"  Endpoint : {endpoint}")
+            model = raw.get("model_name", "")
+            if model:
+                lines.append(f"  Model    : {model}")
+            timeout = raw.get("timeout_seconds")
+            if timeout:
+                lines.append(f"  Timeout  : {timeout}s")
+
+        # ── Capabilities (all backends) ───────────────────────────────────────
+        caps = raw.get("capabilities", [])
+        if caps:
+            lines.append(f"  Capable  : {', '.join(caps)}")
+
         if detail:
             lines.append(f"  Detail   : {detail}")
+
         if not enabled:
             lines.append("")
             lines.append('  To enable: edit config/ai_assist.json → "enabled": true')
-        if backend == "llama_cpp" and not available:
-            transport_mode = transport or "server"
+
+        # ── Troubleshooting — prefer backend-provided hint, then built-in ─────
+        troubleshooting = raw.get("troubleshooting")
+        if troubleshooting and not available:
             lines.append("")
-            if transport_mode == "cli":
-                lines.append("  Set binary_path and model_path in config/ai_assist.json")
-                lines.append("  Example:")
-                lines.append("    \"binary_path\": \"/data/data/com.termux/files/usr/bin/llama-cli\"")
-                lines.append("    \"model_path\": \"/sdcard/models/model.gguf\"")
-            else:
-                lines.append("  To start llama.cpp server:")
-                lines.append("    ./server -m model.gguf --port 8080 --host 127.0.0.1")
+            lines.append("  Troubleshooting:")
+            for hint_line in troubleshooting.splitlines():
+                lines.append(f"    {hint_line}")
+        elif not available:
+            # Built-in fallback hints for backends that predate the troubleshooting field
+            if backend == "llama_cpp":
+                transport_mode = transport or "server"
+                lines.append("")
+                if transport_mode == "cli":
+                    lines.append("  Set binary_path and model_path in config/ai_assist.json")
+                    lines.append("  Example:")
+                    lines.append("    \"binary_path\": \"/data/data/com.termux/files/usr/bin/llama-cli\"")
+                    lines.append("    \"model_path\": \"/sdcard/models/model.gguf\"")
+                else:
+                    lines.append("  To start llama.cpp server:")
+                    lines.append("    ./server -m model.gguf --port 8080 --host 127.0.0.1")
 
     elif intent in ("ai_suggest_command", "ai_explain_last_result", "ai_clarify_request"):
         _append_ai_result(lines, raw)

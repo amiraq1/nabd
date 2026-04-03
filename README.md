@@ -4,9 +4,9 @@ A local-first, safety-first phone operations agent for Android/Termux.
 
 Nabd accepts natural-language commands in English, turns them into structured intents, validates every path against an allowlist, shows a preview before making any change, and asks for confirmation before anything modifying is applied.
 
-**v1.0** — 987 tests passing.
+**v1.1** — 1079 tests passing.
 
-v1.0 is a **contextual-assistant release, not an autonomy release.** It adds session context memory and proactive next-step suggestions while keeping the deterministic safety model entirely intact.
+v1.1 is a **local AI platform release, not an autonomy release.** It adds a backend registry, Ollama support, richer status diagnostics, and cleaner failure handling while keeping the deterministic safety model entirely intact.
 
 ---
 
@@ -530,6 +530,16 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 ---
 
 ## Changelog
+
+### v1.1 — Local AI Platform Release
+- **Backend registry** (`llm/backend_registry.py` — new): `BackendRegistry` centralises backend loading, validation, and selection; `KNOWN_BACKENDS = {"local", "llama_cpp", "ollama"}`; `get_backend()` raises a clear `ValueError` for unknown names; `is_known()`, `list_backends()`, `get_active_name()` for introspection; empty/`None` backend name safely defaults to `"local"` without raising
+- **Ollama backend** (`llm/ollama_backend.py` — new): full `OllamaBackend` implementation using Ollama's `/api/chat` endpoint; uses the same JSON advisory prompts as `LlamaCppBackend`; health check via `GET /api/tags`; all six `LLMBackend` methods implemented; advisory-only — the same safety contract as all other backends; graceful fallback on timeout, connection error, invalid JSON, low confidence, or unsupported intent
+- **Extended `BackendStatus` schema** (`llm/schemas.py`): five new optional fields — `endpoint`, `timeout_seconds`, `model_name`, `capabilities`, `troubleshooting`; all default to `None` / `[]` so existing constructors remain unbroken
+- **`AIAssistSkill` refactored** (`skills/ai_assist_skill.py`): `_get_backend()` now delegates to `BackendRegistry` instead of inline if/elif; `_VALID_BACKENDS` is `KNOWN_BACKENDS` (now includes `"ollama"`); `get_backend_status()` surfaces all v1.1 `BackendStatus` fields; gracefully constructs registry from `backend_name` when `__init__` is bypassed in tests
+- **Richer `ai_backend_status` display** (`agent/reporter.py`): dedicated Ollama section (endpoint, model, timeout); capabilities list shown for any backend that reports it; troubleshooting guidance shown when unavailable — using the backend-provided `troubleshooting` string when present, falling back to built-in llama.cpp hints otherwise
+- **Help text updated** (`main.py`): Ollama listed as a supported backend; `ai backend status` description mentions troubleshooting; `To switch` example added
+- **92 new tests**: `tests/test_v11_backend_registry.py` (44 tests — known-backends frozenset, `list_backends`, `is_known`, `get_active_name`, valid/invalid backend construction, safe unavailable-backend degradation, lazy init) and `tests/test_v11_backend_status.py` (48 tests — `BackendStatus` v1.1 fields, local/llama.cpp/Ollama status, `AIAssistSkill.get_backend_status()` dict shape, Ollama failure handling, reporter Ollama formatting) — **1079 total, 0 failed**
+- **Safety model unchanged**: all three advisory isolation gates preserved; no new execution paths; AI remains advisory-only; invalid backend names now fail explicitly with a clear error instead of silently
 
 ### v1.0 — Contextual Assistant Release
 - **Context memory** (`agent/context.py` — new): `ContextMemory` class tracks `last_intent`, `last_command`, `last_result_msg`, `last_source_path`, and `last_url` across commands; updates only on successful non-AI commands; never carries over failed or blocked results as context

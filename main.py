@@ -193,20 +193,22 @@ HELP_TEXT = """
 
     help me with <text>
       Ask AI to clarify what command to use.
-      Example: help me with finding duplicate files
+      Example: help me with duplicate files
 
     ai backend status
-      Show which backend is active (local or llama.cpp) and whether
-      it is reachable. Safe to run whether or not AI Assist is enabled.
+      Show the active backend, reachability, capabilities, and
+      troubleshooting hints. Safe to run at any time.
 
     AI Assist is advisory only — it suggests and explains, but
     never executes actions on your behalf.
 
-    Backends:
+    Backends (set "backend" in config/ai_assist.json):
       local     — deterministic keyword matching, always available (default)
-      llama_cpp — local llama.cpp HTTP server (set backend in ai_assist.json)
+      llama_cpp — local llama.cpp server or CLI, optional
+      ollama    — Ollama server (/api/chat), optional
 
-    To enable: edit config/ai_assist.json → "enabled": true
+    To enable:  edit config/ai_assist.json → "enabled": true
+    To switch:  edit config/ai_assist.json → "backend": "ollama"
 
   HISTORY
     history

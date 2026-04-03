@@ -2,7 +2,7 @@
 AI Assist Skill — Nabd's optional advisory intelligence layer.
 
 What it IS:
-  - A command suggester (LocalBackend: deterministic; LlamaCppBackend: LLM)
+  - A command suggester (LocalBackend: deterministic; LlamaCppBackend/OllamaBackend: LLM)
   - A plain-English result explainer
   - A request clarifier
 
@@ -12,9 +12,12 @@ What it is NOT:
   - A shell — it never generates arbitrary commands
   - A bypass for safety validation or confirmation rules
 
-Backends:
+Backends (v1.1):
   - "local"     — deterministic keyword matching, always available (default)
-  - "llama_cpp" — local llama.cpp HTTP server, advisory-only, optional
+  - "llama_cpp" — local llama.cpp HTTP server or CLI, advisory-only, optional
+  - "ollama"    — Ollama HTTP server (/api/chat), advisory-only, optional
+
+Backend selection is delegated to BackendRegistry.
 """
 from __future__ import annotations
 import json
@@ -22,6 +25,7 @@ import os
 from typing import Any
 
 from skills.base import SkillBase, SkillInfo
+from llm.backend_registry import BackendRegistry, KNOWN_BACKENDS
 from llm.schemas import CommandSuggestion, Clarification, IntentSuggestion, ResultExplanation
 
 _CONFIG_PATH = os.path.join(
@@ -74,6 +78,11 @@ def _load_config() -> dict:
                 "max_tokens": 256,
                 "temperature": 0.2,
             },
+            "ollama": {
+                "endpoint": "http://127.0.0.1:11434",
+                "model": "llama3",
+                "timeout_seconds": 30,
+            },
         }
 
 
@@ -83,7 +92,7 @@ class AIAssistSkill(SkillBase):
         "Advisory AI that suggests, explains, and clarifies Nabd commands. "
         "Never executes actions on your behalf."
     )
-    version = "0.2.0"
+    version = "0.3.0"
 
     def __init__(self) -> None:
         config = _load_config()
@@ -93,41 +102,36 @@ class AIAssistSkill(SkillBase):
         self.fallback_intent_suggestion: bool = config.get(
             "fallback_intent_suggestion", False
         )
+        # Keep for backward compatibility with tests that access _llama_cfg
         self._llama_cfg: dict = config.get("llama_cpp", {})
+        self._registry = BackendRegistry(config)
         self._backend = None
 
-    _VALID_BACKENDS = {"local", "llama_cpp"}
+    # KNOWN_BACKENDS is the single source of truth for valid backend names.
+    _VALID_BACKENDS = KNOWN_BACKENDS
 
     def _get_backend(self):
+        """
+        Return the cached backend instance, constructing it on first access.
+
+        Raises RuntimeError for unknown backend names (matches the pre-v1.1
+        behavior so existing tests remain compatible).
+
+        If _registry is absent (e.g. created via __new__ in tests that bypass
+        __init__), a fresh BackendRegistry is constructed from backend_name.
+        """
         if self._backend is None:
-            if self.backend_name == "llama_cpp":
-                from llm.llama_cpp_backend import LlamaCppBackend
-                cfg = self._llama_cfg
-                # Support both "endpoint" (spec) and "server_url" (legacy) config keys
-                endpoint = (
-                    cfg.get("endpoint")
-                    or cfg.get("server_url")
-                    or "http://127.0.0.1:8080"
-                )
-                self._backend = LlamaCppBackend(
-                    endpoint=endpoint,
-                    transport=cfg.get("transport", "server"),
-                    timeout_seconds=cfg.get("timeout_seconds", 20),
-                    max_tokens=cfg.get("max_tokens", 256),
-                    temperature=cfg.get("temperature", 0.2),
-                    model_name=cfg.get("model_name"),
-                    binary_path=cfg.get("binary_path", ""),
-                    model_path=cfg.get("model_path", ""),
-                )
-            elif self.backend_name == "local":
-                from llm.local_backend import LocalBackend
-                self._backend = LocalBackend()
-            else:
-                raise RuntimeError(
-                    f"Unknown AI backend: '{self.backend_name}'. "
-                    f"Allowed values: {sorted(self._VALID_BACKENDS)}. "
-                    "Check the 'backend' field in config/ai_assist.json."
-                )
+            registry = getattr(self, "_registry", None)
+            if registry is None:
+                from llm.backend_registry import BackendRegistry as _BR
+                registry = _BR({
+                    "backend": self.backend_name,
+                    "llama_cpp": getattr(self, "_llama_cfg", {}),
+                })
+            try:
+                self._backend = registry.get_backend()
+            except ValueError as e:
+                raise RuntimeError(str(e))
         return self._backend
 
     def get_info(self) -> SkillInfo:
@@ -144,6 +148,7 @@ class AIAssistSkill(SkillBase):
         Return a status dict describing the active backend and its availability.
         Safe to call whether or not AI Assist is enabled.
         Delegates to backend.get_status() for structured, transport-aware reporting.
+        Includes all v1.1 BackendStatus fields when available.
         """
         try:
             backend = self._get_backend()
@@ -166,11 +171,25 @@ class AIAssistSkill(SkillBase):
             "detail": status.detail,
         }
 
-        if self.backend_name == "llama_cpp":
+        # v1.1 extended fields — always include when present on the status object
+        if status.endpoint is not None:
+            result["endpoint"] = status.endpoint
+        if status.timeout_seconds is not None:
+            result["timeout_seconds"] = status.timeout_seconds
+        if status.model_name is not None:
+            result["model_name"] = status.model_name
+        if status.capabilities:
+            result["capabilities"] = status.capabilities
+        if status.troubleshooting is not None:
+            result["troubleshooting"] = status.troubleshooting
+
+        # llama_cpp — backward-compat fields + CLI-specific paths
+        if status.backend_name == "llama_cpp":
             cfg = self._llama_cfg
             endpoint = (
                 cfg.get("endpoint")
                 or cfg.get("server_url")
+                or status.endpoint
                 or "http://127.0.0.1:8080"
             )
             result["endpoint"] = endpoint

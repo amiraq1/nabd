@@ -922,11 +922,12 @@ class TestAIAssistBackendValidation(unittest.TestCase):
             skill._get_backend()
         self.assertIn("Unknown AI backend", str(ctx.exception))
 
-    def test_unknown_backend_empty_string_raises_runtime_error(self):
+    def test_empty_string_backend_defaults_to_local(self):
+        # v1.1: empty string is treated as falsy → defaults to "local" (safer than raising)
+        from llm.local_backend import LocalBackend
         skill = self._make_skill("")
-        with self.assertRaises(RuntimeError) as ctx:
-            skill._get_backend()
-        self.assertIn("Unknown AI backend", str(ctx.exception))
+        backend = skill._get_backend()
+        self.assertIsInstance(backend, LocalBackend)
 
     def test_valid_backend_local_does_not_raise(self):
         skill = self._make_skill("local")
