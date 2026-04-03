@@ -556,25 +556,51 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         backend = raw.get("backend", "?")
         available = raw.get("available", False)
         enabled = raw.get("enabled", False)
+        transport = raw.get("transport")
         detail = raw.get("detail", "")
         avail_str = "✓ reachable" if available else "✗ unreachable"
         enabled_str = "Enabled" if enabled else "Disabled"
         lines.append(f"\n  Backend  : {backend}")
         lines.append(f"  Status   : {enabled_str}")
+        if transport:
+            lines.append(f"  Transport: {transport}")
         lines.append(f"  Reachable: {avail_str}")
         if backend == "llama_cpp":
-            lines.append(f"  Server   : {raw.get('server_url', '?')}")
-            lines.append(f"  Model    : {raw.get('model_name', '?')}")
-            lines.append(f"  Timeout  : {raw.get('timeout_seconds', '?')}s")
+            transport_mode = transport or "server"
+            if transport_mode == "cli":
+                lines.append(f"  Binary   : {raw.get('binary_path', '(not set)')}")
+                lines.append(f"  Model    : {raw.get('model_path', '(not set)')}")
+            else:
+                endpoint = raw.get("endpoint") or raw.get("server_url", "?")
+                lines.append(f"  Endpoint : {endpoint}")
+                model = raw.get("model_name", "")
+                if model:
+                    lines.append(f"  Model    : {model}")
+            timeout = raw.get("timeout_seconds")
+            if timeout:
+                lines.append(f"  Timeout  : {timeout}s")
+            max_tokens = raw.get("max_tokens")
+            if max_tokens:
+                lines.append(f"  Max toks : {max_tokens}")
+            temperature = raw.get("temperature")
+            if temperature is not None:
+                lines.append(f"  Temp     : {temperature}")
         if detail:
             lines.append(f"  Detail   : {detail}")
         if not enabled:
             lines.append("")
             lines.append('  To enable: edit config/ai_assist.json → "enabled": true')
         if backend == "llama_cpp" and not available:
+            transport_mode = transport or "server"
             lines.append("")
-            lines.append("  To start llama.cpp server:")
-            lines.append("    ./server -m model.gguf --port 8080 --host 127.0.0.1")
+            if transport_mode == "cli":
+                lines.append("  Set binary_path and model_path in config/ai_assist.json")
+                lines.append("  Example:")
+                lines.append("    \"binary_path\": \"/data/data/com.termux/files/usr/bin/llama-cli\"")
+                lines.append("    \"model_path\": \"/sdcard/models/model.gguf\"")
+            else:
+                lines.append("  To start llama.cpp server:")
+                lines.append("    ./server -m model.gguf --port 8080 --host 127.0.0.1")
 
     elif intent in ("ai_suggest_command", "ai_explain_last_result", "ai_clarify_request"):
         _append_ai_result(lines, raw)
