@@ -16,6 +16,38 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"is\s+(?:ffmpeg|pillow|python)\s+installed",
     ]),
 
+    # ── Skills system ─────────────────────────────────────────────────────────
+    ("show_skills", [
+        r"\bshow\s+skills?\b",
+        r"\blist\s+skills?\b",
+        r"\bwhat\s+skills?\b",
+        r"\bavailable\s+skills?\b",
+    ]),
+    ("skill_info", [
+        r"\bskill\s+info\b",
+        r"\binfo\s+(?:about|for)\s+skill\b",
+        r"\bskill\s+details?\b",
+    ]),
+
+    # ── AI Assist commands ────────────────────────────────────────────────────
+    ("ai_suggest_command", [
+        r"\bsuggest\s+(?:a\s+)?(?:nabd\s+)?command\s+for\b",
+        r"\bwhat\s+(?:nabd\s+)?command\s+(?:for|should\s+i\s+use|do\s+i\s+(?:use|run))\b",
+        r"\bwhich\s+(?:nabd\s+)?command\s+(?:for|should|to)\b",
+    ]),
+    ("ai_explain_last_result", [
+        r"\bexplain\s+(?:the\s+)?(?:last\s+)?result\b",
+        r"\bexplain\s+that\b",
+        r"\bwhat\s+did\s+that\s+(?:do|mean)\b",
+        r"\bwhat\s+does\s+that\s+(?:do|mean)\b",
+    ]),
+    ("ai_clarify_request", [
+        r"\bhelp\s+me\s+with\b",
+        r"\bhelp\s+me\s+(?:understand|figure|find|do|use|fix)\b",
+        r"\bi\s+(?:need|want)\s+help\s+with\b",
+        r"\bnot\s+sure\s+(?:what|how|which)\s+command\b",
+    ]),
+
     # ── Phone status (read-only, no path) ─────────────────────────────────────
     ("phone_status_battery", [
         r"\bbattery\b",
@@ -183,7 +215,23 @@ CONFIRM_INTENTS = {
     "open_url",
 }
 
-# Regex helpers
+# Regex helpers — AI text and skill name extraction
+_AI_TEXT_RE = re.compile(
+    r"(?:"
+    r"suggest\s+(?:a\s+)?(?:nabd\s+)?command\s+for\s+"
+    r"|what\s+(?:nabd\s+)?command\s+(?:for|should\s+I\s+use|do\s+I\s+(?:use|run))\s+"
+    r"|which\s+(?:nabd\s+)?command\s+(?:for|should|to)\s+"
+    r"|help\s+me\s+with\s+"
+    r"|help\s+me\s+(?:understand|figure\s+out|find|do|use|fix)\s+"
+    r"|i\s+(?:need|want)\s+help\s+with\s+"
+    r")(.+)",
+    re.IGNORECASE,
+)
+_SKILL_NAME_RE = re.compile(
+    r"(?:skill\s+info|info\s+(?:about|for)\s+skill|skill\s+details?)\s+(\w[\w_-]*)",
+    re.IGNORECASE,
+)
+
 _PATH_RE = re.compile(r'(?:^|[\s"\'])(/[^\s"\',:;]+)')
 _QUOTED_RE = re.compile(r'["\']([^"\']+)["\']')
 _TO_SEP_RE = re.compile(r'\bto\b\s+["\']?(/[^\s"\',:;]+)["\']?', re.IGNORECASE)
@@ -336,6 +384,14 @@ def parse_command(command: str) -> ParsedIntent:
 
     if intent == "browser_search":
         query = _extract_query(command)
+
+    if intent in ("ai_suggest_command", "ai_clarify_request"):
+        m = _AI_TEXT_RE.search(command)
+        query = m.group(1).strip().rstrip(".,;)") if m else command
+
+    if intent == "skill_info":
+        m = _SKILL_NAME_RE.search(command)
+        query = m.group(1).strip().lower() if m else ""
 
     if intent == "open_app":
         app_name = _extract_app_name(command)
