@@ -216,11 +216,19 @@ class LlamaCppBackend(LLMBackend):
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 raw = resp.read().decode("utf-8")
         except socket.timeout:
+            # Bare socket.timeout — raised directly in some edge cases / test mocks.
             raise TimeoutError(
                 f"llama.cpp server timed out after {self._timeout}s. "
                 "Try increasing timeout_seconds in config/ai_assist.json."
             )
         except urllib.error.URLError as e:
+            # urllib wraps socket.timeout as URLError(reason=socket.timeout(...))
+            # in normal operation — this is the path that fires in production.
+            if isinstance(e.reason, socket.timeout):
+                raise TimeoutError(
+                    f"llama.cpp server timed out after {self._timeout}s. "
+                    "Try increasing timeout_seconds in config/ai_assist.json."
+                )
             raise ConnectionError(
                 f"llama.cpp server unavailable at {self._endpoint}: {e.reason}"
             )
