@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "backend": "local",
+  "mode": "assist_only",
+  "fallback_intent_suggestion": false
+}
