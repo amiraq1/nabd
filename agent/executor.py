@@ -5,6 +5,17 @@ from agent.models import ExecutionPlan, ExecutionResult, OperationStatus, ToolAc
 from core.exceptions import ExecutionError, ToolError
 
 
+# Whitelisted functions for the skill registry (read-only, no tool module)
+_SKILL_FUNCTIONS: set[str] = {"list_skills", "skill_info"}
+
+# Whitelisted functions for the AI Assist skill (advisory only, never executes)
+_AI_SKILL_FUNCTIONS: set[str] = {
+    "suggest_command",
+    "explain_result",
+    "clarify_request",
+    "suggest_intent",
+}
+
 WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
     "system":     {"run_doctor"},
     "storage":    {"get_storage_report", "list_large_files"},
@@ -18,6 +29,108 @@ WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
     "browser":    {"browser_search", "browser_extract_text", "browser_list_links",
                    "browser_page_title"},
 }
+
+
+def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
+    """Handle skill registry queries — read-only, no tool module needed."""
+    if action.function_name not in _SKILL_FUNCTIONS:
+        raise ExecutionError(
+            f"Skill function '{action.function_name}' is not whitelisted. "
+            f"Allowed: {sorted(_SKILL_FUNCTIONS)}"
+        )
+    from skills.registry import get_registry
+    registry = get_registry()
+
+    if action.function_name == "list_skills":
+        skills = registry.list_skills()
+        return {
+            "skills": [
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "version": s.version,
+                    "enabled": s.enabled,
+                    "tags": s.tags,
+                }
+                for s in skills
+            ]
+        }
+
+    if action.function_name == "skill_info":
+        skill_name = action.arguments.get("skill_name", "")
+        skill = registry.get(skill_name)
+        if skill is None:
+            return {"error": f"Unknown skill: '{skill_name}'", "skill": None}
+        info = skill.get_info()
+        return {
+            "skill": {
+                "name": info.name,
+                "description": info.description,
+                "version": info.version,
+                "enabled": info.enabled,
+                "tags": info.tags,
+            }
+        }
+
+    raise ExecutionError(f"Unhandled skill function: '{action.function_name}'")
+
+
+def _execute_ai_skill_action(action: ToolAction) -> dict[str, Any]:
+    """Handle AI Assist skill calls — advisory only, never executes tool actions."""
+    if action.function_name not in _AI_SKILL_FUNCTIONS:
+        raise ExecutionError(
+            f"AI skill function '{action.function_name}' is not whitelisted. "
+            f"Allowed: {sorted(_AI_SKILL_FUNCTIONS)}"
+        )
+    from skills.registry import get_registry
+    registry = get_registry()
+    skill = registry.get("ai_assist")
+    if skill is None:
+        return {"success": False, "error": "AI Assist skill is not registered.", "type": action.function_name}
+
+    try:
+        fn_name = action.function_name
+        if fn_name == "suggest_command":
+            r = skill.suggest_command(action.arguments.get("user_text", ""))
+            return {
+                "success": True, "type": "suggest_command",
+                "suggested_command": r.suggested_command,
+                "rationale": r.rationale,
+                "confidence": r.confidence,
+            }
+        if fn_name == "explain_result":
+            r = skill.explain_result(
+                action.arguments.get("last_command", ""),
+                action.arguments.get("last_result", ""),
+            )
+            return {
+                "success": True, "type": "explain_result",
+                "summary": r.summary,
+                "safety_note": r.safety_note,
+                "suggested_next_step": r.suggested_next_step,
+            }
+        if fn_name == "clarify_request":
+            r = skill.clarify_request(action.arguments.get("user_text", ""))
+            return {
+                "success": True, "type": "clarify_request",
+                "clarification_needed": r.clarification_needed,
+                "clarification_question": r.clarification_question,
+                "candidate_intents": r.candidate_intents,
+            }
+        if fn_name == "suggest_intent":
+            r = skill.suggest_intent(action.arguments.get("user_text", ""))
+            return {
+                "success": True, "type": "suggest_intent",
+                "intent": r.intent,
+                "confidence": r.confidence,
+                "explanation": r.explanation,
+            }
+    except RuntimeError as e:
+        return {"success": False, "error": str(e), "type": action.function_name}
+    except Exception as e:
+        return {"success": False, "error": f"AI Assist error: {e}", "type": action.function_name}
+
+    raise ExecutionError(f"Unhandled AI skill function: '{action.function_name}'")
 
 
 def _get_tool_module(tool_name: str) -> Any:
@@ -50,6 +163,14 @@ def _get_tool_module(tool_name: str) -> Any:
 
 
 def _execute_action(action: ToolAction, confirmed: bool) -> dict[str, Any]:
+    # Skill registry — read-only, dedicated handler, bypasses tool whitelist
+    if action.tool_name == "skill":
+        return _execute_skill_action(action)
+
+    # AI Assist skill — advisory only, dedicated handler, bypasses tool whitelist
+    if action.tool_name == "ai_skill":
+        return _execute_ai_skill_action(action)
+
     if action.tool_name not in WHITELISTED_FUNCTIONS:
         raise ExecutionError(
             f"Tool '{action.tool_name}' is not whitelisted. "
