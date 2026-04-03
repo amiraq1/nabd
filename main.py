@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nabd v0.4.1 — Local phone operations agent for Android/Termux.
+Nabd v0.6 — Local phone operations agent for Android/Termux.
 Interactive CLI entry point.
 """
 
@@ -28,7 +28,7 @@ from core.logging_db import log_operation
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
-║              Nabd  v0.4.1                        ║
+║              Nabd  v0.6                          ║
 ║   Local Phone Operations Agent for Termux        ║
 ╚══════════════════════════════════════════════════╝"""
 
@@ -57,7 +57,7 @@ RETURNING_HINT = "  Type 'help' for commands  |  'history' for recent runs  |  '
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
-  NABD COMMANDS  (v0.4.2)
+  NABD COMMANDS  (v0.6)
 ────────────────────────────────────────────────────
 
   DIAGNOSTICS
@@ -154,6 +154,29 @@ HELP_TEXT = """
     list links from https://example.com
       Fetch a page and list all links found on it.
 
+  SKILLS
+    show skills
+      List all available Nabd skill modules.
+
+    skill info ai_assist
+      Show details about the AI Assist skill.
+
+  AI ASSIST  (optional, off by default)
+    suggest command for <text>
+      Ask AI to suggest the best Nabd command for your request.
+      Example: suggest command for check my phone setup
+
+    explain last result
+      Get a plain-English explanation of the last command's output.
+
+    help me with <text>
+      Ask AI to clarify what command to use.
+      Example: help me with finding duplicate files
+
+    AI Assist is advisory only — it suggests and explains, but
+    never executes actions on your behalf.
+    To enable: edit config/ai_assist.json → "enabled": true
+
   HISTORY
     history
       Show your 20 most recent Nabd commands.
@@ -181,6 +204,9 @@ HELP_TEXT = """
 
 EXIT_COMMANDS = {"exit", "quit", "q", "bye"}
 HISTORY_COMMANDS = {"history", "hist"}
+
+# Session state — tracks the last command and result for AI Assist explain
+_session: dict[str, str] = {"last_command": "", "last_result": ""}
 
 # Shell commands that users might accidentally type inside Nabd
 SHELL_COMMANDS: dict[str, str] = {
@@ -272,6 +298,12 @@ def run_command(command: str) -> None:
 
     try:
         parsed = parse_command(command)
+
+        # Inject session context for 'explain last result'
+        if parsed.intent == "ai_explain_last_result":
+            parsed.options["last_command"] = _session["last_command"]
+            parsed.options["last_result"] = _session["last_result"]
+
         print(report_parsed_intent(parsed))
 
         validate_intent_safety(parsed)
@@ -298,6 +330,13 @@ def run_command(command: str) -> None:
         log_status = result.status.value
         if result.errors:
             error_detail = "; ".join(result.errors)
+
+        # Update session state for 'explain last result' (skip AI meta-commands)
+        _ai_intents = {"ai_suggest_command", "ai_explain_last_result", "ai_clarify_request",
+                       "show_skills", "skill_info"}
+        if parsed.intent not in _ai_intents:
+            _session["last_command"] = command
+            _session["last_result"] = result.message
 
     except UnknownIntentError:
         print(
