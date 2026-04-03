@@ -4,8 +4,12 @@
   "mode": "assist_only",
   "fallback_intent_suggestion": false,
   "llama_cpp": {
-    "server_url": "http://localhost:8080",
-    "timeout_seconds": 30,
-    "model_name": "nabd-assistant"
+    "transport": "server",
+    "endpoint": "http://127.0.0.1:8080",
+    "binary_path": "",
+    "model_path": "",
+    "timeout_seconds": 20,
+    "max_tokens": 256,
+    "temperature": 0.2
   }
 }
