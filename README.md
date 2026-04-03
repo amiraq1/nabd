@@ -529,6 +529,64 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 
 ## Changelog
 
+### v0.7
+- **llama.cpp backend** (`llm/llama_cpp_backend.py`): optional real local LLM backend via the llama.cpp HTTP server's OpenAI-compatible API (`/v1/chat/completions`); stdlib only (`urllib`, `json`, `socket`) — no new dependencies
+- **Structured JSON prompts** (`llm/prompts.py`): every prompt requests a strict JSON object with an explicit schema (`SUGGEST_COMMAND_JSON_TEMPLATE`, `EXPLAIN_RESULT_JSON_TEMPLATE`, `CLARIFY_REQUEST_JSON_TEMPLATE`, `SUGGEST_INTENT_JSON_TEMPLATE`); `LLAMA_SYSTEM_PROMPT` reminds the model it is advisory-only on every call
+- **Full response validation**: missing fields, invalid JSON, non-dict content, empty required strings — all caught and replaced with a safe fallback; Nabd never propagates a model error to the user
+- **Unsupported intent rejection** (defense in depth): `LlamaCppBackend.suggest_intent` applies its own safety gate in addition to the `AIAssistSkill` gate — any intent not in `allowed_intents` sets `intent=None`, `confidence=0.0`
+- **Backend selection via config**: `config/ai_assist.json` now has a `"llama_cpp"` block (`server_url`, `timeout_seconds`, `model_name`); set `"backend": "llama_cpp"` to switch; `"local"` remains the default
+- **`ai_backend_status` intent** (new): "ai backend status" / "show ai backend" / "ai status" — shows which backend is active, whether the server is reachable, URL, model, timeout, and a startup hint when the server is down; safe to run at any time, even when AI Assist is disabled
+- **`get_backend_status()` method** on `AIAssistSkill`: returns a typed dict; local backend always reports available; llama.cpp probes the server and reports reachable/unreachable with helpful detail
+- **Graceful failure modes**: server not running → `is_available()` false; timeout → fallback result with timeout note; invalid JSON → fallback result with error note; missing fields → fallback result; Nabd continues normally in all cases
+- **Skill version bumped to 0.2.0**
+- **94 new tests** in `tests/test_v7_llama_cpp.py` (774 total)
+
+#### Configuring llama.cpp backend
+
+1. Edit `config/ai_assist.json`:
+```json
+{
+  "enabled": true,
+  "backend": "llama_cpp",
+  "mode": "assist_only",
+  "fallback_intent_suggestion": false,
+  "llama_cpp": {
+    "server_url": "http://localhost:8080",
+    "timeout_seconds": 30,
+    "model_name": "nabd-assistant"
+  }
+}
+```
+2. Start the llama.cpp server:
+```
+./server -m model.gguf --port 8080 --host 127.0.0.1
+```
+3. Verify: run `ai backend status` in Nabd.
+
+#### Backend modes
+
+| Setting | Behaviour |
+|---|---|
+| `"backend": "local"` | Deterministic keyword matching. Always available, no server needed (default). |
+| `"backend": "llama_cpp"` | Real LLM via local HTTP server. Falls back gracefully if server is down. |
+
+#### Safety guarantees (v0.7)
+
+- The llama.cpp backend is advisory-only — it never executes actions
+- All intents suggested by the model are validated against `AVAILABLE_INTENTS`; non-whitelisted intents are silently discarded at two independent gates (backend + skill)
+- Confidence values from the model are clamped to `[0.0, 1.0]`
+- `response_format: {"type": "json_object"}` is requested so the model outputs structured JSON; if it fails, Nabd falls back gracefully
+- AI failures never break Nabd's deterministic parser/safety/planner/executor pipeline
+
+#### Troubleshooting llama.cpp
+
+| Symptom | Fix |
+|---|---|
+| `ai backend status` shows "✗ unreachable" | Start llama.cpp server: `./server -m model.gguf --port 8080` |
+| Suggestions always fall back to "doctor" | Server is down or returned bad JSON. Check server logs. |
+| Timeout errors | Increase `timeout_seconds` in `config/ai_assist.json` or use a faster/smaller model. |
+| `"enabled": false` in status | Edit `config/ai_assist.json` and set `"enabled": true` |
+
 ### v0.6
 - **Skills registry**: `skills/registry.py` — lazy singleton managing all Nabd skill modules; `show skills` and `skill info <name>` expose it to users
 - **AI Assist skill** (`skills/ai_assist_skill.py`): advisory-only, never auto-executes; reads `config/ai_assist.json` (default: `enabled: false`); `suggest_command`, `explain_result`, `clarify_request`, `suggest_intent`
