@@ -39,3 +39,21 @@ class ResultExplanation:
     summary: str
     safety_note: str | None
     suggested_next_step: str | None
+
+
+@dataclass
+class BackendStatus:
+    """
+    Structured health report for an LLM backend.
+
+    available   — can the backend currently handle requests?
+    backend_name — "local", "llama_cpp", etc.
+    transport   — "server", "cli", or None (local has no transport)
+    healthy     — available AND no config errors
+    detail      — human-readable one-line status message
+    """
+    available: bool
+    backend_name: str
+    transport: str | None
+    healthy: bool
+    detail: str
