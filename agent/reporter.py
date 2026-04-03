@@ -654,7 +654,11 @@ def _append_ai_result(lines: list, raw: dict) -> None:
         rationale = raw.get("rationale", "")
         confidence = raw.get("confidence", 0.0)
         pct = int(confidence * 100)
-        if pct == 0:
+        # Show unavailable warning only for the explicit fallback (confidence==0.0 and
+        # rationale contains "unavailable").  Do NOT fire for a genuine model response
+        # that happens to report a very low confidence — that is a different case.
+        _is_fallback = (confidence == 0.0 and "unavailable" in rationale.lower())
+        if _is_fallback:
             lines.append("\n  ⚠  AI backend unavailable — showing safe default, not an AI suggestion.")
             lines.append("     Run 'ai backend status' to check your AI configuration.\n")
         lines.append(f"  Suggested command : {cmd}")
