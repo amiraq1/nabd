@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nabd v0.6 — Local phone operations agent for Android/Termux.
+Nabd v0.7 — Local phone operations agent for Android/Termux.
 Interactive CLI entry point.
 """
 
@@ -28,7 +28,7 @@ from core.logging_db import log_operation
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
-║              Nabd  v0.6                          ║
+║              Nabd  v0.7                          ║
 ║   Local Phone Operations Agent for Termux        ║
 ╚══════════════════════════════════════════════════╝"""
 
@@ -57,7 +57,7 @@ RETURNING_HINT = "  Type 'help' for commands  |  'history' for recent runs  |  '
 
 HELP_TEXT = """
 ────────────────────────────────────────────────────
-  NABD COMMANDS  (v0.6)
+  NABD COMMANDS  (v0.7)
 ────────────────────────────────────────────────────
 
   DIAGNOSTICS
@@ -173,8 +173,17 @@ HELP_TEXT = """
       Ask AI to clarify what command to use.
       Example: help me with finding duplicate files
 
+    ai backend status
+      Show which backend is active (local or llama.cpp) and whether
+      it is reachable. Safe to run whether or not AI Assist is enabled.
+
     AI Assist is advisory only — it suggests and explains, but
     never executes actions on your behalf.
+
+    Backends:
+      local     — deterministic keyword matching, always available (default)
+      llama_cpp — local llama.cpp HTTP server (set backend in ai_assist.json)
+
     To enable: edit config/ai_assist.json → "enabled": true
 
   HISTORY
@@ -333,7 +342,7 @@ def run_command(command: str) -> None:
 
         # Update session state for 'explain last result' (skip AI meta-commands)
         _ai_intents = {"ai_suggest_command", "ai_explain_last_result", "ai_clarify_request",
-                       "show_skills", "skill_info"}
+                       "ai_backend_status", "show_skills", "skill_info"}
         if parsed.intent not in _ai_intents:
             _session["last_command"] = command
             _session["last_result"] = result.message
