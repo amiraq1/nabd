@@ -368,6 +368,29 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
                 dst = planned.get("destination", "")
                 lines.append(f"\n  Would move : {src}  →  {dst}")
 
+    # ── Scheduling ─────────────────────────────────────────────────────────────
+    elif intent == "schedule_create":
+        schedule = raw.get("schedule", {})
+        if schedule:
+            lines.append(f"\n  ID      : {schedule.get('id')}")
+            lines.append(f"  Command : {schedule.get('target_command')}")
+            lines.append(f"  Every   : {schedule.get('interval')}")
+            lines.append("  Status  : Scheduled (MVP)")
+
+    elif intent == "schedule_list":
+        schedules = raw.get("schedules", [])
+        lines.append(f"\n  Active Schedules: {len(schedules)}")
+        for s in schedules:
+            lines.append(f"    [{s.get('id')}] Every {s.get('interval'):<10} : {s.get('target_command')}")
+
+    elif intent == "schedule_delete":
+        deleted_id = raw.get("deleted_id")
+        error = raw.get("error")
+        if error:
+            lines.append(f"\n  Error   : {error}")
+        else:
+            lines.append(f"\n  Deleted : {deleted_id}")
+
     # ── Phone intents ──────────────────────────────────────────────────────────
 
     elif intent == "open_app":

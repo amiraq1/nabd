@@ -20,6 +20,17 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"\bhistory\s+details\b",
     ]),
 
+    # ── Scheduling ────────────────────────────────────────────────────────────
+    ("schedule_create", [
+        r"\bschedule\s+(.+?)\s+every\s+(.+)",
+    ]),
+    ("schedule_list", [
+        r"\b(?:list|show)\s+schedules?\b",
+    ]),
+    ("schedule_delete", [
+        r"\b(?:delete|remove)\s+schedule\s+([a-zA-Z0-9_]+)",
+    ]),
+
     # ── Diagnostic ────────────────────────────────────────────────────────────
     ("doctor", [
         r"\bdoctor\b",
@@ -221,6 +232,8 @@ MODIFYING_INTENTS = {
     "compress_images",
     "safe_rename_files",
     "safe_move_files",
+    "schedule_create",
+    "schedule_delete",
 }
 
 HIGH_RISK_INTENTS = {
@@ -271,6 +284,8 @@ _SEARCH_RE = re.compile(
 _HISTORY_TERM_RE = re.compile(r"history\s+search(?:\s+for)?\s+(.+)", re.IGNORECASE)
 _HISTORY_INTENT_RE = re.compile(r"history\s+intent(?:\s+for)?\s+(\w+)", re.IGNORECASE)
 _HISTORY_SHOW_RE = re.compile(r"history\s+(?:show|details)\s+(\d+)", re.IGNORECASE)
+_SCHEDULE_CREATE_RE = re.compile(r"\bschedule\s+(.+?)\s+every\s+(.+)", re.IGNORECASE)
+_SCHEDULE_DELETE_RE = re.compile(r"\b(?:delete|remove)\s+schedule\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
 _APP_NAME_RE = re.compile(
     r"(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?(\w+)(?:\s+app)?",
     re.IGNORECASE,
@@ -368,6 +383,20 @@ def _extract_history_entry_id(command: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _extract_schedule_create(command: str) -> tuple[str, str]:
+    m = _SCHEDULE_CREATE_RE.search(command)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return "", ""
+
+
+def _extract_schedule_delete(command: str) -> str:
+    m = _SCHEDULE_DELETE_RE.search(command)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def extract_options(command: str, intent: str) -> dict:
     options: dict = {}
 
@@ -416,6 +445,17 @@ def extract_options(command: str, intent: str) -> dict:
         entry_id = _extract_history_entry_id(command)
         if entry_id:
             options["entry_id"] = entry_id
+
+    if intent == "schedule_create":
+        cmd, interval = _extract_schedule_create(command)
+        if cmd and interval:
+            options["target_command"] = cmd
+            options["interval"] = interval
+
+    if intent == "schedule_delete":
+        schedule_id = _extract_schedule_delete(command)
+        if schedule_id:
+            options["schedule_id"] = schedule_id
 
     if intent == "compress_images":
         quality_match = re.search(r"quality\s+(\d+)", command, re.IGNORECASE)

@@ -23,6 +23,7 @@ ENV/
 
 # Data / DB
 data/nabd_history.db
+data/schedules.json
 *.db
 *.sqlite3
 

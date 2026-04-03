@@ -65,6 +65,10 @@ def plan(intent: ParsedIntent) -> ExecutionPlan:
         "history_search": _plan_history_search,
         "history_intent": _plan_history_intent,
         "history_show": _plan_history_show,
+        # ── Scheduling ─────────────────────────────────────────────────────────
+        "schedule_create": _plan_schedule_create,
+        "schedule_list": _plan_schedule_list,
+        "schedule_delete": _plan_schedule_delete,
     }
 
     handler = planners.get(intent.intent)
@@ -670,4 +674,54 @@ def _plan_browser_list_links(intent: ParsedIntent, settings: dict) -> ExecutionP
             arguments={"url": url},
         )],
         preview_summary=f"Fetch and list links from: {url}",
+    )
+
+
+# ── Scheduling ─────────────────────────────────────────────────────────────────
+
+def _plan_schedule_create(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    target_command = intent.options.get("target_command", "")
+    interval = intent.options.get("interval", "")
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.MEDIUM,
+        requires_confirmation=True,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="schedule",
+            function_name="create_schedule",
+            arguments={"target_command": target_command, "interval": interval},
+        )],
+        preview_summary=f"Schedule command to run every {interval}: '{target_command}'",
+    )
+
+
+def _plan_schedule_list(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="schedule",
+            function_name="list_schedules",
+            arguments={},
+        )],
+        preview_summary="List all scheduled commands",
+    )
+
+
+def _plan_schedule_delete(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    schedule_id = intent.options.get("schedule_id", "")
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.MEDIUM,
+        requires_confirmation=True,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="schedule",
+            function_name="delete_schedule",
+            arguments={"schedule_id": schedule_id},
+        )],
+        preview_summary=f"Delete schedule ID: {schedule_id}",
     )

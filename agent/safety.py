@@ -185,6 +185,23 @@ def validate_intent_safety(intent: ParsedIntent) -> None:
     """
     name = intent.intent
 
+    # ── Scheduling ────────────────────────────────────────────────────────────
+    if name == "schedule_create":
+        target_command = intent.options.get("target_command")
+        if not target_command:
+            raise ValidationError("Schedule creation requires a target command.")
+        from agent.parser import parse_command
+        nested = parse_command(target_command)
+        if nested.intent in {"schedule_create", "schedule_delete", "schedule_list"}:
+            raise SafetyError("Cannot schedule a scheduling command.")
+        validate_intent_safety(nested)
+        return
+
+    if name == "schedule_delete":
+        if not intent.options.get("schedule_id"):
+            raise ValidationError("Please specify the schedule ID to delete.")
+        return
+
     # ── Phone status / doctor: no paths or URLs needed ────────────────────────
     if name in READ_ONLY_INTENTS:
         return
