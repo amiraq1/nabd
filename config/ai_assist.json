@@ -2,5 +2,10 @@
   "enabled": false,
   "backend": "local",
   "mode": "assist_only",
-  "fallback_intent_suggestion": false
+  "fallback_intent_suggestion": false,
+  "llama_cpp": {
+    "server_url": "http://localhost:8080",
+    "timeout_seconds": 30,
+    "model_name": "nabd-assistant"
+  }
 }
