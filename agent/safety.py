@@ -22,6 +22,13 @@ READ_ONLY_INTENTS = {
     "doctor",
     "phone_status_battery",
     "phone_status_network",
+    # Skills system — read-only registry queries
+    "show_skills",
+    "skill_info",
+    # AI Assist — advisory only, never executes tool actions
+    "ai_suggest_command",
+    "ai_explain_last_result",
+    "ai_clarify_request",
 }
 
 # Browser intents that use a URL (not a local path)
