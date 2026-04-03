@@ -1,7 +1,7 @@
 import io
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from agent.advisor import format_advisory_suggestions, generate_advisory_suggestions
 from agent.models import ExecutionResult, OperationStatus, ParsedIntent, RiskLevel
@@ -284,6 +284,41 @@ class TestAdvisorSuggestions(unittest.TestCase):
         self.assertFalse(any("list large files /sdcard/Download" in s for s in suggestions))
         self.assertTrue(any("find duplicates /sdcard/Download" in s for s in suggestions))
 
+    def test_session_context_can_suggest_explaining_previous_modifying_result(self):
+        intent = ParsedIntent(
+            intent="storage_report",
+            source_path="/sdcard/Download",
+            risk_level=RiskLevel.LOW,
+            requires_confirmation=False,
+            raw_command="storage report /sdcard/Download",
+        )
+        result = ExecutionResult(
+            status=OperationStatus.SUCCESS,
+            message="ok",
+            raw_results=[{
+                "directory": "/sdcard/Download",
+                "file_count": 4,
+            }],
+        )
+        session_context = {
+            "last_intent": "organize_folder_by_type",
+            "last_command": "organize /sdcard/Download",
+            "last_result": "Operation completed successfully.",
+            "last_folder": "/sdcard/Download",
+        }
+
+        suggestions = generate_advisory_suggestions(
+            intent,
+            result,
+            recent_history=[],
+            session_context=session_context,
+        )
+
+        self.assertIn(
+            "If you want a plain-English recap of the previous step: explain last result",
+            suggestions,
+        )
+
     def test_format_advisory_suggestions_has_header(self):
         output = format_advisory_suggestions(["Review the biggest files next: list large files /sdcard/Download"])
         self.assertIn("ADVISORY SUGGESTIONS", output)
@@ -343,7 +378,7 @@ class TestAdvisorMainIntegration(unittest.TestCase):
         self.assertIn("RESULT", output)
         self.assertIn("ADVICE", output)
         mock_execute.assert_called_once()
-        mock_generate.assert_called_once_with(parsed, result, recent_history=[])
+        mock_generate.assert_called_once_with(parsed, result, recent_history=[], session_context=ANY)
         mock_format.assert_called_once_with(["suggestion"])
 
 

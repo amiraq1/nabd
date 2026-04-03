@@ -6,6 +6,20 @@ from core.exceptions import UnknownIntentError
 
 
 INTENT_PATTERNS: list[tuple[str, list[str]]] = [
+    # ── History UX ───────────────────────────────────────────────────────────
+    ("history_search", [
+        r"\bhistory\s+search\b",
+        r"\bhistory\s+search\s+for\b",
+    ]),
+    ("history_intent", [
+        r"\bhistory\s+intent\b",
+        r"\bhistory\s+intent\s+for\b",
+    ]),
+    ("history_show", [
+        r"\bhistory\s+show\b",
+        r"\bhistory\s+details\b",
+    ]),
+
     # ── Diagnostic ────────────────────────────────────────────────────────────
     ("doctor", [
         r"\bdoctor\b",
@@ -198,6 +212,8 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
     ]),
 ]
 
+ALL_INTENTS = [intent_name for intent_name, _ in INTENT_PATTERNS]
+
 MODIFYING_INTENTS = {
     "organize_folder_by_type",
     "backup_folder",
@@ -252,6 +268,9 @@ _SEARCH_RE = re.compile(
     r"web\s+search\s+(?:for\s+)?)(.+)",
     re.IGNORECASE,
 )
+_HISTORY_TERM_RE = re.compile(r"history\s+search(?:\s+for)?\s+(.+)", re.IGNORECASE)
+_HISTORY_INTENT_RE = re.compile(r"history\s+intent(?:\s+for)?\s+(\w+)", re.IGNORECASE)
+_HISTORY_SHOW_RE = re.compile(r"history\s+(?:show|details)\s+(\d+)", re.IGNORECASE)
 _APP_NAME_RE = re.compile(
     r"(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?(\w+)(?:\s+app)?",
     re.IGNORECASE,
@@ -334,6 +353,21 @@ def _extract_app_name(command: str) -> Optional[str]:
     return None
 
 
+def _extract_history_term(command: str) -> Optional[str]:
+    m = _HISTORY_TERM_RE.search(command)
+    return m.group(1).strip() if m else None
+
+
+def _extract_history_intent(command: str) -> Optional[str]:
+    m = _HISTORY_INTENT_RE.search(command)
+    return m.group(1).strip() if m else None
+
+
+def _extract_history_entry_id(command: str) -> Optional[int]:
+    m = _HISTORY_SHOW_RE.search(command)
+    return int(m.group(1)) if m else None
+
+
 def extract_options(command: str, intent: str) -> dict:
     options: dict = {}
 
@@ -367,6 +401,21 @@ def extract_options(command: str, intent: str) -> dict:
             options["prefix"] = prefix_match.group(1)
         if suffix_match:
             options["suffix"] = suffix_match.group(1)
+
+    if intent == "history_search":
+        term = _extract_history_term(command)
+        if term:
+            options["term"] = term
+
+    if intent == "history_intent":
+        target_intent = _extract_history_intent(command)
+        if target_intent:
+            options["target_intent"] = target_intent
+
+    if intent == "history_show":
+        entry_id = _extract_history_entry_id(command)
+        if entry_id:
+            options["entry_id"] = entry_id
 
     if intent == "compress_images":
         quality_match = re.search(r"quality\s+(\d+)", command, re.IGNORECASE)

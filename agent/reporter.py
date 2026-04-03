@@ -147,12 +147,12 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
     elif intent == "list_large_files":
         files = raw if isinstance(raw, list) else raw.get("files", [])
         lines.append(f"\n  Found {len(files)} large file(s):")
-        shown, extra = truncate_list(files, 20)
+        shown, extra = truncate_list(files, 15)
         for item in shown:
             if isinstance(item, dict):
                 lines.append(f"    {item.get('size_human', '?'):>10}  {item.get('path', '')}")
         if extra:
-            lines.append(f"    ... and {extra} more")
+            lines.append(f"    ... and {extra} more large files (use 'list large files <path> limit N' to see more)")
 
     elif intent == "show_files":
         entries = raw.get("entries", [])
@@ -166,14 +166,16 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
         lines.append(f"  Contents  : {file_count} file(s), {dir_count} folder(s)  (sorted by {sort_by})")
         lines.append("")
 
-        for entry in entries:
+        shown_entries, extra_entries = truncate_list(entries, 15)
+        for entry in shown_entries:
             if entry["is_dir"]:
                 lines.append(f"    {'DIR':>10}  📁 {entry['name']}/")
             else:
                 lines.append(f"    {entry['size_human']:>10}  {entry['name']}")
 
-        if truncated:
-            lines.append(f"\n    ... and {truncated} more entries (use 'limit N' to see more)")
+        more_count = truncated or (len(entries) - len(shown_entries))
+        if more_count > 0:
+            lines.append(f"\n    ... and {more_count} more entries (use 'limit N' or a narrower path to see more)")
 
     elif intent == "list_media":
         summary = raw.get("summary", {})
@@ -268,7 +270,7 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
             return
 
         # Show first 5 groups in full, summarize the rest
-        shown_groups, extra_groups = truncate_list(groups, 5)
+        shown_groups, extra_groups = truncate_list(groups, 3)
         lines.append("")
         for i, g in enumerate(shown_groups, 1):
             size_human = g.get("file_size_human", "?")
@@ -282,7 +284,32 @@ def _append_raw_details(lines: list, raw: dict, intent: str, confirmed: bool) ->
 
         if extra_groups:
             lines.append(f"\n  ... and {extra_groups} more group(s) not shown.")
-            lines.append("  Tip: use 'storage report' to see space usage by category.")
+            lines.append("  Tip: run 'find duplicates' with tighter filters to inspect additional groups.")
+
+    elif intent in {"history_search", "history_intent"}:
+        entries = raw.get("entries", [])
+        count = raw.get("count", len(entries))
+        lines.append(f"\n  Found {count} matching history entr{'ies' if count != 1 else 'y'}:")
+        shown, extra = truncate_list(entries, 20)
+        for entry in shown:
+            lines.append(
+                f"    [{entry.get('id')}] {entry.get('status', '?'):>9} "
+                f"{entry.get('intent', '?'):>15} : {entry.get('command', '')}"
+            )
+        if extra:
+            lines.append(f"    ... and {extra} more entries")
+
+    elif intent == "history_show":
+        entry = raw.get("entry")
+        if entry:
+            ts = entry.get("timestamp", "")[:19].replace("T", " ")
+            lines.append(f"\n  Entry [{entry.get('id')}]  {entry.get('status', '?')}  {ts}")
+            lines.append(f"  Intent : {entry.get('intent', '')}")
+            lines.append(f"  Command: {entry.get('command', '')}")
+            if entry.get("error_details"):
+                lines.append(f"  Errors : {entry.get('error_details')}")
+        else:
+            lines.append(f"\n  {raw.get('message', 'No history entry found.')}")
 
     elif intent == "backup_folder":
         lines.append(f"\n  Source      : {raw.get('source', '')}")

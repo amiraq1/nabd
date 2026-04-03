@@ -27,6 +27,9 @@ READ_ONLY_INTENTS = {
     "ai_explain_last_result",
     "ai_clarify_request",
     "ai_backend_status",
+    "history_search",
+    "history_intent",
+    "history_show",
 }
 
 # Read-only intents that may accept a user-supplied path. If a path is present,

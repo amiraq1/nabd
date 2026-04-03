@@ -28,6 +28,7 @@ WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
                    "get_battery_status", "get_network_status"},
     "browser":    {"browser_search", "browser_extract_text", "browser_list_links",
                    "browser_page_title"},
+    "history":    {"search_history", "history_by_intent", "show_history_entry"},
 }
 
 
@@ -163,6 +164,9 @@ def _get_tool_module(tool_name: str) -> Any:
         return mod
     elif tool_name == "browser":
         import tools.browser as mod
+        return mod
+    elif tool_name == "history":
+        import tools.history as mod
         return mod
     else:
         raise ExecutionError(f"Unknown tool: '{tool_name}'")

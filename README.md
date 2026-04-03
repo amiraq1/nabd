@@ -4,7 +4,7 @@ A local-first, safety-first phone operations agent for Android/Termux.
 
 Nabd accepts natural-language commands in English, turns them into structured intents, validates every path against an allowlist, shows a preview before making any change, and asks for confirmation before anything modifying is applied.
 
-**v0.4** — 397 tests passing.
+**v0.8** — current release.
 
 ---
 
@@ -15,7 +15,7 @@ Nabd accepts natural-language commands in English, turns them into structured in
 - **Preview before apply** — modifying operations run a dry-run pass first. If the preview fails, Nabd stops before confirmation or any real changes.
 - **Explicit confirmation** — you type `y` before any file is moved, renamed, or overwritten, or before a URL/file is opened.
 - **Whitelisted execution** — only explicitly declared tool functions can be called. No arbitrary shell execution. No arbitrary browser automation.
-- **Advisory AI suggestions only** — Nabd can suggest safe next commands based on the current result and recent history, but it never auto-runs them.
+- **Advisory AI suggestions only** — Nabd can suggest safe next commands based on the current result, recent history, and short-term safe session context, but it never auto-runs them.
 - **English-only** — clean input; no multi-language ambiguity.
 
 ---
@@ -191,6 +191,37 @@ history
 ```
 Shows your 20 most recent commands with status, timestamp, and intent.
 
+```
+history search <term>
+history intent <intent>
+history show <id>
+```
+Filters and re-displays entries from the local history log. These commands only read the log; they never replay or execute past actions. Invalid intent names or missing IDs raise a clarification message before anything changes.
+
+---
+
+### Session context
+
+Nabd keeps a small in-memory context for the current session only.
+It can reuse a recent unambiguous folder, URL, or result reference for simple follow-ups such as:
+
+```text
+show files in that folder
+list large files in it
+list links from it
+explain that result
+```
+
+Use these phrases whenever Nabd just described a folder, media scan, or browser result—the parser only accepts them when the reference is unambiguous, so Nabd will ask for clarification instead of guessing.
+
+Rules:
+
+- context is not persisted across restarts
+- context carryover is advisory and parser-side only
+- only unambiguous references are reused
+- if Nabd is not sure what `it` refers to, it asks you to clarify instead of guessing
+- all resolved commands still go through the normal parse → safety → planner → executor flow
+
 ---
 
 ### Advisory suggestions
@@ -201,7 +232,7 @@ These suggestions are:
 - informational only
 - never auto-executed
 - generated after the normal parse → safety → planner → executor flow
-- based on the current result and recent command history when available
+- based on the current result, recent command history, and current-session safe context when available
 - filtered so recent history is only reused when embedded paths stay inside allowed roots and reused URL commands still pass Nabd's URL-safety checks
 
 Examples:
@@ -432,7 +463,17 @@ cd nabd
 python -m pytest tests/ -v
 ```
 
-Tests cover parser, safety, planner, executor, tools, phone/browser flows, TLS handling, and advisory suggestions.
+Tests cover parser, safety, planner, executor, tools, phone/browser flows, TLS handling, advisory suggestions, and session-context carryover.
+
+---
+
+### v0.8
+
+- Short-term in-memory session context for the current Nabd session
+- Safe follow-up references for simple unambiguous phrases such as `that folder`, `it`, and `that result`
+- Clarification-first behavior when context is ambiguous instead of guessing
+- Advisory suggestions improved with last command, last result, and recent safe session context
+- No auto-execution added; all existing safety checks and confirmation rules remain in place
 
 ---
 

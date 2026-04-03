@@ -1609,11 +1609,11 @@ class TestMainV07(unittest.TestCase):
 
     def test_banner_says_v07(self):
         from main import BANNER
-        self.assertIn("v0.7", BANNER)
+        self.assertIn("v0.8", BANNER)
 
     def test_help_text_says_v07(self):
         from main import HELP_TEXT
-        self.assertIn("v0.7", HELP_TEXT)
+        self.assertIn("v0.8", HELP_TEXT)
 
     def test_help_text_mentions_ai_backend_status(self):
         from main import HELP_TEXT

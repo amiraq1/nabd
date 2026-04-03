@@ -2,6 +2,7 @@ import os
 from typing import Any
 
 from agent.models import ExecutionPlan, ParsedIntent, RiskLevel, ToolAction
+from agent.parser import ALL_INTENTS
 from core.config import get_settings
 from core.exceptions import UnknownIntentError, ValidationError
 
@@ -61,6 +62,9 @@ def plan(intent: ParsedIntent) -> ExecutionPlan:
         "browser_page_title": _plan_browser_page_title,
         "browser_extract_text": _plan_browser_extract_text,
         "browser_list_links": _plan_browser_list_links,
+        "history_search": _plan_history_search,
+        "history_intent": _plan_history_intent,
+        "history_show": _plan_history_show,
     }
 
     handler = planners.get(intent.intent)
@@ -162,6 +166,62 @@ def _plan_ai_clarify_request(intent: ParsedIntent, settings: dict) -> ExecutionP
             arguments={"user_text": user_text},
         )],
         preview_summary=f"AI clarifies request: '{user_text}'",
+    )
+
+
+def _plan_history_search(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    term = (intent.options.get("term") or "").strip()
+    if not term:
+        raise ValidationError("Please specify a term to search in history.")
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="history",
+            function_name="search_history",
+            arguments={"term": term},
+        )],
+        preview_summary=f"Search history for: {term}",
+    )
+
+
+def _plan_history_intent(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    target_intent = (intent.options.get("target_intent") or "").strip()
+    if not target_intent:
+        raise ValidationError("Please specify an intent name to filter history.")
+    if target_intent not in ALL_INTENTS:
+        raise ValidationError(f"Unknown intent name: '{target_intent}'")
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="history",
+            function_name="history_by_intent",
+            arguments={"intent_name": target_intent},
+        )],
+        preview_summary=f"Show history entries for intent: {target_intent}",
+    )
+
+
+def _plan_history_show(intent: ParsedIntent, settings: dict) -> ExecutionPlan:
+    entry_id = intent.options.get("entry_id")
+    if entry_id is None:
+        raise ValidationError("Please provide a history entry id to show.")
+    return ExecutionPlan(
+        intent=intent.intent,
+        risk_level=RiskLevel.LOW,
+        requires_confirmation=False,
+        dry_run=False,
+        actions=[ToolAction(
+            tool_name="history",
+            function_name="show_history_entry",
+            arguments={"entry_id": entry_id},
+        )],
+        preview_summary=f"Show history entry #{entry_id}",
     )
 
 

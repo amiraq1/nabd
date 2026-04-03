@@ -129,6 +129,15 @@ class TestDetectIntent:
         with pytest.raises(UnknownIntentError):
             detect_intent("zzz aaa bbb")
 
+    def test_history_search_intent(self):
+        assert detect_intent("history search doctor") == "history_search"
+
+    def test_history_intent_filter(self):
+        assert detect_intent("history intent doctor") == "history_intent"
+
+    def test_history_show_intent(self):
+        assert detect_intent("history show 3") == "history_show"
+
 
 class TestSourceTargetExtraction:
     def test_single_path_source_only(self):

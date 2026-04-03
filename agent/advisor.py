@@ -33,15 +33,18 @@ def generate_advisory_suggestions(
     intent: ParsedIntent,
     result: ExecutionResult | None = None,
     recent_history: list[dict[str, Any]] | None = None,
+    session_context: dict[str, Any] | None = None,
 ) -> list[str]:
     suggestions: list[str] = []
     history = recent_history or []
+    current_session = session_context or {}
 
     if result and result.raw_results:
         raw = result.raw_results[0]
         suggestions.extend(_suggest_from_result(intent, raw, result, history))
 
     suggestions.extend(_suggest_from_history(intent, result, history))
+    suggestions.extend(_suggest_from_session_context(intent, result, current_session))
     suggestions = _dedupe_suggestions(suggestions)
     suggestions = _filter_recent_command_repeats(suggestions, history)
     return suggestions[:MAX_SUGGESTIONS]
@@ -228,6 +231,43 @@ def _suggest_from_history(
             suggestions.append(f"If you were preparing a change, review the earlier command carefully before retrying: {previous}")
 
     return suggestions
+
+
+def _suggest_from_session_context(
+    intent: ParsedIntent,
+    result: ExecutionResult | None,
+    session_context: dict[str, Any],
+) -> list[str]:
+    if not result or not session_context:
+        return []
+
+    current_folder = intent.source_path or intent.target_path or ""
+    last_folder = (session_context.get("last_folder") or "").strip()
+    last_intent = (session_context.get("last_intent") or "").strip()
+    last_command = (session_context.get("last_command") or "").strip()
+    last_result = (session_context.get("last_result") or "").strip()
+
+    if not current_folder or not last_folder or current_folder != last_folder:
+        return []
+
+    if intent.intent in {
+        "storage_report",
+        "list_large_files",
+        "find_duplicates",
+        "show_files",
+        "list_media",
+    } and last_intent in {
+        "organize_folder_by_type",
+        "backup_folder",
+        "safe_move_files",
+        "safe_rename_files",
+        "compress_images",
+        "convert_video_to_mp3",
+    }:
+        if last_command and last_result:
+            return ["If you want a plain-English recap of the previous step: explain last result"]
+
+    return []
 
 
 def _recent_retryable_command(recent_history: list[dict[str, Any]]) -> str | None:
