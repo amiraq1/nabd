@@ -539,9 +539,14 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 - **`get_backend_status()` method** on `AIAssistSkill`: returns a typed dict; local backend always reports available; llama.cpp probes the server and reports reachable/unreachable with helpful detail
 - **Graceful failure modes**: server not running → `is_available()` false; timeout → fallback result with timeout note; invalid JSON → fallback result with error note; missing fields → fallback result; Nabd continues normally in all cases
 - **Skill version bumped to 0.2.0**
-- **94 new tests** in `tests/test_v7_llama_cpp.py` (774 total)
+- **`BackendStatus` dataclass** (`llm/schemas.py`): fifth output schema — `available`, `backend_name`, `transport`, `healthy`, `detail`; returned by `get_status()` on every backend
+- **Abstract `get_status()` method** (`llm/backend.py`): every backend must implement it; `LocalBackend` always returns healthy; `LlamaCppBackend` server mode probes `/health`, CLI mode checks file existence
+- **CLI transport mode** (`llm/llama_cpp_backend.py`): `"transport": "cli"` calls `llama-cli` as a subprocess with a fixed argument list (`shell=False`), captures stderr, uses `timeout`, parses JSON from stdout; binary and model path absence is reported clearly before execution
+- **Configurable `max_tokens` and `temperature`** in `_chat_server()`; both are taken from config and sent in every request rather than being hardcoded
+- **Config expanded to full spec §8** (`config/ai_assist.json`): `transport`, `endpoint` (replaces `server_url`), `binary_path`, `model_path`, `max_tokens`, `temperature`
+- **147 new tests** in `tests/test_v7_llama_cpp.py` (827 total)
 
-#### Configuring llama.cpp backend
+#### Configuring llama.cpp backend (server mode)
 
 1. Edit `config/ai_assist.json`:
 ```json
@@ -551,9 +556,13 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
   "mode": "assist_only",
   "fallback_intent_suggestion": false,
   "llama_cpp": {
-    "server_url": "http://localhost:8080",
-    "timeout_seconds": 30,
-    "model_name": "nabd-assistant"
+    "transport": "server",
+    "endpoint": "http://127.0.0.1:8080",
+    "binary_path": "",
+    "model_path": "",
+    "timeout_seconds": 20,
+    "max_tokens": 256,
+    "temperature": 0.2
   }
 }
 ```
@@ -562,6 +571,31 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 ./server -m model.gguf --port 8080 --host 127.0.0.1
 ```
 3. Verify: run `ai backend status` in Nabd.
+
+#### Configuring llama.cpp backend (CLI mode)
+
+Use CLI mode when you cannot run a persistent server (slower, but works anywhere):
+
+```json
+{
+  "enabled": true,
+  "backend": "llama_cpp",
+  "mode": "assist_only",
+  "fallback_intent_suggestion": false,
+  "llama_cpp": {
+    "transport": "cli",
+    "binary_path": "/data/data/com.termux/files/usr/bin/llama-cli",
+    "model_path": "/sdcard/models/model.gguf",
+    "timeout_seconds": 60,
+    "max_tokens": 256,
+    "temperature": 0.2
+  }
+}
+```
+
+CLI mode safety contract: the binary is called with a fixed argument list (`shell=False`); user text is never interpolated into a shell command. If the binary or model file is missing, Nabd reports the error clearly and continues operating normally.
+
+If both server and CLI are configured, server mode is preferred (set `"transport": "server"`).
 
 #### Backend modes
 
@@ -578,14 +612,30 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 - `response_format: {"type": "json_object"}` is requested so the model outputs structured JSON; if it fails, Nabd falls back gracefully
 - AI failures never break Nabd's deterministic parser/safety/planner/executor pipeline
 
+#### Output schema
+
+All backend responses are typed dataclasses (`llm/schemas.py`):
+
+| Class | Fields |
+|---|---|
+| `CommandSuggestion` | `suggested_command`, `rationale`, `confidence` |
+| `ResultExplanation` | `summary`, `safety_note`, `suggested_next_step` |
+| `Clarification` | `clarification_needed`, `clarification_question`, `candidate_intents` |
+| `IntentSuggestion` | `intent`, `confidence`, `explanation` |
+| `BackendStatus` | `available`, `backend_name`, `transport`, `healthy`, `detail` |
+
 #### Troubleshooting llama.cpp
 
 | Symptom | Fix |
 |---|---|
-| `ai backend status` shows "✗ unreachable" | Start llama.cpp server: `./server -m model.gguf --port 8080` |
-| Suggestions always fall back to "doctor" | Server is down or returned bad JSON. Check server logs. |
-| Timeout errors | Increase `timeout_seconds` in `config/ai_assist.json` or use a faster/smaller model. |
+| `ai backend status` shows "✗ unreachable" (server) | Start llama.cpp: `./server -m model.gguf --port 8080` |
+| `ai backend status` shows "✗ unreachable" (CLI) | Set `binary_path` and `model_path` in `config/ai_assist.json` |
+| CLI: `binary not found` | Install llama.cpp and set the full path to `llama-cli` |
+| CLI: `model file not found` | Download a GGUF model and set `model_path` |
+| Suggestions always fall back to "doctor" | Backend down or returned bad JSON. Check server logs or model output. |
+| Timeout errors | Increase `timeout_seconds` or use a faster/smaller model. |
 | `"enabled": false` in status | Edit `config/ai_assist.json` and set `"enabled": true` |
+| Invalid JSON from model | Model too small or temperature too high; lower `temperature` to 0.1-0.2. |
 
 ### v0.6
 - **Skills registry**: `skills/registry.py` — lazy singleton managing all Nabd skill modules; `show skills` and `skill info <name>` expose it to users
