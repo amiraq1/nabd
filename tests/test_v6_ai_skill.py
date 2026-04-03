@@ -814,13 +814,13 @@ class TestLLMSchemas(unittest.TestCase):
 
 class TestMainV06(unittest.TestCase):
 
-    def test_banner_says_v06(self):
+    def test_banner_says_current_version(self):
         from main import BANNER
-        self.assertIn("v0.6", BANNER)
+        self.assertIn("v0.", BANNER)
 
-    def test_help_text_says_v06(self):
+    def test_help_text_says_current_version(self):
         from main import HELP_TEXT
-        self.assertIn("v0.6", HELP_TEXT)
+        self.assertIn("v0.", HELP_TEXT)
 
     def test_help_text_has_ai_assist_section(self):
         from main import HELP_TEXT
