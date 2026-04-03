@@ -96,6 +96,8 @@ class AIAssistSkill(SkillBase):
         self._llama_cfg: dict = config.get("llama_cpp", {})
         self._backend = None
 
+    _VALID_BACKENDS = {"local", "llama_cpp"}
+
     def _get_backend(self):
         if self._backend is None:
             if self.backend_name == "llama_cpp":
@@ -117,9 +119,15 @@ class AIAssistSkill(SkillBase):
                     binary_path=cfg.get("binary_path", ""),
                     model_path=cfg.get("model_path", ""),
                 )
-            else:
+            elif self.backend_name == "local":
                 from llm.local_backend import LocalBackend
                 self._backend = LocalBackend()
+            else:
+                raise RuntimeError(
+                    f"Unknown AI backend: '{self.backend_name}'. "
+                    f"Allowed values: {sorted(self._VALID_BACKENDS)}. "
+                    "Check the 'backend' field in config/ai_assist.json."
+                )
         return self._backend
 
     def get_info(self) -> SkillInfo:
