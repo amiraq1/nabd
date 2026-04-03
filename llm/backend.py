@@ -5,7 +5,7 @@ All implementations must be safe, advisory-only, and never execute tool actions.
 from __future__ import annotations
 from abc import ABC, abstractmethod
 
-from llm.schemas import CommandSuggestion, Clarification, IntentSuggestion, ResultExplanation
+from llm.schemas import BackendStatus, CommandSuggestion, Clarification, IntentSuggestion, ResultExplanation
 
 
 class LLMBackend(ABC):
@@ -19,6 +19,14 @@ class LLMBackend(ABC):
     @abstractmethod
     def is_available(self) -> bool:
         """Return True if this backend can currently handle requests."""
+        ...
+
+    @abstractmethod
+    def get_status(self) -> "BackendStatus":
+        """
+        Return a structured health report for this backend.
+        Must never raise — always returns a BackendStatus even on failure.
+        """
         ...
 
     @abstractmethod
