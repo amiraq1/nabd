@@ -756,21 +756,44 @@ class TestConfigV7(unittest.TestCase):
             config = json.load(f)
         self.assertIn("llama_cpp", config)
 
-    def test_llama_cpp_section_has_server_url(self):
+    def test_llama_cpp_section_has_endpoint(self):
         with open(self._config_path()) as f:
             config = json.load(f)
-        self.assertIn("server_url", config["llama_cpp"])
+        self.assertIn("endpoint", config["llama_cpp"])
+
+    def test_llama_cpp_section_has_transport(self):
+        with open(self._config_path()) as f:
+            config = json.load(f)
+        self.assertIn("transport", config["llama_cpp"])
+        self.assertIn(config["llama_cpp"]["transport"], ("server", "cli"))
+
+    def test_llama_cpp_section_has_binary_path(self):
+        with open(self._config_path()) as f:
+            config = json.load(f)
+        self.assertIn("binary_path", config["llama_cpp"])
+
+    def test_llama_cpp_section_has_model_path(self):
+        with open(self._config_path()) as f:
+            config = json.load(f)
+        self.assertIn("model_path", config["llama_cpp"])
+
+    def test_llama_cpp_section_has_max_tokens(self):
+        with open(self._config_path()) as f:
+            config = json.load(f)
+        self.assertIn("max_tokens", config["llama_cpp"])
+        self.assertIsInstance(config["llama_cpp"]["max_tokens"], int)
+
+    def test_llama_cpp_section_has_temperature(self):
+        with open(self._config_path()) as f:
+            config = json.load(f)
+        self.assertIn("temperature", config["llama_cpp"])
+        self.assertIsInstance(config["llama_cpp"]["temperature"], float)
 
     def test_llama_cpp_section_has_timeout_seconds(self):
         with open(self._config_path()) as f:
             config = json.load(f)
         self.assertIn("timeout_seconds", config["llama_cpp"])
         self.assertIsInstance(config["llama_cpp"]["timeout_seconds"], int)
-
-    def test_llama_cpp_section_has_model_name(self):
-        with open(self._config_path()) as f:
-            config = json.load(f)
-        self.assertIn("model_name", config["llama_cpp"])
 
     def test_default_backend_is_local(self):
         with open(self._config_path()) as f:
@@ -781,6 +804,581 @@ class TestConfigV7(unittest.TestCase):
         with open(self._config_path()) as f:
             config = json.load(f)
         self.assertFalse(config["enabled"])
+
+
+# ── BackendStatus dataclass ───────────────────────────────────────────────────
+
+class TestBackendStatusSchema(unittest.TestCase):
+
+    def test_backend_status_fields(self):
+        from llm.schemas import BackendStatus
+        s = BackendStatus(
+            available=True, backend_name="local",
+            transport=None, healthy=True, detail="ok"
+        )
+        self.assertTrue(s.available)
+        self.assertEqual(s.backend_name, "local")
+        self.assertIsNone(s.transport)
+        self.assertTrue(s.healthy)
+        self.assertEqual(s.detail, "ok")
+
+    def test_backend_status_unhealthy(self):
+        from llm.schemas import BackendStatus
+        s = BackendStatus(
+            available=False, backend_name="llama_cpp",
+            transport="server", healthy=False, detail="server not responding"
+        )
+        self.assertFalse(s.available)
+        self.assertFalse(s.healthy)
+        self.assertEqual(s.transport, "server")
+
+    def test_backend_status_cli_transport(self):
+        from llm.schemas import BackendStatus
+        s = BackendStatus(
+            available=True, backend_name="llama_cpp",
+            transport="cli", healthy=True, detail="CLI ready"
+        )
+        self.assertEqual(s.transport, "cli")
+
+
+# ── get_status() — abstract method implemented ────────────────────────────────
+
+class TestGetStatusMethod(unittest.TestCase):
+
+    def test_local_backend_get_status(self):
+        from llm.local_backend import LocalBackend
+        from llm.schemas import BackendStatus
+        b = LocalBackend()
+        status = b.get_status()
+        self.assertIsInstance(status, BackendStatus)
+        self.assertTrue(status.available)
+        self.assertEqual(status.backend_name, "local")
+        self.assertIsNone(status.transport)
+        self.assertTrue(status.healthy)
+
+    def test_llama_cpp_server_get_status_up(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        from llm.schemas import BackendStatus
+        b = LlamaCppBackend(endpoint="http://localhost:8080", transport="server")
+        resp = _make_http_response({"status": "ok"})
+        with patch("urllib.request.urlopen", return_value=resp):
+            status = b.get_status()
+        self.assertIsInstance(status, BackendStatus)
+        self.assertTrue(status.available)
+        self.assertEqual(status.backend_name, "llama_cpp")
+        self.assertEqual(status.transport, "server")
+        self.assertTrue(status.healthy)
+
+    def test_llama_cpp_server_get_status_down(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        from llm.schemas import BackendStatus
+        b = LlamaCppBackend(endpoint="http://localhost:8080", transport="server")
+        with patch("urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("refused")):
+            status = b.get_status()
+        self.assertIsInstance(status, BackendStatus)
+        self.assertFalse(status.available)
+        self.assertFalse(status.healthy)
+        self.assertIn("not responding", status.detail.lower())
+
+    def test_llama_cpp_cli_get_status_missing_binary(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        from llm.schemas import BackendStatus
+        b = LlamaCppBackend(transport="cli", binary_path="/nonexistent/llama-cli",
+                            model_path="/nonexistent/model.gguf")
+        status = b.get_status()
+        self.assertIsInstance(status, BackendStatus)
+        self.assertFalse(status.available)
+        self.assertEqual(status.transport, "cli")
+        self.assertIn("not found", status.detail.lower())
+
+    def test_llama_cpp_cli_get_status_missing_model(self, tmp_path=None):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        from llm.schemas import BackendStatus
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            binary = f.name
+        try:
+            b = LlamaCppBackend(transport="cli", binary_path=binary,
+                                model_path="/nonexistent/model.gguf")
+            status = b.get_status()
+        finally:
+            os.unlink(binary)
+        self.assertFalse(status.available)
+        self.assertIn("not found", status.detail.lower())
+
+    def test_llama_cpp_cli_get_status_both_present(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        from llm.schemas import BackendStatus
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False) as fb:
+            binary = fb.name
+        with tempfile.NamedTemporaryFile(delete=False) as fm:
+            model = fm.name
+        try:
+            b = LlamaCppBackend(transport="cli", binary_path=binary, model_path=model)
+            status = b.get_status()
+        finally:
+            os.unlink(binary)
+            os.unlink(model)
+        self.assertTrue(status.available)
+        self.assertTrue(status.healthy)
+        self.assertEqual(status.transport, "cli")
+
+    def test_get_status_never_raises(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(transport="server", endpoint="http://localhost:9999")
+        with patch("urllib.request.urlopen", side_effect=RuntimeError("unexpected")):
+            status = b.get_status()
+        self.assertIsNotNone(status)
+        self.assertFalse(status.available)
+
+
+# ── LlamaCppBackend — transport config ────────────────────────────────────────
+
+class TestLlamaCppTransportConfig(unittest.TestCase):
+
+    def test_default_transport_is_server(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend()
+        self.assertEqual(b._transport, "server")
+
+    def test_cli_transport_set(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(transport="cli", binary_path="/bin/llama", model_path="/m.gguf")
+        self.assertEqual(b._transport, "cli")
+
+    def test_endpoint_used_as_primary(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(endpoint="http://myserver:9090")
+        self.assertEqual(b._endpoint, "http://myserver:9090")
+
+    def test_server_url_kwarg_still_works(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(server_url="http://legacy:8888")
+        self.assertEqual(b._server_url, "http://legacy:8888")
+
+    def test_trailing_slash_stripped_from_endpoint(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(endpoint="http://localhost:8080/")
+        self.assertFalse(b._endpoint.endswith("/"))
+
+    def test_max_tokens_stored(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(max_tokens=512)
+        self.assertEqual(b._max_tokens, 512)
+
+    def test_temperature_stored(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(temperature=0.5)
+        self.assertAlmostEqual(b._temperature, 0.5)
+
+    def test_binary_path_stored(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(transport="cli", binary_path="/usr/bin/llama-cli")
+        self.assertEqual(b._binary_path, "/usr/bin/llama-cli")
+
+    def test_model_path_stored(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(transport="cli", model_path="/sdcard/models/model.gguf")
+        self.assertEqual(b._model_path, "/sdcard/models/model.gguf")
+
+
+# ── max_tokens and temperature propagated in server request ───────────────────
+
+class TestLlamaCppServerPayload(unittest.TestCase):
+
+    def test_max_tokens_in_request_payload(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(endpoint="http://localhost:8080", max_tokens=128)
+        payload_resp = _make_http_response(
+            _chat_response({"suggested_command": "doctor", "rationale": "ok", "confidence": 0.8})
+        )
+        captured = {}
+        def fake_urlopen(req, timeout):
+            captured["body"] = json.loads(req.data.decode())
+            return payload_resp
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            b.suggest_command("check", ["doctor"])
+        self.assertEqual(captured["body"]["max_tokens"], 128)
+
+    def test_temperature_in_request_payload(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(endpoint="http://localhost:8080", temperature=0.3)
+        payload_resp = _make_http_response(
+            _chat_response({"suggested_command": "doctor", "rationale": "ok", "confidence": 0.8})
+        )
+        captured = {}
+        def fake_urlopen(req, timeout):
+            captured["body"] = json.loads(req.data.decode())
+            return payload_resp
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            b.suggest_command("check", ["doctor"])
+        self.assertAlmostEqual(captured["body"]["temperature"], 0.3)
+
+    def test_response_format_json_object_in_payload(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(endpoint="http://localhost:8080")
+        payload_resp = _make_http_response(
+            _chat_response({"suggested_command": "doctor", "rationale": "ok", "confidence": 0.8})
+        )
+        captured = {}
+        def fake_urlopen(req, timeout):
+            captured["body"] = json.loads(req.data.decode())
+            return payload_resp
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            b.suggest_command("check", ["doctor"])
+        self.assertEqual(
+            captured["body"].get("response_format", {}).get("type"), "json_object"
+        )
+
+
+# ── CLI mode — is_available ───────────────────────────────────────────────────
+
+class TestLlamaCppCLIAvailability(unittest.TestCase):
+
+    def test_cli_available_when_both_files_exist(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False) as fb:
+            binary = fb.name
+        with tempfile.NamedTemporaryFile(delete=False) as fm:
+            model = fm.name
+        try:
+            b = LlamaCppBackend(transport="cli", binary_path=binary, model_path=model)
+            self.assertTrue(b.is_available())
+        finally:
+            os.unlink(binary)
+            os.unlink(model)
+
+    def test_cli_unavailable_when_binary_missing(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(transport="cli",
+                            binary_path="/nonexistent/llama-cli",
+                            model_path="/nonexistent/model.gguf")
+        self.assertFalse(b.is_available())
+
+    def test_cli_unavailable_when_model_missing(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False) as fb:
+            binary = fb.name
+        try:
+            b = LlamaCppBackend(transport="cli", binary_path=binary,
+                                model_path="/nonexistent/model.gguf")
+            self.assertFalse(b.is_available())
+        finally:
+            os.unlink(binary)
+
+    def test_cli_unavailable_when_paths_empty(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(transport="cli", binary_path="", model_path="")
+        self.assertFalse(b.is_available())
+
+
+# ── CLI mode — subprocess safety ──────────────────────────────────────────────
+
+class TestLlamaCppCLISubprocess(unittest.TestCase):
+
+    def _make_cli_backend(self, binary="/usr/bin/llama-cli", model="/sdcard/model.gguf"):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        return LlamaCppBackend(
+            transport="cli",
+            binary_path=binary,
+            model_path=model,
+            timeout_seconds=10,
+            max_tokens=128,
+            temperature=0.2,
+        )
+
+    def _cli_proc(self, stdout: str, returncode: int = 0) -> MagicMock:
+        proc = MagicMock()
+        proc.stdout = stdout
+        proc.stderr = ""
+        proc.returncode = returncode
+        return proc
+
+    def test_cli_chat_returns_valid_dict(self):
+        b = self._make_cli_backend()
+        payload = {"suggested_command": "doctor", "rationale": "ok", "confidence": 0.9}
+        proc = self._cli_proc(json.dumps(payload))
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            result = b._chat_cli("sys", "user")
+        self.assertEqual(result["suggested_command"], "doctor")
+
+    def test_cli_chat_extracts_json_from_mixed_output(self):
+        b = self._make_cli_backend()
+        payload = {"suggested_command": "doctor", "rationale": "ok", "confidence": 0.7}
+        mixed = f"some preamble text\n{json.dumps(payload)}\nsome trailing text"
+        proc = self._cli_proc(mixed)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            result = b._chat_cli("sys", "user")
+        self.assertEqual(result["suggested_command"], "doctor")
+
+    def test_cli_uses_fixed_arg_list_not_shell(self):
+        b = self._make_cli_backend()
+        payload = {"intent": "doctor", "confidence": 0.8, "explanation": "ok"}
+        proc = self._cli_proc(json.dumps(payload))
+        call_args = {}
+        def fake_run(cmd, **kwargs):
+            call_args["cmd"] = cmd
+            call_args["shell"] = kwargs.get("shell", False)
+            return proc
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", side_effect=fake_run):
+            b._chat_cli("sys", "user")
+        self.assertIsInstance(call_args["cmd"], list)
+        self.assertFalse(call_args["shell"])
+
+    def test_cli_timeout_raises_timeout_error(self):
+        b = self._make_cli_backend()
+        import subprocess as sp
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", side_effect=sp.TimeoutExpired(["llama-cli"], 10)):
+            with self.assertRaises(TimeoutError):
+                b._chat_cli("sys", "user")
+
+    def test_cli_missing_binary_raises_connection_error(self):
+        b = self._make_cli_backend(binary="/missing/llama-cli")
+        with patch("os.path.isfile", return_value=False):
+            with self.assertRaises(ConnectionError) as ctx:
+                b._chat_cli("sys", "user")
+        self.assertIn("not found", str(ctx.exception).lower())
+
+    def test_cli_missing_model_raises_connection_error(self):
+        b = self._make_cli_backend()
+        def isfile(p):
+            return "binary" not in p and "llama-cli" not in p.lower() or p == "/usr/bin/llama-cli"
+        with patch("os.path.isfile", side_effect=lambda p: (
+            p == "/usr/bin/llama-cli"  # binary exists
+        )):
+            with self.assertRaises(ConnectionError):
+                b._chat_cli("sys", "user")
+
+    def test_cli_nonzero_exit_raises_connection_error(self):
+        b = self._make_cli_backend()
+        proc = self._cli_proc("error output", returncode=1)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=proc):
+            with self.assertRaises(ConnectionError) as ctx:
+                b._chat_cli("sys", "user")
+        self.assertIn("exited with code 1", str(ctx.exception))
+
+    def test_cli_falls_back_gracefully_on_timeout(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        import subprocess as sp
+        b = LlamaCppBackend(transport="cli", binary_path="/bin/llama",
+                            model_path="/m.gguf", timeout_seconds=5)
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", side_effect=sp.TimeoutExpired(["llama-cli"], 5)):
+            result = b.suggest_command("check", ["doctor"])
+        self.assertEqual(result.suggested_command, "doctor")
+        self.assertEqual(result.confidence, 0.0)
+        self.assertIn("timed out", result.rationale.lower())
+
+    def test_cli_falls_back_gracefully_on_missing_binary(self):
+        from llm.llama_cpp_backend import LlamaCppBackend
+        b = LlamaCppBackend(transport="cli", binary_path="/nonexistent/llama",
+                            model_path="/nonexistent/model.gguf")
+        result = b.suggest_command("check", ["doctor"])
+        self.assertEqual(result.suggested_command, "doctor")
+        self.assertEqual(result.confidence, 0.0)
+
+
+# ── Reporter — transport field ────────────────────────────────────────────────
+
+class TestReporterTransportField(unittest.TestCase):
+
+    def _report(self, raw: dict) -> str:
+        from agent.reporter import report_result
+        from agent.models import OperationStatus
+        result = MagicMock()
+        result.status = OperationStatus.SUCCESS
+        result.message = "AI Backend Status"
+        result.errors = []
+        result.raw_results = [raw]
+        return report_result(result, "ai_backend_status", False)
+
+    def test_transport_shown_for_server(self):
+        raw = {
+            "backend": "llama_cpp", "available": True, "enabled": True,
+            "transport": "server", "healthy": True,
+            "endpoint": "http://localhost:8080",
+            "timeout_seconds": 20, "max_tokens": 256, "temperature": 0.2,
+            "detail": "Connected",
+        }
+        output = self._report(raw)
+        self.assertIn("server", output)
+        self.assertIn("Transport", output)
+
+    def test_transport_shown_for_cli(self):
+        raw = {
+            "backend": "llama_cpp", "available": False, "enabled": True,
+            "transport": "cli", "healthy": False,
+            "binary_path": "/usr/bin/llama-cli",
+            "model_path": "/sdcard/models/model.gguf",
+            "timeout_seconds": 20,
+            "detail": "binary not found",
+        }
+        output = self._report(raw)
+        self.assertIn("cli", output)
+        self.assertIn("Binary", output)
+
+    def test_endpoint_shown_for_server_transport(self):
+        raw = {
+            "backend": "llama_cpp", "available": True, "enabled": True,
+            "transport": "server", "healthy": True,
+            "endpoint": "http://192.168.1.5:8080",
+            "timeout_seconds": 30, "max_tokens": 256, "temperature": 0.2,
+            "detail": "Connected",
+        }
+        output = self._report(raw)
+        self.assertIn("192.168.1.5:8080", output)
+        self.assertIn("Endpoint", output)
+
+    def test_cli_hint_shown_when_cli_unavailable(self):
+        raw = {
+            "backend": "llama_cpp", "available": False, "enabled": True,
+            "transport": "cli", "healthy": False,
+            "binary_path": "", "model_path": "",
+            "timeout_seconds": 20,
+            "detail": "binary_path not set",
+        }
+        output = self._report(raw)
+        self.assertIn("binary_path", output)
+
+    def test_server_hint_shown_when_server_unavailable(self):
+        raw = {
+            "backend": "llama_cpp", "available": False, "enabled": True,
+            "transport": "server", "healthy": False,
+            "endpoint": "http://localhost:8080",
+            "timeout_seconds": 20, "max_tokens": 256, "temperature": 0.2,
+            "detail": "not responding",
+        }
+        output = self._report(raw)
+        self.assertIn("./server", output)
+
+    def test_local_backend_no_transport_line(self):
+        raw = {
+            "backend": "local", "available": True, "enabled": False,
+            "transport": None, "healthy": True,
+            "detail": "deterministic keyword matching",
+        }
+        output = self._report(raw)
+        self.assertNotIn("Transport:", output)
+
+
+# ── AIAssistSkill — endpoint config propagated ────────────────────────────────
+
+class TestAIAssistSkillEndpointConfig(unittest.TestCase):
+
+    def setUp(self):
+        import skills.registry as reg_mod
+        reg_mod._registry = None
+
+    def _skill_with_config(self, config: dict):
+        from skills.ai_assist_skill import AIAssistSkill
+        with patch("skills.ai_assist_skill._load_config", return_value=config):
+            return AIAssistSkill()
+
+    def test_endpoint_used_from_config(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"endpoint": "http://192.168.1.1:9001",
+                          "transport": "server", "timeout_seconds": 15,
+                          "max_tokens": 128, "temperature": 0.1},
+        })
+        backend = skill._get_backend()
+        self.assertEqual(backend._endpoint, "http://192.168.1.1:9001")
+
+    def test_server_url_legacy_key_still_works(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"server_url": "http://old-style:8080",
+                          "timeout_seconds": 10},
+        })
+        backend = skill._get_backend()
+        self.assertEqual(backend._endpoint, "http://old-style:8080")
+
+    def test_max_tokens_propagated(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"endpoint": "http://localhost:8080",
+                          "transport": "server", "timeout_seconds": 20,
+                          "max_tokens": 512, "temperature": 0.3},
+        })
+        backend = skill._get_backend()
+        self.assertEqual(backend._max_tokens, 512)
+
+    def test_temperature_propagated(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"endpoint": "http://localhost:8080",
+                          "transport": "server", "timeout_seconds": 20,
+                          "max_tokens": 256, "temperature": 0.15},
+        })
+        backend = skill._get_backend()
+        self.assertAlmostEqual(backend._temperature, 0.15)
+
+    def test_cli_transport_propagated(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"transport": "cli",
+                          "binary_path": "/usr/bin/llama-cli",
+                          "model_path": "/sdcard/model.gguf",
+                          "timeout_seconds": 30,
+                          "max_tokens": 256, "temperature": 0.2},
+        })
+        backend = skill._get_backend()
+        self.assertEqual(backend._transport, "cli")
+        self.assertEqual(backend._binary_path, "/usr/bin/llama-cli")
+        self.assertEqual(backend._model_path, "/sdcard/model.gguf")
+
+    def test_get_backend_status_has_transport_field(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"endpoint": "http://localhost:8080",
+                          "transport": "server", "timeout_seconds": 5,
+                          "max_tokens": 256, "temperature": 0.2},
+        })
+        with patch("urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("refused")):
+            status = skill.get_backend_status()
+        self.assertIn("transport", status)
+
+    def test_get_backend_status_has_max_tokens(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"endpoint": "http://localhost:8080",
+                          "transport": "server", "timeout_seconds": 5,
+                          "max_tokens": 400, "temperature": 0.2},
+        })
+        with patch("urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("refused")):
+            status = skill.get_backend_status()
+        self.assertEqual(status["max_tokens"], 400)
+
+    def test_get_backend_status_has_temperature(self):
+        skill = self._skill_with_config({
+            "enabled": True, "backend": "llama_cpp",
+            "mode": "assist_only", "fallback_intent_suggestion": False,
+            "llama_cpp": {"endpoint": "http://localhost:8080",
+                          "transport": "server", "timeout_seconds": 5,
+                          "max_tokens": 256, "temperature": 0.25},
+        })
+        with patch("urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("refused")):
+            status = skill.get_backend_status()
+        self.assertAlmostEqual(status["temperature"], 0.25)
 
 
 # ── JSON prompts sanity checks ────────────────────────────────────────────────
