@@ -435,7 +435,7 @@ class LlamaCppBackend(LLMBackend):
             confidence = max(0.0, min(1.0, confidence))
             explanation = str(data.get("explanation", "")).strip()
 
-            # Safety gate — discard any intent not in the allowed whitelist
+            # Safety gate 1 — discard any intent not in the allowed whitelist
             if intent and intent not in allowed_intents:
                 return IntentSuggestion(
                     intent=None,
@@ -445,6 +445,21 @@ class LlamaCppBackend(LLMBackend):
                         "Nabd whitelist — discarded for safety."
                     ),
                 )
+
+            # Safety gate 2 — low-confidence gate matching the prompt instruction:
+            # "If confidence is below 0.4, set intent to null."
+            # Enforced here even if the model disobeys that instruction.
+            if intent and confidence < _LOW_CONFIDENCE_THRESHOLD:
+                return IntentSuggestion(
+                    intent=None,
+                    confidence=round(confidence, 2),
+                    explanation=(
+                        f"Model returned confidence {confidence:.2f} for '{intent}', "
+                        f"below threshold {_LOW_CONFIDENCE_THRESHOLD} — "
+                        "treated as no confident match."
+                    ),
+                )
+
             return IntentSuggestion(
                 intent=intent,
                 confidence=round(confidence, 2),
@@ -462,11 +477,25 @@ class LlamaCppBackend(LLMBackend):
 
 # ── Output parsing helpers ────────────────────────────────────────────────────
 
+_LOW_CONFIDENCE_THRESHOLD = 0.4   # matches the threshold stated in SUGGEST_INTENT_JSON_TEMPLATE
+
+
 def _parse_chat_response(raw: str) -> dict[str, Any]:
-    """Parse an OpenAI-compatible chat completion response and return the content dict."""
+    """
+    Parse an OpenAI-compatible chat completion response and return the content dict.
+
+    Handles two `content` formats:
+      - JSON string (standard): content = '{"key": "val"}'
+      - Pre-parsed dict (some servers/proxies): content = {"key": "val"}
+    Both are accepted; any other type raises ValueError.
+    """
     try:
         outer = json.loads(raw)
         content = outer["choices"][0]["message"]["content"]
+        # Accept pre-parsed dict — some llama.cpp builds or proxy layers return the
+        # content field already decoded rather than as a JSON string.
+        if isinstance(content, dict):
+            return content
         result = json.loads(content)
         if not isinstance(result, dict):
             raise ValueError(f"Expected JSON object, got {type(result).__name__}")
