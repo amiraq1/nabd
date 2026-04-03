@@ -890,5 +890,67 @@ class TestConfigFiles(unittest.TestCase):
         self.assertIsInstance(config["skills"], list)
 
 
+# ── Audit: backend validation ──────────────────────────────────────────────────
+
+class TestAIAssistBackendValidation(unittest.TestCase):
+    """M1 audit fix: unknown backend name must raise, not silently use local."""
+
+    def _make_skill(self, backend_name: str):
+        from skills.ai_assist_skill import AIAssistSkill
+        skill = AIAssistSkill.__new__(AIAssistSkill)
+        skill.enabled = True
+        skill.mode = "assist_only"
+        skill.backend_name = backend_name
+        skill.fallback_intent_suggestion = False
+        skill._llama_cfg = {}
+        skill._backend = None
+        return skill
+
+    def test_unknown_backend_raises_runtime_error(self):
+        skill = self._make_skill("llamacpp")
+        with self.assertRaises(RuntimeError) as ctx:
+            skill._get_backend()
+        self.assertIn("Unknown AI backend", str(ctx.exception))
+        self.assertIn("llamacpp", str(ctx.exception))
+
+    def test_unknown_backend_typo_raises_runtime_error(self):
+        skill = self._make_skill("llama-cpp")
+        with self.assertRaises(RuntimeError) as ctx:
+            skill._get_backend()
+        self.assertIn("Unknown AI backend", str(ctx.exception))
+
+    def test_unknown_backend_empty_string_raises_runtime_error(self):
+        skill = self._make_skill("")
+        with self.assertRaises(RuntimeError) as ctx:
+            skill._get_backend()
+        self.assertIn("Unknown AI backend", str(ctx.exception))
+
+    def test_valid_backend_local_does_not_raise(self):
+        skill = self._make_skill("local")
+        backend = skill._get_backend()
+        from llm.local_backend import LocalBackend
+        self.assertIsInstance(backend, LocalBackend)
+
+    def test_valid_backend_llama_cpp_does_not_raise(self):
+        skill = self._make_skill("llama_cpp")
+        from llm.llama_cpp_backend import LlamaCppBackend
+        backend = skill._get_backend()
+        self.assertIsInstance(backend, LlamaCppBackend)
+
+    def test_error_message_lists_allowed_values(self):
+        skill = self._make_skill("gpt4")
+        with self.assertRaises(RuntimeError) as ctx:
+            skill._get_backend()
+        msg = str(ctx.exception)
+        self.assertIn("local", msg)
+        self.assertIn("llama_cpp", msg)
+
+    def test_backend_cached_after_first_get(self):
+        skill = self._make_skill("local")
+        b1 = skill._get_backend()
+        b2 = skill._get_backend()
+        self.assertIs(b1, b2)
+
+
 if __name__ == "__main__":
     unittest.main()
