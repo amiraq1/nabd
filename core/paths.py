@@ -3,6 +3,8 @@ import os
 from core.config import get_allowed_roots
 from core.exceptions import PathNotAllowedError, PathTraversalError, ValidationError
 
+TRAVERSAL_INDICATORS = ["..", "//", "\x00", "%2e", "%2f"]
+
 
 def resolve_path(raw_path: str) -> str:
     expanded = os.path.expanduser(os.path.expandvars(raw_path))
@@ -22,8 +24,7 @@ def validate_path(raw_path: str) -> str:
     if not raw_path or not raw_path.strip():
         raise ValidationError("Path must not be empty.")
 
-    traversal_indicators = ["..", "//", "\x00"]
-    for indicator in traversal_indicators:
+    for indicator in TRAVERSAL_INDICATORS:
         if indicator in raw_path:
             raise PathTraversalError(
                 f"Path contains disallowed sequence '{indicator}': {raw_path}"

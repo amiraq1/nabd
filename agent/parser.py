@@ -137,7 +137,9 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"extract\s+links?\s+(?:from|on|at|in)\b",
     ]),
     ("browser_search", [
-        r"\bsearch\s+(?:the\s+web\s+)?(?:for\s+)?(?!files?\s|duplicate|large|same|identical)",
+        r"\bsearch\s+(?:the\s+web\s+)?(?:for\s+)?"
+        r"(?!files?\s|duplicate|large|same|identical|"
+        r"(?:photos?|images?|videos?|clips?|audio|music|songs?)\s+in\s+/)",
         r"\bgoogle\s+(?:for\s+|search\s+)?",
         r"\blook\s+up\b",
         r"web\s+search\b",
@@ -290,12 +292,22 @@ _APP_NAME_RE = re.compile(
     r"(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?(\w+)(?:\s+app)?",
     re.IGNORECASE,
 )
+_LOCAL_MEDIA_SEARCH_RE = re.compile(
+    r"\bsearch\s+(?:the\s+web\s+)?(?:for\s+)?"
+    r"(?:photos?|images?|pictures?|pics?|screenshots?|wallpapers?"
+    r"|videos?|clips?|movies?|films?"
+    r"|audio|music|songs?|tracks?|recordings?|voice\s+notes?|podcasts?)"
+    r"\s+in\s+[\"']?/",
+    re.IGNORECASE,
+)
 
 KNOWN_APP_NAMES = {"chrome", "files", "settings", "camera", "gallery", "calculator"}
 
 
 def detect_intent(command: str) -> str:
     text = command.lower().strip()
+    if _LOCAL_MEDIA_SEARCH_RE.search(text):
+        return "list_media"
     for intent_name, patterns in INTENT_PATTERNS:
         for pattern in patterns:
             if re.search(pattern, text):

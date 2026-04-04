@@ -25,14 +25,15 @@ class TestHistoryTool(unittest.TestCase):
         self.assertEqual(result["entries"][0]["id"], 3)
         mock_get.assert_called_once_with(limit=200)
 
-    @patch("tools.history.get_history", return_value=SAMPLE)
+    @patch("tools.history.get_history_entry", return_value=SAMPLE[1])
     def test_show_history_entry_found(self, mock_get):
         result = history_tool.show_history_entry(2)
         self.assertEqual(result["entry"]["intent"], "doctor")
-        mock_get.assert_called_once_with(limit=500)
+        mock_get.assert_called_once_with(2)
 
-    @patch("tools.history.get_history", return_value=SAMPLE)
+    @patch("tools.history.get_history_entry", return_value=None)
     def test_show_history_entry_missing(self, mock_get):
         result = history_tool.show_history_entry(99)
         self.assertIsNone(result["entry"])
         self.assertIn("No history entry found", result.get("message", ""))
+        mock_get.assert_called_once_with(99)

@@ -4,6 +4,7 @@ import sys
 import os
 import tempfile
 import shutil
+from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
@@ -99,6 +100,13 @@ class TestHashFile:
     def test_nonexistent_file_returns_empty(self):
         assert hash_file("/nonexistent/path/file.txt") == ""
 
+    def test_hash_prefix_mode_is_stable(self, tmp_path):
+        f = tmp_path / "big.bin"
+        f.write_bytes(b"a" * 4096 + b"b" * 4096)
+        h1 = hash_file(str(f), chunk_size_kb=4, max_chunks=1)
+        h2 = hash_file(str(f), chunk_size_kb=4, max_chunks=1)
+        assert h1 == h2
+
 
 class TestUniqueDestPath:
     def test_no_conflict_returns_original(self, tmp_path):
@@ -116,6 +124,12 @@ class TestUniqueDestPath:
             (tmp_path / name).write_bytes(b"x")
         result = unique_dest_path(str(tmp_path / "file.txt"))
         assert result == str(tmp_path / "file_3.txt")
+
+    def test_raises_when_no_unique_name_found(self, monkeypatch):
+        monkeypatch.setattr("tools.utils.MAX_UNIQUE_DEST_ATTEMPTS", 3)
+        monkeypatch.setattr("tools.utils.os.path.exists", lambda _path: True)
+        with pytest.raises(ToolError):
+            unique_dest_path("/tmp/file.txt")
 
 
 class TestStorageReport:
@@ -159,7 +173,8 @@ class TestListLargeFiles:
         small = tmp_path / "small.txt"
         small.write_bytes(b"hi")
         result = list_large_files(str(tmp_path), top_n=10, threshold_mb=1.0)
-        paths = [r["path"] for r in result]
+        paths = [r["path"] for r in result["files"]]
+        assert result["directory"] == str(tmp_path)
         assert str(large) in paths
         assert str(small) not in paths
 
@@ -167,14 +182,14 @@ class TestListLargeFiles:
         for i in range(5):
             (tmp_path / f"file{i}.bin").write_bytes(b"x" * 1024)
         result = list_large_files(str(tmp_path), top_n=3, threshold_mb=0)
-        assert len(result) <= 3
+        assert len(result["files"]) <= 3
 
     def test_sorted_descending(self, tmp_path):
         (tmp_path / "small.bin").write_bytes(b"x" * 100)
         (tmp_path / "large.bin").write_bytes(b"x" * 10000)
         (tmp_path / "medium.bin").write_bytes(b"x" * 1000)
         result = list_large_files(str(tmp_path), top_n=10, threshold_mb=0)
-        sizes = [r["size_bytes"] for r in result]
+        sizes = [r["size_bytes"] for r in result["files"]]
         assert sizes == sorted(sizes, reverse=True)
 
     def test_nonexistent_dir_raises(self):
@@ -287,6 +302,26 @@ class TestFindDuplicates:
         (sub / "nested.txt").write_bytes(content)
         result = find_duplicates(str(tmp_path), recursive=True)
         assert result["total_groups"] == 1
+
+    def test_prefix_hash_prefilter_skips_full_hash_for_distinct_prefixes(self, tmp_path):
+        a = tmp_path / "a.bin"
+        b = tmp_path / "b.bin"
+        a.write_bytes(b"a" * 8192)
+        b.write_bytes(b"b" * 8192)
+
+        calls: list[tuple[str, int, int | None]] = []
+
+        def fake_hash(path: str, chunk_size_kb: int = 64, max_chunks: int | None = None) -> str:
+            calls.append((os.path.basename(path), chunk_size_kb, max_chunks))
+            if max_chunks == 1:
+                return f"prefix-{os.path.basename(path)}"
+            raise AssertionError("Full hash should not run when prefix hashes differ.")
+
+        with patch("tools.duplicates.hash_file", side_effect=fake_hash):
+            result = find_duplicates(str(tmp_path), recursive=False)
+
+        assert result["total_groups"] == 0
+        assert calls == [("a.bin", 4, 1), ("b.bin", 4, 1)]
 
 
 class TestSafeRenameFiles:
@@ -421,6 +456,7 @@ class TestExecutorIntegration:
         (tmp_path / "a.txt").write_bytes(b"hello")
         result = execute(plan, confirmed=False)
         assert result.status == OperationStatus.SUCCESS
+        assert result.message == "Operation 'storage_report' completed successfully."
         assert len(result.raw_results) == 1
         assert result.raw_results[0]["file_count"] == 1
 
@@ -442,6 +478,7 @@ class TestExecutorIntegration:
         )
         result = execute(plan, confirmed=False)
         assert result.status == OperationStatus.SUCCESS
+        assert "[DRY RUN]" in result.message
         assert (tmp_path / "photo.jpg").exists()
 
     def test_whitelisted_function_enforced(self, tmp_path):

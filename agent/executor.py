@@ -1,4 +1,5 @@
 import copy
+import importlib
 from typing import Any
 
 from agent.models import ExecutionPlan, ExecutionResult, OperationStatus, ToolAction
@@ -30,6 +31,19 @@ WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
                    "browser_page_title"},
     "history":    {"search_history", "history_by_intent", "show_history_entry"},
     "schedule":   {"create_schedule", "list_schedules", "delete_schedule"},
+}
+
+_TOOL_MODULES: dict[str, str] = {
+    "system": "tools.system",
+    "storage": "tools.storage",
+    "files": "tools.files",
+    "media": "tools.media",
+    "backup": "tools.backup",
+    "duplicates": "tools.duplicates",
+    "phone": "tools.phone",
+    "browser": "tools.browser",
+    "history": "tools.history",
+    "schedule": "tools.schedule",
 }
 
 
@@ -142,38 +156,10 @@ def _execute_ai_skill_action(action: ToolAction) -> dict[str, Any]:
 
 
 def _get_tool_module(tool_name: str) -> Any:
-    if tool_name == "system":
-        import tools.system as mod
-        return mod
-    elif tool_name == "storage":
-        import tools.storage as mod
-        return mod
-    elif tool_name == "files":
-        import tools.files as mod
-        return mod
-    elif tool_name == "media":
-        import tools.media as mod
-        return mod
-    elif tool_name == "backup":
-        import tools.backup as mod
-        return mod
-    elif tool_name == "duplicates":
-        import tools.duplicates as mod
-        return mod
-    elif tool_name == "phone":
-        import tools.phone as mod
-        return mod
-    elif tool_name == "browser":
-        import tools.browser as mod
-        return mod
-    elif tool_name == "history":
-        import tools.history as mod
-        return mod
-    elif tool_name == "schedule":
-        import tools.schedule as mod
-        return mod
-    else:
+    module_path = _TOOL_MODULES.get(tool_name)
+    if module_path is None:
         raise ExecutionError(f"Unknown tool: '{tool_name}'")
+    return importlib.import_module(module_path)
 
 
 def _execute_action(action: ToolAction, confirmed: bool) -> dict[str, Any]:
@@ -280,7 +266,7 @@ def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
     else:
         status = OperationStatus.SUCCESS
 
-    message = _build_message(plan.intent, confirmed, status)
+    message = _build_message(plan.intent, confirmed, status, is_preview=plan.dry_run)
 
     return ExecutionResult(
         status=status,
@@ -295,8 +281,13 @@ def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
     )
 
 
-def _build_message(intent: str, confirmed: bool, status: OperationStatus) -> str:
-    if not confirmed:
+def _build_message(
+    intent: str,
+    confirmed: bool,
+    status: OperationStatus,
+    is_preview: bool = False,
+) -> str:
+    if not confirmed and is_preview:
         return f"[DRY RUN] Preview completed for '{intent}'. No changes made."
     if status == OperationStatus.SUCCESS:
         return f"Operation '{intent}' completed successfully."

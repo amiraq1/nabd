@@ -1,7 +1,7 @@
 import os
 from typing import Any
 
-from tools.utils import human_readable_size, scan_files
+from tools.utils import get_category, human_readable_size, scan_files
 from core.exceptions import ToolError
 
 
@@ -23,7 +23,6 @@ def get_storage_report(directory: str) -> dict[str, Any]:
                 total_size += size
                 file_count += 1
                 ext = os.path.splitext(filename)[1].lower()
-                from tools.utils import get_category
                 cat = get_category(ext)
                 category_sizes[cat] = category_sizes.get(cat, 0) + size
             except (OSError, PermissionError):
@@ -46,7 +45,11 @@ def get_storage_report(directory: str) -> dict[str, Any]:
     }
 
 
-def list_large_files(directory: str, top_n: int = 20, threshold_mb: float = 0.0) -> list[dict[str, Any]]:
+def list_large_files(
+    directory: str,
+    top_n: int = 20,
+    threshold_mb: float = 0.0,
+) -> dict[str, Any]:
     if not os.path.isdir(directory):
         raise ToolError(f"Directory does not exist: {directory}")
 
@@ -66,4 +69,7 @@ def list_large_files(directory: str, top_n: int = 20, threshold_mb: float = 0.0)
             pass
 
     files_info.sort(key=lambda x: -x["size_bytes"])
-    return files_info[:top_n]
+    return {
+        "directory": directory,
+        "files": files_info[:top_n],
+    }

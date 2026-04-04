@@ -38,6 +38,12 @@ def get_registry() -> SkillRegistry:
     return _registry
 
 
+def reset_registry() -> None:
+    """Reset the module-level singleton so tests can isolate registry state."""
+    global _registry
+    _registry = None
+
+
 def _bootstrap(registry: SkillRegistry) -> None:
     from skills.ai_assist_skill import AIAssistSkill
     registry.register(AIAssistSkill())

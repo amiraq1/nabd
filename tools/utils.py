@@ -2,6 +2,10 @@ import hashlib
 import os
 from typing import Generator
 
+from core.exceptions import ToolError
+
+MAX_UNIQUE_DEST_ATTEMPTS = 10_000
+
 
 EXTENSION_CATEGORIES: dict[str, set[str]] = {
     "images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".tiff", ".svg"},
@@ -56,16 +60,24 @@ def scan_files(directory: str, recursive: bool = False) -> Generator[str, None, 
             return
 
 
-def hash_file(filepath: str, chunk_size_kb: int = 64) -> str:
+def hash_file(
+    filepath: str,
+    chunk_size_kb: int = 64,
+    max_chunks: int | None = None,
+) -> str:
     sha256 = hashlib.sha256()
     chunk_size = chunk_size_kb * 1024
     try:
         with open(filepath, "rb") as f:
+            chunks_read = 0
             while True:
+                if max_chunks is not None and chunks_read >= max_chunks:
+                    break
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break
                 sha256.update(chunk)
+                chunks_read += 1
         return sha256.hexdigest()
     except (OSError, PermissionError):
         return ""
@@ -89,8 +101,12 @@ def unique_dest_path(dest_path: str) -> str:
         return dest_path
     base, ext = os.path.splitext(dest_path)
     counter = 1
-    while True:
+    while counter <= MAX_UNIQUE_DEST_ATTEMPTS:
         candidate = f"{base}_{counter}{ext}"
         if not os.path.exists(candidate):
             return candidate
         counter += 1
+    raise ToolError(
+        f"Could not find an available destination path after "
+        f"{MAX_UNIQUE_DEST_ATTEMPTS} attempts: {dest_path}"
+    )

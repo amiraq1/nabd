@@ -80,7 +80,8 @@ _EXPLICIT_URL_REF = re.compile(
 )
 
 # "it" alone — disambiguated at resolution time.
-_IT_REF = re.compile(r"\bit\b", re.IGNORECASE)
+# Hyphenated terms like "it-projects" are treated as ordinary text, not context.
+_IT_REF = re.compile(r"(?<![\w-])it(?![\w-])", re.IGNORECASE)
 
 # "explain that / that result / that error" → handled by ai_explain_last_result;
 # do not intercept these.

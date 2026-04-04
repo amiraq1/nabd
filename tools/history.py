@@ -1,6 +1,6 @@
 from typing import Any
 
-from core.logging_db import get_history
+from core.logging_db import get_history, get_history_entry
 
 
 def search_history(term: str) -> dict[str, Any]:
@@ -33,8 +33,7 @@ def history_by_intent(intent_name: str) -> dict[str, Any]:
 
 
 def show_history_entry(entry_id: int) -> dict[str, Any]:
-    results = get_history(limit=500)
-    for entry in results:
-        if entry.get("id") == entry_id:
-            return {"entry": entry}
+    entry = get_history_entry(entry_id)
+    if entry is not None:
+        return {"entry": entry}
     return {"entry": None, "message": f"No history entry found with id {entry_id}"}

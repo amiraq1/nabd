@@ -12,6 +12,7 @@ from agent.executor import execute
 from agent.reporter import report_result
 from core.exceptions import ValidationError, SafetyError
 from agent.models import OperationStatus
+from tools.schedule import create_schedule, list_schedules, prepare_schedule_for_execution
 
 def test_parse_schedule_create():
     cmd = "schedule storage report /sdcard/Download every daily"
@@ -93,3 +94,37 @@ def test_executor_schedule_flow(mock_schedule_file):
     # List empty
     res_list_empty = execute(list_p, confirmed=True)
     assert len(res_list_empty.raw_results[0]["schedules"]) == 0
+
+def test_create_schedule_stores_creation_validation(mock_schedule_file):
+    result = create_schedule("doctor", "weekly")
+    schedule = result["schedule"]
+    assert schedule["creation_validation"]["ok"] is True
+    assert schedule["creation_validation"]["intent"] == "doctor"
+
+def test_list_schedules_revalidates_tampered_command(mock_schedule_file):
+    created = create_schedule("doctor", "weekly")
+    schedule_id = created["schedule"]["id"]
+
+    with open(mock_schedule_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data[schedule_id]["target_command"] = "list schedules"
+    with open(mock_schedule_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    listed = list_schedules()
+    assert listed["invalid_count"] == 1
+    assert listed["schedules"][0]["runtime_validation"]["ok"] is False
+
+def test_prepare_schedule_for_execution_rejects_invalid_tampered_command(mock_schedule_file):
+    created = create_schedule("doctor", "weekly")
+    schedule_id = created["schedule"]["id"]
+
+    with open(mock_schedule_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data[schedule_id]["target_command"] = "list schedules"
+    with open(mock_schedule_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    prepared = prepare_schedule_for_execution(schedule_id)
+    assert prepared["success"] is False
+    assert prepared["runtime_validation"]["ok"] is False

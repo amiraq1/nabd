@@ -4,6 +4,9 @@ from typing import Any
 from tools.utils import hash_file, human_readable_size, scan_files
 from core.exceptions import ToolError
 
+PREFIX_HASH_CHUNK_SIZE_KB = 4
+PREFIX_HASH_MAX_CHUNKS = 1
+
 
 def find_duplicates(
     directory: str, recursive: bool = True
@@ -25,10 +28,23 @@ def find_duplicates(
 
     hash_map: dict[str, list[str]] = {}
     for paths in candidates.values():
+        prefix_map: dict[str, list[str]] = {}
         for fpath in paths:
-            digest = hash_file(fpath)
-            if digest:
-                hash_map.setdefault(digest, []).append(fpath)
+            prefix_digest = hash_file(
+                fpath,
+                chunk_size_kb=PREFIX_HASH_CHUNK_SIZE_KB,
+                max_chunks=PREFIX_HASH_MAX_CHUNKS,
+            )
+            if prefix_digest:
+                prefix_map.setdefault(prefix_digest, []).append(fpath)
+
+        for prefix_paths in prefix_map.values():
+            if len(prefix_paths) < 2:
+                continue
+            for fpath in prefix_paths:
+                digest = hash_file(fpath)
+                if digest:
+                    hash_map.setdefault(digest, []).append(fpath)
 
     duplicate_groups: list[dict[str, Any]] = []
     total_wasted = 0

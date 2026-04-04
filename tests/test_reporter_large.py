@@ -10,20 +10,23 @@ class DummyLines(list):
 
 class TestReporterLargeOutputs(unittest.TestCase):
     def test_list_large_files_truncates(self):
-        files = [{"path": f"/file{i}", "size_human": f"{i}KB"} for i in range(30)]
+        files = {
+            "directory": "/sdcard/Download",
+            "files": [{"path": f"/file{i}", "size_human": f"{i}KB"} for i in range(30)],
+        }
         lines = DummyLines()
         _append_raw_details(lines, files, "list_large_files", confirmed=False)
         self.assertIn("... and", "".join(lines))
 
     def test_show_files_truncates(self):
-        entries = [{"name": f"file{i}", "is_dir": False, "size_human": f"{i}KB"} for i in range(30)]
+        entries = [{"name": f"file{i}", "is_dir": False, "size_human": f"{i}KB"} for i in range(20)]
         raw = {
             "directory": "/sdcard/Download",
             "entries": entries,
-            "total_entries": len(entries),
-            "file_count": len(entries),
+            "total_entries": 30,
+            "file_count": 30,
             "dir_count": 0,
-            "truncated": 0,
+            "truncated": 10,
             "sort_by": "name",
         }
         lines = DummyLines()
