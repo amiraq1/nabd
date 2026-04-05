@@ -529,6 +529,103 @@ Nabd never disables certificate verification (`ssl.CERT_NONE`, `verify=False`, o
 
 ---
 
+## Filesystem Skills Framework
+
+Nabd now supports a modular, safety-first skills framework for explicit extensions.
+
+What a skill is:
+- A small capability module discovered from the local filesystem
+- Either metadata-only (informational) or Python-backed (narrow execution)
+- Always routed through Nabd's normal `parse -> safety -> plan -> execute -> report` pipeline
+
+What a skill is not:
+- Not a parser replacement
+- Not an autonomy layer
+- Not a backdoor around safety checks
+- Not executable directly from `SKILL.md`
+
+### Discovery model
+
+Nabd discovers skills under:
+
+```text
+skills/<skill_name>/
+```
+
+Supported files in this phase:
+
+```text
+skills/<skill_name>/SKILL.md
+skills/<skill_name>/skill_logic.py   # optional
+```
+
+Rules:
+- Skill directories must be local, explicit, and inside the `skills/` root
+- Malformed skills are ignored safely and reported in `show skills`
+- Discovery loads metadata only; it does not import or execute Python code
+
+### `SKILL.md` contract
+
+Each skill must begin with front matter:
+
+```md
+---
+name: duplicate_helper
+description: Helps inspect duplicate-file workflows.
+version: 1.0.0
+author: Nabd
+requires_python: true
+entrypoint: run
+tags: duplicates, advisory
+---
+```
+
+Required fields:
+- `name`
+- `description`
+- `version`
+
+Optional fields:
+- `author`
+- `requires_python`
+- `entrypoint`
+- `tags`
+
+Validation rules:
+- `name` must match the folder name exactly
+- Python-backed skills must declare `requires_python: true`
+- Only explicit whitelisted entrypoints are allowed in this phase
+- Metadata-only skills must not declare an entrypoint
+
+### Python-backed skill execution
+
+If `skill_logic.py` exists, Nabd may run the skill only through an explicit entrypoint declared in metadata.
+
+Safety guarantees:
+- No `eval` / `exec`
+- No `shell=True`
+- No arbitrary function dispatch from user input
+- No execution during discovery
+- Unknown skills are rejected clearly
+- Extra free-form skill arguments are rejected in this phase
+
+Current execution surface:
+- `show skills`
+- `skill info duplicate_helper`
+- `run skill duplicate_helper`
+
+Example skill:
+
+```text
+skills/duplicate_helper/
+  SKILL.md
+  skill_logic.py
+```
+
+`run skill duplicate_helper` executes the skill through the same safety-first executor model Nabd uses everywhere else.
+
+---
+
 ## Changelog
 
 ### v1.1 — Local AI Platform Release

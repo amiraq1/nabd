@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import patch
 
 from agent.safety import validate_path_safety, validate_intent_safety
+from core.paths import validate_path
 from agent.models import ParsedIntent, RiskLevel
 from core.exceptions import (
     PathNotAllowedError,
@@ -84,6 +85,11 @@ class TestValidatePathSafety:
         with patch("agent.safety.get_allowed_roots", return_value=ALLOWED_ROOTS):
             with pytest.raises(PathTraversalError):
                 validate_path_safety("/sdcard/Download/%2e%2e/etc")
+
+    def test_core_validate_path_blocks_url_encoded_traversal(self):
+        with patch("core.paths.get_allowed_roots", return_value=ALLOWED_ROOTS):
+            with pytest.raises(PathTraversalError):
+                validate_path("/sdcard/Download/%2e%2e/etc")
 
 
 class TestValidateIntentSafety:

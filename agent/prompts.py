@@ -1,12 +1,16 @@
 """
-Placeholder for future LLM integration.
+Reference prompts for future non-runtime LLM integration.
 
-This module is intentionally minimal. The MVP uses deterministic rule-based
-parsing and does not require any LLM. When LLM integration is added, this
-module will provide prompt templates and model interaction helpers.
+The runtime parser remains deterministic and does not depend on this module.
+These templates are kept in sync with the current intent list so future
+prompt-based experiments do not silently drift from Nabd's real command set.
 
 This module is NOT imported by any MVP runtime path.
 """
+
+from agent.parser import ALL_INTENTS
+
+_SUPPORTED_INTENTS_TEXT = ", ".join(sorted(ALL_INTENTS))
 
 SYSTEM_PROMPT_TEMPLATE = """
 You are نبض (Nabd), a local phone operations assistant.
@@ -20,13 +24,14 @@ Always confirm before making any changes.
 
 INTENT_EXTRACTION_TEMPLATE = """
 Extract the user's intent from the following command:
-{command}
+{{command}}
 
 Return a JSON object with:
-- intent: one of [storage_report, list_large_files, organize_folder_by_type,
-  convert_video_to_mp3, compress_images, backup_folder, find_duplicates,
-  safe_rename_files, safe_move_files]
+- intent: one of [{_SUPPORTED_INTENTS_TEXT}]
 - source_path: optional string
 - target_path: optional string
+- url: optional string
+- app_name: optional string
+- query: optional string
 - options: dict of extra options
-"""
+""".format(_SUPPORTED_INTENTS_TEXT=_SUPPORTED_INTENTS_TEXT)

@@ -38,10 +38,13 @@ ONBOARDING = """
   Welcome! Here are a few things to try:
 
     doctor                                — check your setup
+    show skills                           — list built-in and filesystem skills
+    skill info duplicate_helper           — inspect one skill safely
     storage report /sdcard/Download       — see disk usage
     show files in /sdcard/Download        — browse a folder
     list media in /sdcard/Download        — list photos/videos/audio
     find duplicates /sdcard/Download      — find duplicate files
+    run skill duplicate_helper            — run a narrow Python-backed skill
     organize /sdcard/Download             — sort files into subfolders
     back up /sdcard/Documents to /sdcard/Backup
     show battery status                   — check battery (needs termux-api)
@@ -178,10 +181,16 @@ HELP_TEXT = """
 
   SKILLS
     show skills
-      List all available Nabd skill modules.
+      List built-in and filesystem skills discovered under skills/<name>/SKILL.md.
 
+    skill info duplicate_helper
     skill info ai_assist
-      Show details about the AI Assist skill.
+      Show metadata, safety notes, and usage for one skill.
+
+    run skill duplicate_helper
+      Execute a Python-backed skill through the normal safety and executor path.
+      Only explicit whitelisted entrypoints are allowed.
+      Free-form skill arguments are not supported in this phase.
 
   AI ASSIST  (optional, off by default)
     suggest command for <text>
@@ -269,14 +278,15 @@ SHELL_COMMANDS: dict[str, str] = {
 _ctx = ContextMemory()
 _advisor = Advisor()
 
-# AI meta-intents that do not update context
-_AI_INTENTS: frozenset[str] = frozenset({
+# Intents that should not overwrite session context
+_CONTEXT_SKIP_INTENTS: frozenset[str] = frozenset({
     "ai_suggest_command",
     "ai_explain_last_result",
     "ai_clarify_request",
     "ai_backend_status",
     "show_skills",
     "skill_info",
+    "run_skill",
 })
 
 
@@ -384,8 +394,8 @@ def run_command(command: str) -> None:
             error_detail = "; ".join(result.errors)
 
         # ── Update context memory (v1.0) ──────────────────────────────────────
-        # Only update context for non-AI intents; only store path/url on success.
-        if parsed.intent not in _AI_INTENTS:
+        # Only update context for operational intents; only store path/url on success.
+        if parsed.intent not in _CONTEXT_SKIP_INTENTS:
             _ctx.update(
                 intent=parsed.intent,
                 command=command,

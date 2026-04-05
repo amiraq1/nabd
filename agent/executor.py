@@ -1,4 +1,5 @@
 import copy
+import importlib
 from typing import Any
 
 from agent.models import ExecutionPlan, ExecutionResult, OperationStatus, ToolAction
@@ -6,7 +7,7 @@ from core.exceptions import ExecutionError, ToolError
 
 
 # Whitelisted functions for the skill registry (read-only, no tool module)
-_SKILL_FUNCTIONS: set[str] = {"list_skills", "skill_info", "backend_status"}
+_SKILL_FUNCTIONS: set[str] = {"list_skills", "skill_info", "backend_status", "run_skill"}
 
 # Whitelisted functions for the AI Assist skill (advisory only, never executes)
 _AI_SKILL_FUNCTIONS: set[str] = {
@@ -32,6 +33,19 @@ WHITELISTED_FUNCTIONS: dict[str, set[str]] = {
     "schedule":   {"create_schedule", "list_schedules", "delete_schedule"},
 }
 
+_TOOL_MODULES: dict[str, str] = {
+    "system": "tools.system",
+    "storage": "tools.storage",
+    "files": "tools.files",
+    "media": "tools.media",
+    "backup": "tools.backup",
+    "duplicates": "tools.duplicates",
+    "phone": "tools.phone",
+    "browser": "tools.browser",
+    "history": "tools.history",
+    "schedule": "tools.schedule",
+}
+
 
 def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
     """Handle skill registry queries — read-only, no tool module needed."""
@@ -53,14 +67,23 @@ def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
                     "version": s.version,
                     "enabled": s.enabled,
                     "tags": s.tags,
+                    "path": s.path,
+                    "author": s.author,
+                    "requires_python": s.requires_python,
+                    "has_python_logic": s.has_python_logic,
+                    "entrypoint": s.entrypoint,
+                    "usage": s.usage,
+                    "instructions": s.instructions,
+                    "source": s.source,
                 }
                 for s in skills
-            ]
+            ],
+            "load_errors": registry.list_errors(),
         }
 
     if action.function_name == "skill_info":
         skill_name = action.arguments.get("skill_name", "")
-        skill = registry.get(skill_name)
+        skill = registry.get_skill(skill_name)
         if skill is None:
             return {"error": f"Unknown skill: '{skill_name}'", "skill": None}
         info = skill.get_info()
@@ -71,6 +94,14 @@ def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
                 "version": info.version,
                 "enabled": info.enabled,
                 "tags": info.tags,
+                "path": info.path,
+                "author": info.author,
+                "requires_python": info.requires_python,
+                "has_python_logic": info.has_python_logic,
+                "entrypoint": info.entrypoint,
+                "usage": info.usage,
+                "instructions": info.instructions,
+                "source": info.source,
             }
         }
 
@@ -79,6 +110,17 @@ def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
         if skill is None:
             return {"error": "AI Assist skill is not registered."}
         return skill.get_backend_status()
+
+    if action.function_name == "run_skill":
+        skill_name = action.arguments.get("skill_name", "")
+        try:
+            return registry.execute_skill(skill_name)
+        except RuntimeError as exc:
+            return {
+                "success": False,
+                "skill_name": skill_name,
+                "error": str(exc),
+            }
 
     raise ExecutionError(f"Unhandled skill function: '{action.function_name}'")
 
@@ -142,38 +184,10 @@ def _execute_ai_skill_action(action: ToolAction) -> dict[str, Any]:
 
 
 def _get_tool_module(tool_name: str) -> Any:
-    if tool_name == "system":
-        import tools.system as mod
-        return mod
-    elif tool_name == "storage":
-        import tools.storage as mod
-        return mod
-    elif tool_name == "files":
-        import tools.files as mod
-        return mod
-    elif tool_name == "media":
-        import tools.media as mod
-        return mod
-    elif tool_name == "backup":
-        import tools.backup as mod
-        return mod
-    elif tool_name == "duplicates":
-        import tools.duplicates as mod
-        return mod
-    elif tool_name == "phone":
-        import tools.phone as mod
-        return mod
-    elif tool_name == "browser":
-        import tools.browser as mod
-        return mod
-    elif tool_name == "history":
-        import tools.history as mod
-        return mod
-    elif tool_name == "schedule":
-        import tools.schedule as mod
-        return mod
-    else:
+    module_path = _TOOL_MODULES.get(tool_name)
+    if module_path is None:
         raise ExecutionError(f"Unknown tool: '{tool_name}'")
+    return importlib.import_module(module_path)
 
 
 def _execute_action(action: ToolAction, confirmed: bool) -> dict[str, Any]:
@@ -280,7 +294,7 @@ def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
     else:
         status = OperationStatus.SUCCESS
 
-    message = _build_message(plan.intent, confirmed, status)
+    message = _build_message(plan.intent, confirmed, status, is_preview=plan.dry_run)
 
     return ExecutionResult(
         status=status,
@@ -295,8 +309,13 @@ def execute(plan: ExecutionPlan, confirmed: bool) -> ExecutionResult:
     )
 
 
-def _build_message(intent: str, confirmed: bool, status: OperationStatus) -> str:
-    if not confirmed:
+def _build_message(
+    intent: str,
+    confirmed: bool,
+    status: OperationStatus,
+    is_preview: bool = False,
+) -> str:
+    if not confirmed and is_preview:
         return f"[DRY RUN] Preview completed for '{intent}'. No changes made."
     if status == OperationStatus.SUCCESS:
         return f"Operation '{intent}' completed successfully."

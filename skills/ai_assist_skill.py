@@ -141,6 +141,22 @@ class AIAssistSkill(SkillBase):
             version=self.version,
             enabled=self.enabled,
             tags=["ai", "advisory", "offline", "deterministic"],
+            path=os.path.realpath(__file__),
+            author="Nabd",
+            requires_python=False,
+            has_python_logic=True,
+            entrypoint=None,
+            usage=(
+                "suggest command for <text>\n"
+                "explain last result\n"
+                "help me with <text>\n"
+                "ai backend status"
+            ),
+            instructions=(
+                "Advisory skill only. It suggests, explains, and clarifies commands "
+                "but never executes actions automatically."
+            ),
+            source="built_in",
         )
 
     def get_backend_status(self) -> dict[str, Any]:

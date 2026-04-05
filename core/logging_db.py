@@ -46,6 +46,7 @@ def log_operation(
     affected_paths: Optional[list[str]] = None,
     error_details: Optional[str] = None,
 ) -> None:
+    conn: sqlite3.Connection | None = None
     try:
         db_path = _get_db_path()
         conn = _ensure_db(db_path)
@@ -66,9 +67,14 @@ def log_operation(
             ),
         )
         conn.commit()
-        conn.close()
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_history(limit: int = 20) -> list[dict[str, Any]]:
@@ -76,15 +82,30 @@ def get_history(limit: int = 20) -> list[dict[str, Any]]:
         db_path = _get_db_path()
         if not os.path.isfile(db_path):
             return []
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM history ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM history ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def get_history_entry(entry_id: int) -> Optional[dict[str, Any]]:
+    try:
+        db_path = _get_db_path()
+        if not os.path.isfile(db_path):
+            return None
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM history WHERE id = ?",
+                (entry_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+    except Exception:
+        return None
 
 
 def is_first_run() -> bool:
@@ -93,9 +114,8 @@ def is_first_run() -> bool:
         db_path = _get_db_path()
         if not os.path.isfile(db_path):
             return True
-        conn = sqlite3.connect(db_path)
-        count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
-        conn.close()
-        return count == 0
+        with sqlite3.connect(db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+            return count == 0
     except Exception:
         return True
