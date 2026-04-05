@@ -53,6 +53,10 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"\binfo\s+(?:about|for)\s+skill\b",
         r"\bskill\s+details?\b",
     ]),
+    ("run_skill", [
+        r"\brun\s+skill\b",
+        r"\buse\s+skill\b",
+    ]),
 
     # ── AI backend status ─────────────────────────────────────────────────────
     ("ai_backend_status", [
@@ -269,6 +273,10 @@ _AI_TEXT_RE = re.compile(
 )
 _SKILL_NAME_RE = re.compile(
     r"(?:skill\s+info|info\s+(?:about|for)\s+skill|skill\s+details?)\s+(\w[\w_-]*)",
+    re.IGNORECASE,
+)
+_RUN_SKILL_NAME_RE = re.compile(
+    r"(?:run|use)\s+skill\s+(\w[\w_-]*)",
     re.IGNORECASE,
 )
 
@@ -502,6 +510,14 @@ def parse_command(command: str) -> ParsedIntent:
     if intent == "skill_info":
         m = _SKILL_NAME_RE.search(command)
         query = m.group(1).strip().lower() if m else ""
+
+    if intent == "run_skill":
+        m = _RUN_SKILL_NAME_RE.search(command)
+        query = m.group(1).strip().lower() if m else ""
+        if m:
+            trailing = command[m.end():].strip()
+            if trailing.strip(" \t\r\n.,;:!?"):
+                options["skill_argument_text"] = trailing
 
     if intent == "open_app":
         app_name = _extract_app_name(command)

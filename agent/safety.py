@@ -10,9 +10,7 @@ from core.exceptions import (
     SafetyError,
     ValidationError,
 )
-from core.paths import is_under_allowed_root, resolve_path
-
-TRAVERSAL_INDICATORS = ["..", "//", "\x00", "%2e", "%2f"]
+from core.paths import TRAVERSAL_INDICATORS, is_under_allowed_root, resolve_path
 
 # Intents that only read data and require no path, URL, or confirmation
 READ_ONLY_INTENTS = {
@@ -200,6 +198,24 @@ def validate_intent_safety(intent: ParsedIntent) -> None:
     if name == "schedule_delete":
         if not intent.options.get("schedule_id"):
             raise ValidationError("Please specify the schedule ID to delete.")
+        return
+
+    if name == "run_skill":
+        skill_name = (intent.query or "").strip().lower()
+        if not skill_name:
+            raise ValidationError("Please specify the skill name to run.")
+        if intent.options.get("skill_argument_text"):
+            raise ValidationError(
+                "This phase only supports 'run skill <name>' without extra arguments."
+            )
+        from skills.registry import get_registry
+        skill = get_registry().get(skill_name)
+        if skill is None:
+            raise ValidationError(f"Unknown skill: '{skill_name}'")
+        if not skill.can_execute():
+            raise SafetyError(
+                f"Skill '{skill_name}' does not expose an executable Python entrypoint."
+            )
         return
 
     # ── Phone status / doctor: no paths or URLs needed ────────────────────────

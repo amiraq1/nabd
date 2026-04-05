@@ -55,7 +55,7 @@ _URL_CONTEXT_INTENTS: frozenset[str] = frozenset({
     "browser_search",
 })
 
-# Intents that must NOT update context (AI meta + registry queries).
+# Intents that must NOT update context (meta commands + skill queries/runs).
 _CONTEXT_SKIP_INTENTS: frozenset[str] = frozenset({
     "ai_suggest_command",
     "ai_explain_last_result",
@@ -63,6 +63,7 @@ _CONTEXT_SKIP_INTENTS: frozenset[str] = frozenset({
     "ai_backend_status",
     "show_skills",
     "skill_info",
+    "run_skill",
 })
 
 # ── Reference patterns ────────────────────────────────────────────────────────

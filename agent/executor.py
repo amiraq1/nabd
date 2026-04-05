@@ -7,7 +7,7 @@ from core.exceptions import ExecutionError, ToolError
 
 
 # Whitelisted functions for the skill registry (read-only, no tool module)
-_SKILL_FUNCTIONS: set[str] = {"list_skills", "skill_info", "backend_status"}
+_SKILL_FUNCTIONS: set[str] = {"list_skills", "skill_info", "backend_status", "run_skill"}
 
 # Whitelisted functions for the AI Assist skill (advisory only, never executes)
 _AI_SKILL_FUNCTIONS: set[str] = {
@@ -67,14 +67,23 @@ def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
                     "version": s.version,
                     "enabled": s.enabled,
                     "tags": s.tags,
+                    "path": s.path,
+                    "author": s.author,
+                    "requires_python": s.requires_python,
+                    "has_python_logic": s.has_python_logic,
+                    "entrypoint": s.entrypoint,
+                    "usage": s.usage,
+                    "instructions": s.instructions,
+                    "source": s.source,
                 }
                 for s in skills
-            ]
+            ],
+            "load_errors": registry.list_errors(),
         }
 
     if action.function_name == "skill_info":
         skill_name = action.arguments.get("skill_name", "")
-        skill = registry.get(skill_name)
+        skill = registry.get_skill(skill_name)
         if skill is None:
             return {"error": f"Unknown skill: '{skill_name}'", "skill": None}
         info = skill.get_info()
@@ -85,6 +94,14 @@ def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
                 "version": info.version,
                 "enabled": info.enabled,
                 "tags": info.tags,
+                "path": info.path,
+                "author": info.author,
+                "requires_python": info.requires_python,
+                "has_python_logic": info.has_python_logic,
+                "entrypoint": info.entrypoint,
+                "usage": info.usage,
+                "instructions": info.instructions,
+                "source": info.source,
             }
         }
 
@@ -93,6 +110,17 @@ def _execute_skill_action(action: ToolAction) -> dict[str, Any]:
         if skill is None:
             return {"error": "AI Assist skill is not registered."}
         return skill.get_backend_status()
+
+    if action.function_name == "run_skill":
+        skill_name = action.arguments.get("skill_name", "")
+        try:
+            return registry.execute_skill(skill_name)
+        except RuntimeError as exc:
+            return {
+                "success": False,
+                "skill_name": skill_name,
+                "error": str(exc),
+            }
 
     raise ExecutionError(f"Unhandled skill function: '{action.function_name}'")
 

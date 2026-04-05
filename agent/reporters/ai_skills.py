@@ -15,13 +15,19 @@ def render_show_skills(lines: list[str], raw: dict[str, Any], confirmed: bool) -
         version = skill.get("version", "?")
         desc = skill.get("description", "")
         tags = ", ".join(skill.get("tags", []))
-        lines.append(f"  {status}  {name:<20} v{version}")
+        skill_type = "Python-backed" if skill.get("has_python_logic") else "Metadata-only"
+        lines.append(f"  {status}  {name:<20} v{version}  [{skill_type}]")
         lines.append(f"              {desc}")
         if tags:
             lines.append(f"              Tags: {tags}")
         lines.append("")
     if count == 0:
         lines.append("  No skills registered.")
+    load_errors = raw.get("load_errors", {})
+    if load_errors:
+        lines.append("  Ignored malformed skills:")
+        for name, error in sorted(load_errors.items()):
+            lines.append(f"    ! {name}: {error}")
 
 
 @register_raw_detail("skill_info")
@@ -37,12 +43,37 @@ def render_skill_info(lines: list[str], raw: dict[str, Any], confirmed: bool) ->
     desc = skill.get("description", "")
     enabled = skill.get("enabled", False)
     tags = ", ".join(skill.get("tags", []))
+    author = skill.get("author")
+    entrypoint = skill.get("entrypoint")
+    usage = skill.get("usage")
+    instructions = skill.get("instructions")
+    path = skill.get("path", "")
+    skill_type = "Python-backed" if skill.get("has_python_logic") else "Metadata-only"
     lines.append(f"\n  Name       : {name}")
     lines.append(f"  Version    : v{version}")
     lines.append(f"  Status     : {'Enabled' if enabled else 'Disabled'}")
+    lines.append(f"  Type       : {skill_type}")
     lines.append(f"  Description: {desc}")
+    if author:
+        lines.append(f"  Author     : {author}")
+    if entrypoint:
+        lines.append(f"  Entrypoint : {entrypoint}")
+    if path:
+        lines.append(f"  Path       : {path}")
     if tags:
         lines.append(f"  Tags       : {tags}")
+    if instructions:
+        lines.append("")
+        lines.append("  Instructions:")
+        for line in instructions.splitlines():
+            if line.strip():
+                lines.append(f"    {line.strip()}")
+    if usage:
+        lines.append("")
+        lines.append("  Usage:")
+        for line in usage.splitlines():
+            if line.strip():
+                lines.append(f"    {line.strip()}")
     if name == "ai_assist":
         lines.append("")
         lines.append("  Commands:")
@@ -56,6 +87,29 @@ def render_skill_info(lines: list[str], raw: dict[str, Any], confirmed: bool) ->
             lines.append("")
             lines.append("  To enable:")
             lines.append('    Edit config/ai_assist.json → set "enabled": true')
+
+
+@register_raw_detail("run_skill")
+def render_run_skill(lines: list[str], raw: dict[str, Any], confirmed: bool) -> None:
+    err = raw.get("error")
+    if err:
+        lines.append(f"\n  ✗  {err}")
+        return
+
+    lines.append(f"\n  Skill      : {raw.get('skill_name', '?')}")
+    if raw.get("entrypoint"):
+        lines.append(f"  Entrypoint : {raw.get('entrypoint')}")
+    if raw.get("message"):
+        lines.append(f"  Message    : {raw.get('message')}")
+    elif raw.get("result") is not None:
+        lines.append(f"  Result     : {raw.get('result')}")
+
+    details = raw.get("details", [])
+    if details:
+        lines.append("")
+        lines.append("  Details:")
+        for item in details:
+            lines.append(f"    • {item}")
 
 
 @register_raw_detail("ai_backend_status")
