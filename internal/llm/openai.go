@@ -133,9 +133,12 @@ func (c *OpenAIClient) attempt(ctx context.Context, endpoint string, body []byte
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, true, 0, fmt.Errorf("read response: %w", err)
+	}
+	if len(data) > maxResponseBytes {
+		return nil, false, 0, fmt.Errorf("response too large: exceeds %d bytes", maxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
