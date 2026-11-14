@@ -429,7 +429,7 @@ func (r *Registry) Undo(relPath string) (string, error) {
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path}); err != nil {
 		return "", err
 	}
-	if err := r.atomicWrite(currentPath, backup, os.FileMode(entry.Mode)); err != nil {
+	if err := r.atomicWriteChecked(currentPath, backup, os.FileMode(entry.Mode), currentHash); err != nil {
 		_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path})
 		return "", err
 	}
@@ -442,9 +442,6 @@ func (r *Registry) Undo(relPath string) (string, error) {
 
 // atomicWrite writes data to a temporary file in the target directory, syncs
 // it, and renames it over the destination. All operations stay inside root.
-func (r *Registry) atomicWrite(rel string, data []byte, mode os.FileMode) error {
-	return r.atomicWriteChecked(rel, data, mode, "")
-}
 func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode, expectedHash string) error {
 	tmp := filepath.Join(filepath.Dir(rel), ".nabd-tmp-"+randomHex(8))
 	f, err := r.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
@@ -453,9 +450,10 @@ func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode,
 	}
 
 	_, writeErr := f.Write(data)
+	modeErr := f.Chmod(mode.Perm())
 	syncErr := f.Sync()
 	closeErr := f.Close()
-	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+	if err := errors.Join(writeErr, modeErr, syncErr, closeErr); err != nil {
 		_ = r.root.Remove(tmp)
 		return fmt.Errorf("write temporary file: %w", err)
 	}
