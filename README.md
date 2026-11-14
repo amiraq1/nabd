@@ -61,6 +61,7 @@ nabdcoder
 ## الأمان
 
 - **Jail**: `os.Root` + تحقق من المسار، ورفض symlinks في `edit_file`/`undo`، ورفض المسارات الحساسة: `.env*` في كل مكوّن (عدا ملفات `.env.example` و`.env.sample` و`.env.template` و`.env.dist` النهائية؛ لا يُفحص محتواها)، `.git/`، `.nabd/`، `id_*` (عدا `.pub`)، وملفات المفاتيح.
+- على Linux/Android تُفتح ملفات القراءة وكل مكوّنات مسارها دون اتباع الروابط الرمزية؛ هذا لا يغلق سباقات المسار في كل عمليات الكتابة، ولا ينطبق الضمان نفسه على المنصات الأخرى.
 - **Gate**: preview + diff + hashes، وtoken أحادي الاستخدام مربوط بالأداة و`args_sha256`، صلاحيته 5 دقائق. لا يمكن استدعاء `RunApproved` بدونه.
 - **Audit**: أحداث `requested`/`approved`/`denied`/`applied`/`failed` مع hashes؛ الكتابة إلزامية للأدوات الكاتبة/المنفذة، وbest-effort للقراءة.
 - **go_verify**: بيئة allowlist بلا مفاتيح، `GOFLAGS=-mod=readonly`، `GOPROXY=off`، `GOTOOLCHAIN=local`، وأنماط حزم workspace-relative فقط.
