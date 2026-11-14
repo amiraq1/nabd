@@ -371,11 +371,13 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	cut := s[:n]
-	for len(cut) > 0 && !utf8.ValidString(cut) {
-		cut = cut[:len(cut)-1]
+	if n < 0 {
+		n = 0
 	}
-	return cut + "..."
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "..."
 }
 
 func max(a, b int) int {
