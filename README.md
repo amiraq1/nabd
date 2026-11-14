@@ -80,7 +80,7 @@ go test ./... -count=1
 staticcheck ./...
 ```
 
-`.github/workflows/ci.yml` يشغّل gofmt وvet و`go mod verify` وtest وstaticcheck، ويبني `linux/amd64` و`linux/arm64` بـ`CGO_ENABLED=0` على كل push إلى `main`/`audit/**` وكل PR.
+`.github/workflows/ci.yml` يشغّل gofmt وvet و`go mod verify` والاختبارات و`go test -race -short` وstaticcheck بإصدار محدد، ويبني `linux/amd64` و`linux/arm64` و`android/arm64` بـ`CGO_ENABLED=0` على كل push إلى `main`/`audit/**` وكل PR. البناء المتقاطع لا يغني عن تشغيل الاختبارات على Termux فعلياً.
 
 ## القيود والمخاطر المعروفة
 
