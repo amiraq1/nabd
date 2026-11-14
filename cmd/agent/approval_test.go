@@ -17,25 +17,21 @@ func approvalTestModel(t *testing.T, dir string) uiModel {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
-	return initialModel(reg)
+	return initialModel(reg, &mockClient{})
 }
 
 func TestApprovalShowsFullArgumentsWithinLimit(t *testing.T) {
 	m := approvalTestModel(t, t.TempDir())
 	tail := "TAIL-MARKER-1234567890"
-	args := `{"path":"a.go","old_text":"x","new_text":"` + strings.Repeat("a", 1000) + tail + `"}`
+	args := `{"command":"` + strings.Repeat("a", 1000) + tail + `","tool":"x"}`
 	tc := ToolCall{ID: "call_small", Type: "function"}
-	tc.Function.Name = "edit_file"
+	tc.Function.Name = "mcp_call"
 	tc.Function.Arguments = args
 	m.pendingTools = []ToolCall{tc}
-	m.awaitingApproval = true
-
-	view := m.View()
-	if !strings.Contains(view, tail) {
-		t.Fatalf("approval prompt hid part of the arguments (%d bytes)", len(args))
-	}
-	if strings.Contains(view, "bytes not shown") {
-		t.Fatalf("unexpected truncation notice for %d bytes", len(args))
+	next, _ := m.advance()
+	v := next.(uiModel)
+	if !v.awaitingApproval || !strings.Contains(v.View(), tail) {
+		t.Fatal("approval did not show the complete command")
 	}
 }
 
@@ -89,22 +85,29 @@ func TestOversizedApprovalIsRejectedWithoutExecution(t *testing.T) {
 
 func TestApprovalArabicAtLimitIsValidUTF8(t *testing.T) {
 	m := approvalTestModel(t, t.TempDir())
-	prefix := `{"path":"x.go","old_text":"`
-	if len(prefix)%2 == 0 {
-		prefix += "a"
-	}
-	args := prefix + strings.Repeat("م", maxApprovalArgs/2+100) + `","new_text":"y"}`
 	tc := ToolCall{ID: "call_ar", Type: "function"}
-	tc.Function.Name = "edit_file"
-	tc.Function.Arguments = args
+	tc.Function.Name = "mcp_call"
+	tc.Function.Arguments = `{"command":"` + strings.Repeat("م", maxApprovalArgs/2+100) + `","tool":"x"}`
 	m.pendingTools = []ToolCall{tc}
-	m.awaitingApproval = true
-
-	view := m.View()
-	if !utf8.ValidString(view) {
-		t.Fatal("approval view is not valid UTF-8")
+	next, _ := m.advance()
+	v := next.(uiModel)
+	if v.awaitingApproval {
+		t.Fatal("oversized command was approvable")
 	}
-	if !strings.Contains(view, "bytes not shown") {
-		t.Fatalf("approval view has no hidden-byte count for %d bytes", len(args))
+	if !utf8.ValidString(v.View()) {
+		t.Fatal("invalid UTF-8")
+	}
+}
+
+func TestPR7ApprovalRejectsControlCharactersInCommand(t *testing.T) {
+	m := approvalTestModel(t, t.TempDir())
+	tc := ToolCall{ID: "control", Type: "function"}
+	tc.Function.Name = "mcp_call"
+	tc.Function.Arguments = `{"command":"safe\nspoof","tool":"x"}`
+	m.pendingTools = []ToolCall{tc}
+	next, _ := m.advance()
+	v := next.(uiModel)
+	if v.awaitingApproval {
+		t.Fatal("command with line break was approvable")
 	}
 }

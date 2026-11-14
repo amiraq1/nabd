@@ -18,7 +18,7 @@ func f18Model(t *testing.T, dir string) uiModel {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
-	return initialModel(reg)
+	return initialModel(reg, &mockClient{})
 }
 
 func f18Call(args string) ToolCall {

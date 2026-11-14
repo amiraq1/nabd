@@ -28,7 +28,7 @@ func TestF19ChangeBeforeRenameRejected(t *testing.T) {
 	}
 	defer func() { editBeforeRenameHook = nil }()
 
-	out := r.RunApproved(context.Background(), "edit_file", args, preview.State)
+	out := legacyApproved(t, r, context.Background(), "edit_file", args, preview.State)
 	if !strings.Contains(out, "file changed since approval") {
 		t.Fatalf("missing pre-rename mismatch error: %q", out)
 	}
@@ -63,7 +63,7 @@ func TestF19PathMismatchRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := r.RunApproved(context.Background(), "edit_file", argsB, previewA.State)
+	out := legacyApproved(t, r, context.Background(), "edit_file", argsB, previewA.State)
 	if !strings.Contains(out, "path mismatch") {
 		t.Fatalf("missing path mismatch error: %q", out)
 	}

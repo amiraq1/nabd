@@ -17,7 +17,7 @@ func f20State(t *testing.T, r *Registry, relPath string) ApprovalState {
 	if err != nil {
 		t.Fatal(err)
 	}
-	content, err := os.ReadFile(safePath)
+	content, err := r.root.ReadFile(safePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestF20RunApprovedValidatesEditWithoutPreview(t *testing.T) {
 			r := mustRegistry(t, dir)
 			state := f20State(t, r, tc.file)
 
-			out := r.RunApproved(context.Background(), "edit_file", json.RawMessage(tc.args), state)
+			out := legacyApproved(t, r, context.Background(), "edit_file", json.RawMessage(tc.args), state)
 			if !strings.Contains(out, "Error") {
 				t.Fatalf("expected a rejection, got %q", out)
 			}

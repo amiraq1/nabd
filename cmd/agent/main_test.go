@@ -8,13 +8,13 @@ import (
 	"github.com/amiraq1/nabd/internal/tools"
 )
 
-func testModel(t *testing.T) uiModel {
+func testPR7Model(t *testing.T) uiModel {
 	t.Helper()
 	reg, err := tools.NewRegistry(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
-	return initialModel(reg)
+	return initialModel(reg, &mockClient{})
 }
 
 func TestTruncateKeepsValidUTF8(t *testing.T) {
@@ -29,12 +29,13 @@ func TestTruncateKeepsValidUTF8(t *testing.T) {
 }
 
 func TestApprovalPromptShowsArguments(t *testing.T) {
-	m := testModel(t)
+	m := testPR7Model(t)
 	tc := ToolCall{ID: "call_1", Type: "function"}
 	tc.Function.Name = "edit_file"
 	tc.Function.Arguments = `{"path":"secret.go","old_text":"a","new_text":"b"}`
 	m.pendingTools = []ToolCall{tc}
 	m.awaitingApproval = true
+	m.approval = buildApprovalPreview(m.registry, tc)
 
 	view := m.View()
 	if !strings.Contains(view, "secret.go") {
@@ -43,9 +44,9 @@ func TestApprovalPromptShowsArguments(t *testing.T) {
 }
 
 func TestIterationLimitAnswersToolCalls(t *testing.T) {
-	m := testModel(t)
+	m := testPR7Model(t)
 	m.busy = true
-	m.iteration = maxIterations - 1
+	m.iteration = m.maxIterations - 1
 
 	tc := ToolCall{ID: "call_1", Type: "function"}
 	tc.Function.Name = "read_file"

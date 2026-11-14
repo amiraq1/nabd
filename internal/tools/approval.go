@@ -10,7 +10,6 @@ import (
 	"go/format"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -57,7 +56,16 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 	}
 
 	state := ApprovalState{Path: safePath}
-	content, readErr := os.ReadFile(safePath)
+	info, statErr := r.root.Lstat(safePath)
+	if statErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return ApprovalPreview{}, fmt.Errorf("editing symlinks is not supported: %s", p.Path)
+		}
+		if info.Size() > maxEditBytes {
+			return ApprovalPreview{}, fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
+		}
+	}
+	content, readErr := r.root.ReadFile(safePath)
 	if readErr != nil {
 		if errors.Is(readErr, fs.ErrNotExist) {
 			return ApprovalPreview{
@@ -101,64 +109,6 @@ func parseEditParams(rawArgs json.RawMessage) (editParams, error) {
 // editBeforeRenameHook is a test-only seam; production leaves it nil.
 var editBeforeRenameHook func()
 
-func (r *Registry) writeEdit(safePath string, p editParams, content []byte) (string, error) {
-	updatedBytes, err := applyEdit(content, p.Path, safePath, p.OldText, p.NewText)
-	if err != nil {
-		return "", err
-	}
-	expected := sha256.Sum256(content)
-	expectedHash := hex.EncodeToString(expected[:])
-
-	realPath, err := filepath.EvalSymlinks(safePath)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(realPath)
-	if err != nil {
-		return "", err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(realPath), "."+filepath.Base(realPath)+".tmp-*")
-	if err != nil {
-		return "", err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(updatedBytes); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return "", err
-	}
-	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return "", err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return "", err
-	}
-
-	if editBeforeRenameHook != nil {
-		editBeforeRenameHook()
-	}
-
-	current, readErr := os.ReadFile(realPath)
-	if readErr != nil {
-		os.Remove(tmpName)
-		return "", fmt.Errorf("file changed since approval: %s", p.Path)
-	}
-	sum := sha256.Sum256(current)
-	if hex.EncodeToString(sum[:]) != expectedHash {
-		os.Remove(tmpName)
-		return "", fmt.Errorf("file changed since approval: %s", p.Path)
-	}
-
-	if err := os.Rename(tmpName, realPath); err != nil {
-		os.Remove(tmpName)
-		return "", err
-	}
-	return fmt.Sprintf("Successfully updated %s", p.Path), nil
-}
-
 // applyEdit performs the in-memory transformation used by both the preview and
 // the write path.
 func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText string) ([]byte, error) {
@@ -189,8 +139,7 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	return updated, nil
 }
 
-// verifyEditState re-reads the target once and returns the bytes it hashed.
-// The write path must apply the edit to those bytes instead of reading again.
+// verifyEditState compares the approved path and bytes against the workspace root.
 func (r *Registry) verifyEditState(p editParams, state ApprovalState) ([]byte, string, error) {
 	safePath, err := r.resolveSafePath(p.Path)
 	if err != nil {
@@ -202,20 +151,18 @@ func (r *Registry) verifyEditState(p editParams, state ApprovalState) ([]byte, s
 	if state.Path != safePath {
 		return nil, "", fmt.Errorf("file changed since approval: path mismatch")
 	}
-
-	content, readErr := os.ReadFile(safePath)
-	exists := readErr == nil
-	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
-		return nil, "", readErr
-	}
-	if exists != state.Exists {
+	info, err := r.root.Lstat(safePath)
+	if err != nil {
 		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
 	}
-	if !exists {
-		return nil, safePath, nil
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, "", fmt.Errorf("editing symlinks is not supported: %s", p.Path)
 	}
-	sum := sha256.Sum256(content)
-	if hex.EncodeToString(sum[:]) != state.Hash {
+	content, err := r.root.ReadFile(safePath)
+	if err != nil {
+		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
+	}
+	if !state.Exists || hashBytes(content) != state.Hash {
 		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
 	}
 	return content, safePath, nil

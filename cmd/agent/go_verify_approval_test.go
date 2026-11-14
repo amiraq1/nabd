@@ -15,12 +15,13 @@ func TestGoVerifyApprovalShowsPackage(t *testing.T) {
 	if !reg.NeedsApproval("go_verify") {
 		t.Fatal("go_verify must require approval")
 	}
-	m := initialModel(reg)
+	m := initialModel(reg, &mockClient{})
 	tc := ToolCall{ID: "call_go", Type: "function"}
 	tc.Function.Name = "go_verify"
 	tc.Function.Arguments = `{"pkg":"./internal/tools"}`
 	m.pendingTools = []ToolCall{tc}
 	m.awaitingApproval = true
+	m.approval = buildApprovalPreview(m.registry, tc)
 
 	view := m.View()
 	if !strings.Contains(view, "./internal/tools") {

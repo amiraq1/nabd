@@ -3,21 +3,23 @@
 package tools
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
 
-// prepareProcess puts cmd in its own process group so cancellation kills the
-// whole tree, including test binaries spawned by the go command.
-func prepareProcess(cmd *exec.Cmd) {
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setpgid = true
+// configureProcessTree puts the child in its own process group and kills the
+// whole group when the context is canceled, so grandchildren cannot leak.
+func configureProcessTree(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
-			return nil
+			return os.ErrProcessDone
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
 	}
 }

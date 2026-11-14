@@ -3,35 +3,88 @@ package tools
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"go/format"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/amiraq1/nabd/internal/audit"
+	shadowstore "github.com/amiraq1/nabd/internal/shadow"
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
-const maxOutputBytes = 4096
+const (
+	maxOutputBytes = 4096
+	maxReadBytes   = 512 << 10
+	maxEditBytes   = 2 << 20
+	maxListEntries = 1000
+)
+
+type ApprovalFunc func(toolName, summary string) bool
 
 type ToolSpec struct {
-	Name         string
-	Description  string
-	Parameters   json.RawMessage
-	NeedsConfirm bool
-	Execute      func(ctx context.Context, args json.RawMessage) (string, error)
+	Name        string
+	Description string
+	Parameters  json.RawMessage
+	// ReadOnly marks tools that cannot modify the workspace or execute
+	// external code. The zero value is false, so every new tool requires
+	// approval unless its author explicitly declares it read-only.
+	ReadOnly bool
+	Execute  func(ctx context.Context, args json.RawMessage) (string, error)
 }
 
 type Registry struct {
 	workDir  string
+	root     *os.Root
+	shadow   *shadowstore.Store
+	auditLog *audit.Log
+	approve  ApprovalFunc
 	handlers map[string]ToolSpec
+	mu       sync.Mutex
+	pending  map[string]pendingApproval
+	now      func() time.Time
 }
 
-// NewRegistry builds a registry. Run is fail-closed; confirmation tools only
-// execute through RunApproved.
-func NewRegistry(workDir string) (*Registry, error) {
+type pendingApproval struct {
+	state        *ApprovalState
+	preflightErr error
+	tool         string
+	argsHash     string
+	expires      time.Time
+}
+
+// Approval is a single-use token proving that the UI obtained an explicit
+// approval for this exact tool call.
+type Approval struct {
+	Token      string
+	Tool       string
+	ArgsSHA256 string
+}
+
+const approvalTTL = 5 * time.Minute
+
+func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
+	var approve ApprovalFunc
+	if len(approvers) > 1 {
+		return nil, fmt.Errorf("multiple approvers")
+	}
+	if len(approvers) == 1 {
+		approve = approvers[0]
+	}
 	absRoot, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, err
@@ -39,12 +92,42 @@ func NewRegistry(workDir string) (*Registry, error) {
 	if resolved, err := filepath.EvalSymlinks(absRoot); err == nil {
 		absRoot = resolved
 	}
+	root, err := os.OpenRoot(absRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace root: %w", err)
+	}
+	store, err := shadowstore.Open(root)
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	auditLog, err := audit.Open(root)
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
 	r := &Registry{
 		workDir:  absRoot,
+		root:     root,
+		shadow:   store,
+		auditLog: auditLog,
+		approve:  approve,
 		handlers: make(map[string]ToolSpec),
+		pending:  make(map[string]pendingApproval),
+		now:      time.Now,
 	}
 	r.registerDefaults()
 	return r, nil
+}
+
+// Close releases the workspace handle. The registry must not be used afterwards.
+func (r *Registry) Close() error {
+	if r.root == nil {
+		return nil
+	}
+	err := r.root.Close()
+	r.root = nil
+	return err
 }
 
 // OpenAITools returns tool definitions sorted alphabetically to preserve KV-cache.
@@ -76,170 +159,639 @@ func (r *Registry) OpenAITools() []map[string]any {
 	return out
 }
 
-func (r *Registry) NeedsApproval(name string) bool {
+// RequiresApproval reports whether a tool must be approved before running.
+// Unknown tools and every tool that is not explicitly read-only require
+// approval.
+func (r *Registry) RequiresApproval(name string) bool {
 	spec, ok := r.handlers[name]
 	if !ok {
 		return true
 	}
-	return spec.NeedsConfirm
+	return !spec.ReadOnly
 }
 
-func (r *Registry) resolveSafePath(relPath string) (string, error) {
-	if strings.ContainsRune(relPath, 0) {
-		return "", fmt.Errorf("invalid path: contains NUL byte")
+// Has reports whether a tool is registered.
+func (r *Registry) NeedsApproval(name string) bool { return r.RequiresApproval(name) }
+
+func (r *Registry) Has(name string) bool {
+	_, ok := r.handlers[name]
+	return ok
+}
+
+// Disable removes tools from the registry. Disabled tools are neither
+// advertised nor executable.
+func (r *Registry) Disable(names ...string) {
+	for _, name := range names {
+		delete(r.handlers, name)
 	}
+}
+
+// resolveSafePath validates a workspace-relative path and returns it in the
+// form expected by os.Root. File operations use the root handle, so the
+// containment check is enforced at open time, not only here.
+func (r *Registry) resolveSafePath(relPath string) (string, error) {
 	if strings.TrimSpace(relPath) == "" {
 		return "", fmt.Errorf("empty path is not allowed")
 	}
+	if strings.ContainsRune(relPath, 0) {
+		return "", fmt.Errorf("invalid path: contains NUL byte")
+	}
 	cleaned := filepath.Clean(relPath)
-	if filepath.IsAbs(cleaned) {
+	if filepath.IsAbs(cleaned) || filepath.VolumeName(cleaned) != "" {
 		return "", fmt.Errorf("absolute paths are not allowed: %s", relPath)
 	}
-
-	target := filepath.Join(r.workDir, cleaned)
-	rel, err := filepath.Rel(r.workDir, target)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path outside workspace not allowed: %s", relPath)
 	}
+	if isSensitivePath(cleaned) {
+		return "", fmt.Errorf("access to sensitive path denied: %s", relPath)
+	}
 
-	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+	// Defense in depth: os.Root rejects escaping symlinks at open time, but we
+	// still check the resolved path so symlinks to sensitive files are denied.
+	abs := filepath.Join(r.workDir, cleaned)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		relResolved, err := filepath.Rel(r.workDir, resolved)
 		if err != nil || relResolved == ".." || strings.HasPrefix(relResolved, ".."+string(filepath.Separator)) {
 			return "", fmt.Errorf("symlink points outside workspace: %s", relPath)
 		}
+		if isSensitivePath(relResolved) {
+			return "", fmt.Errorf("access to sensitive path denied: %s", relPath)
+		}
 	}
 
-	return target, nil
+	return cleaned, nil
 }
 
+// isSensitivePath denies credentials, VCS internals and the reserved .nabd
+// directory. The check is intentionally case-insensitive so it also holds on
+// case-insensitive filesystems such as Android shared storage.
+func isSensitivePath(rel string) bool {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for _, part := range parts {
+		switch strings.ToLower(part) {
+		case ".nabd", ".git":
+			return true
+		}
+	}
+
+	base := strings.ToLower(parts[len(parts)-1])
+	if strings.HasPrefix(base, ".nabd-tmp-") {
+		return true
+	}
+	switch {
+	case base == ".env":
+		return true
+	case strings.HasPrefix(base, ".env."):
+		switch base {
+		case ".env.example", ".env.sample", ".env.template", ".env.dist":
+			return false
+		}
+		return true
+	case strings.HasPrefix(base, "id_") && !strings.HasSuffix(base, ".pub"):
+		return true
+	}
+
+	switch strings.ToLower(filepath.Ext(base)) {
+	case ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore":
+		return true
+	}
+	return false
+}
+
+// FileDigest returns the SHA-256 of a file inside the workspace. The approval
+// UI uses it to confirm that the file did not change between the preview and
+// the approved edit.
+func (r *Registry) FileDigest(relPath string) (string, error) {
+	rel, err := r.resolveSafePath(relPath)
+	if err != nil {
+		return "", err
+	}
+	f, err := r.root.Open(rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (r *Registry) readFile(rel string) (string, error) {
+	info, err := r.root.Stat(rel)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s is a directory", rel)
+	}
+	f, err := r.root.Open(rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
+	if err != nil {
+		return "", err
+	}
+	truncated := len(data) > maxReadBytes
+	if truncated {
+		data = data[:maxReadBytes]
+	}
+	out := string(data)
+	if truncated {
+		out += fmt.Sprintf("\n...[truncated at %d bytes]", maxReadBytes)
+	}
+	return out, nil
+}
+
+func (r *Registry) listDir(rel string) (string, error) {
+	f, err := r.root.Open(rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	entries, err := f.ReadDir(-1)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	var b strings.Builder
+	shown, hidden := 0, 0
+	for _, e := range entries {
+		if isSensitivePath(filepath.Join(rel, e.Name())) {
+			continue
+		}
+		if shown >= maxListEntries {
+			hidden++
+			continue
+		}
+		typ := "F"
+		if e.IsDir() {
+			typ = "D"
+		}
+		b.WriteString(fmt.Sprintf("%s  %s\n", typ, e.Name()))
+		shown++
+	}
+	if hidden > 0 {
+		b.WriteString(fmt.Sprintf("... [%d more entries]\n", hidden))
+	}
+	return b.String(), nil
+}
+
+// Undo restores the most recent non-undone shadow entry for relPath (or the
+// most recent entry overall when relPath is empty). It refuses if the file
+// changed since the edit or if the shadow copy is corrupted.
+func (r *Registry) Undo(relPath string) (string, error) {
+	var target string
+	if strings.TrimSpace(relPath) != "" {
+		var err error
+		target, err = r.resolveSafePath(relPath)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	entry, backup, err := r.shadow.Latest(target)
+	if err != nil {
+		return "", err
+	}
+
+	currentPath, err := r.resolveSafePath(entry.Path)
+	if err != nil {
+		return "", err
+	}
+	info, err := r.root.Lstat(currentPath)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: "undo", Detail: entry.Path, Reason: "symlink"})
+		return "", fmt.Errorf("refusing to undo a symlink: %s", entry.Path)
+	}
+
+	current, err := r.root.ReadFile(currentPath)
+	if err != nil {
+		return "", err
+	}
+	currentHash := hashBytes(current)
+	if currentHash != entry.SHA256After {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path, Reason: "file changed since the edit"})
+		return "", fmt.Errorf("refusing undo: %s changed since the edit", entry.Path)
+	}
+
+	if err := r.logEvent(audit.Event{Event: "requested", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path}); err != nil {
+		return "", err
+	}
+	if err := r.atomicWrite(currentPath, backup, os.FileMode(entry.Mode)); err != nil {
+		_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path})
+		return "", err
+	}
+	if err := r.shadow.MarkUndone(entry.ID); err != nil {
+		return "", fmt.Errorf("restored %s but could not update shadow metadata: %w", entry.Path, err)
+	}
+	_ = r.logEvent(audit.Event{Event: "applied", Tool: "undo", ArgsSHA256: currentHash, ResultSHA256: entry.SHA256Before, Detail: entry.Path})
+	return fmt.Sprintf("Restored %s from shadow %s", entry.Path, entry.ID), nil
+}
+
+// atomicWrite writes data to a temporary file in the target directory, syncs
+// it, and renames it over the destination. All operations stay inside root.
+func (r *Registry) atomicWrite(rel string, data []byte, mode os.FileMode) error {
+	return r.atomicWriteChecked(rel, data, mode, "")
+}
+func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode, expectedHash string) error {
+	tmp := filepath.Join(filepath.Dir(rel), ".nabd-tmp-"+randomHex(8))
+	f, err := r.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+
+	_, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		_ = r.root.Remove(tmp)
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+
+	if expectedHash != "" {
+		if editBeforeRenameHook != nil {
+			editBeforeRenameHook()
+		}
+		info, statErr := r.root.Lstat(rel)
+		current, readErr := r.root.ReadFile(rel)
+		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != expectedHash {
+			_ = r.root.Remove(tmp)
+			return fmt.Errorf("file changed since approval: %s", rel)
+		}
+	}
+	if err := r.root.Rename(tmp, rel); err != nil {
+		_ = r.root.Remove(tmp)
+		return fmt.Errorf("replace %s: %w", rel, err)
+	}
+	return nil
+}
+
+func hashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func randomHex(n int) string {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}
+
+// Run executes a tool. Tools that are not read-only are refused unless an
+// approver is configured and grants the request, so callers without an
+// interactive approval path fail closed. Every action is appended to the
+// audit log.
 func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage) string {
-	return r.run(ctx, name, rawArgs, false)
-}
-
-// RunApproved executes a tool after the caller has already collected consent.
-// For edit_file, state must be the ApprovalState from PreviewApproval; the file
-// is re-read and rejected if it changed since that preview.
-func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage, state ApprovalState) string {
-	if name == "edit_file" {
-		p, err := parseEditParams(rawArgs)
-		if err != nil {
-			return fmt.Sprintf("Error: %v", err)
-		}
-		content, safePath, err := r.verifyEditState(p, state)
-		if err != nil {
-			return fmt.Sprintf("Error: %v", err)
-		}
-		if content == nil {
-			return fmt.Sprintf("Error: file does not exist: %s", p.Path)
-		}
-		out, err := r.writeEdit(safePath, p, content)
-		if err != nil {
-			return fmt.Sprintf("Error: %v", err)
-		}
-		return truncateOutput(out)
-	}
-	return r.run(ctx, name, rawArgs, true)
-}
-
-func (r *Registry) run(ctx context.Context, name string, rawArgs json.RawMessage, approved bool) string {
 	spec, ok := r.handlers[name]
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", name)
 	}
-	if spec.NeedsConfirm && !approved {
+	hash := hashBytes(rawArgs)
+	detail := toolDetail(name, rawArgs)
+
+	if spec.ReadOnly {
+		_ = r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: detail})
+		return r.execute(ctx, spec, name, rawArgs, hash)
+	}
+
+	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: detail}); err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	if name == "mcp_call" {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "RunApproved required"})
 		return fmt.Sprintf("Error: tool %q requires approval; use RunApproved", name)
 	}
+	if r.approve == nil {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "no approver configured"})
+		return fmt.Sprintf("Error: tool %q requires approval, but no approver is configured", name)
+	}
+	var editState *ApprovalState
+	if name == "edit_file" {
+		preview, err := r.PreviewApproval(name, rawArgs)
+		if err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		editState = &preview.State
+	}
+	if !r.approve(name, string(rawArgs)) {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "denied by approver"})
+		return "Action rejected by user."
+	}
+	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	if editState != nil {
+		p, err := parseEditParams(rawArgs)
+		if err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		if _, _, err := r.verifyEditState(p, *editState); err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		ctx = context.WithValue(ctx, editApprovalKey{}, *editState)
+	}
+	return r.execute(ctx, spec, name, rawArgs, hash)
+}
+
+// Approve records an explicit approval and returns a single-use token bound to
+// this exact tool call. The audit write is mandatory: if it fails, no token is
+// issued and nothing can execute.
+func (r *Registry) Approve(name string, rawArgs json.RawMessage) (Approval, error) {
+	var state *ApprovalState
+	var previewErr error
+	if name == "edit_file" {
+		preview, err := r.PreviewApproval(name, rawArgs)
+		previewErr = err
+		if err == nil {
+			state = &preview.State
+		}
+	}
+	return r.approveWithState(name, rawArgs, state, previewErr)
+}
+
+// ApprovePreview binds a single-use token to the file state shown in the UI.
+func (r *Registry) ApprovePreview(name string, rawArgs json.RawMessage, state ApprovalState) (Approval, error) {
+	if name != "edit_file" {
+		return Approval{}, fmt.Errorf("preview state is only valid for edit_file")
+	}
+	return r.approveWithState(name, rawArgs, &state, nil)
+}
+func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state *ApprovalState, preflightErr error) (Approval, error) {
+	spec, ok := r.handlers[name]
+	if !ok {
+		return Approval{}, fmt.Errorf("unknown tool %q", name)
+	}
+	if spec.ReadOnly {
+		return Approval{}, fmt.Errorf("tool %q does not require approval", name)
+	}
+
+	hash := hashBytes(rawArgs)
+	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)}); err != nil {
+		return Approval{}, err
+	}
+	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
+		return Approval{}, err
+	}
+
+	now := r.now()
+	token := randomHex(16)
+	r.mu.Lock()
+	r.pruneApprovalsLocked(now)
+	r.pending[token] = pendingApproval{state: state, preflightErr: preflightErr, tool: name, argsHash: hash, expires: now.Add(approvalTTL)}
+	r.mu.Unlock()
+
+	return Approval{Token: token, Tool: name, ArgsSHA256: hash}, nil
+}
+
+// RunApproved executes a tool with a token issued by Approve. Tokens are bound
+// to the tool and argument hash, expire, and can be used once.
+func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage, approval Approval) string {
+	spec, ok := r.handlers[name]
+	if !ok {
+		return fmt.Sprintf("Error: unknown tool %q", name)
+	}
+	hash := hashBytes(rawArgs)
+
+	if spec.ReadOnly {
+		_ = r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)})
+		return r.execute(ctx, spec, name, rawArgs, hash)
+	}
+
+	pending, ok := r.consumeApproval(name, hash, approval)
+	if !ok {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "invalid or expired approval token"})
+		return "Error: approval token is invalid or expired"
+	}
+
+	if name == "edit_file" {
+		if pending.preflightErr != nil {
+			return r.failedResult(name, hash, pending.preflightErr)
+		}
+		if pending.state == nil {
+			return r.failedResult(name, hash, fmt.Errorf("missing approval state"))
+		}
+		p, err := parseEditParams(rawArgs)
+		if err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		if _, _, err = r.verifyEditState(p, *pending.state); err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		ctx = context.WithValue(ctx, editApprovalKey{}, *pending.state)
+	}
+	return r.execute(ctx, spec, name, rawArgs, hash)
+}
+
+func (r *Registry) failedResult(name, hash string, err error) string {
+	result := fmt.Sprintf("Error: %v", err)
+	_ = r.logEvent(audit.Event{Event: "failed", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))})
+	return result
+}
+
+type editApprovalKey struct{}
+
+func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawArgs json.RawMessage, hash string) string {
 	out, err := spec.Execute(ctx, rawArgs)
 	if err != nil {
-		return fmt.Sprintf("Error: %v\nOutput:\n%s", err, truncateOutput(out))
+		result := fmt.Sprintf("Error: %v\nOutput:\n%s", err, truncateOutput(out))
+		_ = r.logEvent(audit.Event{Event: "failed", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))})
+		return result
 	}
-	return truncateOutput(out)
+	result := truncateOutput(out)
+	if err := r.logEvent(audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))}); err != nil && !spec.ReadOnly {
+		result += "\nWarning: audit log write failed"
+	}
+	return result
+}
+
+func (r *Registry) consumeApproval(name, hash string, approval Approval) (pendingApproval, bool) {
+	if approval.Token == "" || approval.Tool != name || approval.ArgsSHA256 != hash {
+		return pendingApproval{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pending, ok := r.pending[approval.Token]
+	if !ok {
+		return pendingApproval{}, false
+	}
+	delete(r.pending, approval.Token)
+	return pending, pending.tool == name && pending.argsHash == hash && !r.now().After(pending.expires)
+}
+
+func (r *Registry) pruneApprovalsLocked(now time.Time) {
+	for token, pending := range r.pending {
+		if now.After(pending.expires) {
+			delete(r.pending, token)
+		}
+	}
+}
+
+func (r *Registry) logEvent(event audit.Event) error {
+	return r.auditLog.Write(event)
+}
+
+func toolDetail(name string, rawArgs json.RawMessage) string {
+	var p struct {
+		Path    string `json:"path"`
+		Pkg     string `json:"pkg"`
+		Command string `json:"command"`
+	}
+	_ = json.Unmarshal(rawArgs, &p)
+
+	var detail string
+	switch name {
+	case "edit_file", "read_file", "list_dir":
+		detail = p.Path
+	case "go_verify":
+		detail = p.Pkg
+		if detail == "" {
+			detail = "./..."
+		}
+	case "mcp_call":
+		detail = p.Command
+	}
+	if name == "list_dir" && detail == "" {
+		detail = "."
+	}
+	if len(detail) > 200 {
+		detail = detail[:200]
+	}
+	return strings.ToValidUTF8(detail, "\uFFFD")
 }
 
 func (r *Registry) registerDefaults() {
 	r.handlers["edit_file"] = ToolSpec{
-		Name:         "edit_file",
-		Description:  "Replace an exact block of text in a file. Validates and formats Go code before saving.",
-		NeedsConfirm: true,
-		Parameters:   json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"old_text":{"type":"string","description":"Exact existing block to replace"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
+		Name:        "edit_file",
+		Description: "Replace an exact block of text in a file. Validates and formats Go code before saving.",
+		ReadOnly:    false,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"old_text":{"type":"string","description":"Exact existing block to replace"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
-			p, err := parseEditParams(args)
-			if err != nil {
+			var p struct {
+				Path    string `json:"path"`
+				OldText string `json:"old_text"`
+				NewText string `json:"new_text"`
+			}
+			if err := json.Unmarshal(args, &p); err != nil {
 				return "", err
+			}
+			if p.OldText == "" {
+				return "", fmt.Errorf("old_text cannot be empty")
+			}
+			if p.OldText == p.NewText {
+				return "", fmt.Errorf("old_text and new_text are identical")
 			}
 
-			safePath, err := r.resolveSafePath(p.Path)
+			rel, err := r.resolveSafePath(p.Path)
 			if err != nil {
 				return "", err
 			}
-			contentBytes, err := os.ReadFile(safePath)
+			info, err := r.root.Lstat(rel)
 			if err != nil {
 				return "", err
+			}
+			if info.IsDir() {
+				return "", fmt.Errorf("%s is a directory", p.Path)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("editing symlinks is not supported: %s", p.Path)
+			}
+			if info.Size() > maxEditBytes {
+				return "", fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
 			}
 
-			return r.writeEdit(safePath, p, contentBytes)
+			contentBytes, err := r.root.ReadFile(rel)
+			if err != nil {
+				return "", err
+			}
+			if state, ok := ctx.Value(editApprovalKey{}).(ApprovalState); ok {
+				if state.Path != rel || !state.Exists || hashBytes(contentBytes) != state.Hash {
+					return "", fmt.Errorf("file changed since approval: %s", p.Path)
+				}
+			}
+
+			hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
+			content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
+			oldNorm := strings.ReplaceAll(p.OldText, "\r\n", "\n")
+			newNorm := strings.ReplaceAll(p.NewText, "\r\n", "\n")
+			if oldNorm == newNorm {
+				return "", fmt.Errorf("old_text and new_text are identical after line-ending normalization")
+			}
+
+			count := strings.Count(content, oldNorm)
+			if count == 0 {
+				return "", fmt.Errorf("old_text not found in %s", p.Path)
+			}
+			if count != 1 {
+				return "", fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
+			}
+
+			updatedBytes := []byte(strings.Replace(content, oldNorm, newNorm, 1))
+
+			if strings.HasSuffix(rel, ".go") {
+				formatted, err := format.Source(updatedBytes)
+				if err != nil {
+					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
+				}
+				updatedBytes = formatted
+			}
+			if hasCRLF {
+				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
+			}
+			if bytes.Equal(updatedBytes, contentBytes) {
+				return "", fmt.Errorf("edit would not change %s", p.Path)
+			}
+
+			entry, err := r.shadow.Backup(rel, contentBytes, info.Mode(), updatedBytes)
+			if err != nil {
+				return "", err
+			}
+			if err := r.atomicWriteChecked(rel, updatedBytes, info.Mode(), hashBytes(contentBytes)); err != nil {
+				_ = r.shadow.MarkUndone(entry.ID)
+				return "", err
+			}
+			return fmt.Sprintf("Successfully updated %s (shadow %s)", p.Path, entry.ID), nil
 		},
 	}
 
 	r.handlers["go_verify"] = ToolSpec{
-		Name:         "go_verify",
-		Description:  "Run go test and go vet with Termux-safe memory limits.",
-		NeedsConfirm: true,
-		Parameters:   json.RawMessage(`{"type":"object","properties":{"pkg":{"type":"string","description":"Package pattern, default ./..."}}}`),
+		Name:        "go_verify",
+		Description: "Run go test and go vet with Termux-safe memory limits.",
+		ReadOnly:    false,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"pkg":{"type":"string","description":"Package pattern, default ./..."}}}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
 				Pkg string `json:"pkg"`
 			}
-			if len(args) > 0 {
-				if err := json.Unmarshal(args, &p); err != nil {
-					return "", fmt.Errorf("invalid arguments: %w", err)
-				}
+			if err := json.Unmarshal(args, &p); err != nil {
+				return "", err
 			}
-			pkg := strings.TrimSpace(p.Pkg)
-			if pkg == "" {
-				pkg = "./..."
+			pkg, err := r.validatePkgPattern(p.Pkg)
+			if err != nil {
+				return "", err
 			}
-
-			if strings.HasPrefix(pkg, "-") {
-				return "", fmt.Errorf("invalid package pattern %q: flags are not allowed", pkg)
-			}
-			if pkg != "./..." && pkg != "." {
-				if _, err := r.resolveSafePath(strings.TrimSuffix(pkg, "/...")); err != nil {
-					return "", err
-				}
-			}
-
-			tCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-			defer cancel()
-
-			cmd := exec.CommandContext(tCtx, "go", "test", "-p", "2", "-vet=all", pkg)
-			prepareProcess(cmd)
-			cmd.WaitDelay = 5 * time.Second
-			cmd.Dir = r.workDir
-			env := append(os.Environ(),
-				"GOMEMLIMIT=512MiB",
-				"GOGC=50",
-			)
-			if os.Getenv("TMPDIR") == "" {
-				if prefix := os.Getenv("PREFIX"); prefix != "" {
-					env = append(env, "TMPDIR="+filepath.Join(prefix, "tmp"))
-				}
-			}
-			cmd.Env = env
-
-			var out bytes.Buffer
-			cmd.Stdout = &out
-			cmd.Stderr = &out
-			err := cmd.Run()
-			return out.String(), err
+			return r.runGoVerify(ctx, pkg, 90*time.Second)
 		},
 	}
 
 	r.handlers["read_file"] = ToolSpec{
-		Name:         "read_file",
-		Description:  "Read the contents of a file inside the workspace.",
-		NeedsConfirm: false,
-		Parameters:   json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}`),
+		Name:        "read_file",
+		Description: "Read the contents of a file inside the workspace.",
+		ReadOnly:    true,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
 				Path string `json:"path"`
@@ -247,54 +799,261 @@ func (r *Registry) registerDefaults() {
 			if err := json.Unmarshal(args, &p); err != nil {
 				return "", err
 			}
-			safe, err := r.resolveSafePath(p.Path)
+			rel, err := r.resolveSafePath(p.Path)
 			if err != nil {
 				return "", err
 			}
-			data, err := os.ReadFile(safe)
-			if err != nil {
-				return "", err
-			}
-			return string(data), nil
+			return r.readFile(rel)
 		},
 	}
 
 	r.handlers["list_dir"] = ToolSpec{
-		Name:         "list_dir",
-		Description:  "List directory contents inside the workspace.",
-		NeedsConfirm: false,
-		Parameters:   json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative directory path (default .)"}}}`),
+		Name:        "list_dir",
+		Description: "List directory contents inside the workspace.",
+		ReadOnly:    true,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative directory path (default .)"}}}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
 				Path string `json:"path"`
 			}
-			if len(args) > 0 {
-				if err := json.Unmarshal(args, &p); err != nil {
-					return "", fmt.Errorf("invalid arguments: %w", err)
-				}
-			}
+			_ = json.Unmarshal(args, &p)
 			if strings.TrimSpace(p.Path) == "" {
 				p.Path = "."
 			}
-			safe, err := r.resolveSafePath(p.Path)
+			rel, err := r.resolveSafePath(p.Path)
 			if err != nil {
 				return "", err
 			}
-			entries, err := os.ReadDir(safe)
-			if err != nil {
-				return "", err
-			}
-			var b strings.Builder
-			for _, e := range entries {
-				typ := "F"
-				if e.IsDir() {
-					typ = "D"
-				}
-				b.WriteString(fmt.Sprintf("%s  %s\n", typ, e.Name()))
-			}
-			return b.String(), nil
+			return r.listDir(rel)
 		},
 	}
+
+	r.handlers["mcp_call"] = ToolSpec{
+		Name:        "mcp_call",
+		Description: "Call a tool on an external MCP server via stdio. Starts the server process, calls the tool, then closes it.",
+		ReadOnly:    false,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Command to start the MCP server (e.g. nabd-mcp)"},"tool":{"type":"string","description":"Name of the tool to call on the MCP server"},"arguments":{"type":"object","description":"Arguments to pass to the tool"}},"required":["command","tool"]}`),
+		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
+			var p struct {
+				Command   string                 `json:"command"`
+				Tool      string                 `json:"tool"`
+				Arguments map[string]interface{} `json:"arguments"`
+			}
+			if err := json.Unmarshal(args, &p); err != nil {
+				return "", err
+			}
+			if p.Command == "" || p.Tool == "" {
+				return "", fmt.Errorf("command and tool are required")
+			}
+
+			tCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			defer cancel()
+
+			stdioTransport := transport.NewStdio(p.Command, nil)
+			c := client.NewClient(stdioTransport)
+			if err := c.Start(tCtx); err != nil {
+				return "", fmt.Errorf("failed to start MCP server: %w", err)
+			}
+			defer c.Close()
+
+			result, err := c.CallTool(tCtx, mcp.CallToolRequest{
+				Params: mcp.CallToolParams{
+					Name:      p.Tool,
+					Arguments: p.Arguments,
+				},
+			})
+			if err != nil {
+				return "", fmt.Errorf("mcp call failed: %w", err)
+			}
+
+			var out strings.Builder
+			for _, content := range result.Content {
+				if tc, ok := content.(mcp.TextContent); ok {
+					out.WriteString(tc.Text)
+					out.WriteString("\n")
+				}
+			}
+			if out.Len() == 0 {
+				return "(no text content returned)", nil
+			}
+			return out.String(), nil
+		},
+	}
+}
+
+// validatePkgPattern accepts only package patterns that stay inside the
+// workspace. Module paths ("std", "github.com/...") are rejected so go_verify
+// cannot be pointed at packages outside the project.
+func (r *Registry) validatePkgPattern(pattern string) (string, error) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return "./...", nil
+	}
+	if strings.HasPrefix(pattern, "-") {
+		return "", fmt.Errorf("invalid package pattern %q: flags are not allowed", pattern)
+	}
+	switch pattern {
+	case ".", "./":
+		return ".", nil
+	case "./...":
+		return pattern, nil
+	}
+	if !strings.HasPrefix(pattern, "./") {
+		return "", fmt.Errorf("package pattern must be workspace-relative (for example ./... or ./pkg)")
+	}
+
+	rel := strings.TrimSuffix(pattern, "/...")
+	rel = strings.TrimPrefix(rel, "./")
+	if rel == "" {
+		return "", fmt.Errorf("invalid package pattern %q", pattern)
+	}
+	if _, err := r.resolveSafePath(rel); err != nil {
+		return "", err
+	}
+	return pattern, nil
+}
+
+// runGoVerify executes go test with a hard timeout and a structured summary.
+// Test failures are normal results, not tool errors.
+func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Duration) (string, error) {
+	tCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(tCtx, "go", "test", "-p", "2", "-vet=all", pkg)
+	cmd.Dir = r.workDir
+	cmd.Env = buildVerifyEnv()
+	cmd.WaitDelay = 2 * time.Second
+	configureProcessTree(cmd)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+
+	status := "PASS"
+	if err != nil {
+		status = "FAIL"
+	}
+	if tCtx.Err() == context.DeadlineExceeded {
+		status = "FAIL (timeout)"
+	}
+	if err != nil && !isGoTestFailure(tCtx, err) {
+		return "", err
+	}
+	return summarizeGoTest(status, out.String(), err), nil
+}
+
+func isGoTestFailure(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
+}
+
+const (
+	maxSummarySignals = 5
+	maxSummaryTail    = 12
+	maxSummaryLine    = 180
+)
+
+// summarizeGoTest returns a small, structured result instead of raw logs: a
+// status line, the first failure signals, and the tail of the output.
+func summarizeGoTest(status, output string, err error) string {
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+
+	var b strings.Builder
+	b.WriteString(status)
+	if err != nil {
+		b.WriteString(" (")
+		b.WriteString(clipSummary(err.Error(), maxSummaryLine))
+		b.WriteString(")")
+	}
+	b.WriteString("\n")
+
+	signals := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "--- FAIL:") ||
+			strings.Contains(trimmed, "build failed") ||
+			strings.Contains(trimmed, "cannot find") ||
+			strings.Contains(trimmed, "undefined:") ||
+			strings.Contains(trimmed, "panic:") {
+			if signals >= maxSummarySignals {
+				break
+			}
+			b.WriteString("  ")
+			b.WriteString(clipSummary(trimmed, maxSummaryLine))
+			b.WriteString("\n")
+			signals++
+		}
+	}
+
+	b.WriteString("--- tail ---\n")
+	if len(lines) == 1 && lines[0] == "" {
+		b.WriteString("(no output)\n")
+		return b.String()
+	}
+	start := len(lines) - maxSummaryTail
+	if start < 0 {
+		start = 0
+	}
+	for _, line := range lines[start:] {
+		b.WriteString(clipSummary(line, maxSummaryLine))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func clipSummary(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
+}
+
+// verifyEnvAllowlist is the only set of parent variables forwarded to project
+// test code. Secrets such as API keys and proxy credentials are intentionally
+// omitted.
+var verifyEnvAllowlist = []string{
+	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+	"TMPDIR", "TMP", "TEMP",
+	"GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE", "GOTOOLCHAIN",
+	"GOOS", "GOARCH", "GOARM", "GOAMD64", "GOEXPERIMENT",
+	"CGO_ENABLED", "CC", "CXX", "PKG_CONFIG",
+	"PREFIX", "ANDROID_ROOT", "ANDROID_DATA", "ANDROID_STORAGE",
+	"SSL_CERT_FILE", "SSL_CERT_DIR",
+	"SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+	"USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+}
+
+func buildVerifyEnv() []string {
+	env := make([]string, 0, len(verifyEnvAllowlist)+4)
+	for _, key := range verifyEnvAllowlist {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	env = append(env,
+		"GOMEMLIMIT=512MiB",
+		"GOGC=50",
+		"GOFLAGS=-mod=readonly",
+		"GOPROXY=off",
+		"GOTOOLCHAIN=local",
+	)
+	if os.Getenv("TMPDIR") == "" {
+		if prefix := os.Getenv("PREFIX"); prefix != "" {
+			env = append(env, "TMPDIR="+filepath.Join(prefix, "tmp"))
+		}
+	}
+	return env
 }
 
 func truncateOutput(s string) string {

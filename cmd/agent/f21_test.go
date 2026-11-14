@@ -7,7 +7,7 @@ import (
 )
 
 func TestF21SmallWindowDoesNotPanic(t *testing.T) {
-	m := testModel(t)
+	m := testPR7Model(t)
 	widths := []int{0, 10}
 	heights := []int{0, 3, 5}
 	for _, w := range widths {

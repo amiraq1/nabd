@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -43,8 +44,7 @@ func TestGoVerifyNeedsApproval(t *testing.T) {
 func TestGoVerifyRunWithoutApprovalDoesNotExecute(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "ran.txt")
-	t.Setenv("NABD_PROBE_OUT", marker)
-	installProbeGo(t, `printf ran > "$NABD_PROBE_OUT"`)
+	installProbeGo(t, `printf ran > `+strconv.Quote(marker))
 
 	r := approvalRegistry(t, dir)
 	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`))
@@ -59,8 +59,7 @@ func TestGoVerifyRunWithoutApprovalDoesNotExecute(t *testing.T) {
 func TestGoVerifyRunApprovedExecutes(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "ran.txt")
-	t.Setenv("NABD_PROBE_OUT", marker)
-	installProbeGo(t, `printf ran > "$NABD_PROBE_OUT"`)
+	installProbeGo(t, `printf ran > `+strconv.Quote(marker))
 
 	r := approvalRegistry(t, dir)
 	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`))
@@ -71,7 +70,7 @@ func TestGoVerifyRunApprovedExecutes(t *testing.T) {
 		t.Fatal("go test executed despite rejection")
 	}
 
-	out = r.RunApproved(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})
+	out = legacyApproved(t, r, context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})
 	if strings.Contains(out, "Error") {
 		t.Fatalf("RunApproved failed: %q", out)
 	}

@@ -63,7 +63,7 @@ func TestF18RunApprovedRejectsChangedFile(t *testing.T) {
 	}
 	mustWrite(t, target, "changed old\n", 0600)
 
-	out := r.RunApproved(context.Background(), "edit_file", args, preview.State)
+	out := legacyApproved(t, r, context.Background(), "edit_file", args, preview.State)
 	if !strings.Contains(out, "file changed since approval") {
 		t.Fatalf("missing hash mismatch error: %q", out)
 	}
@@ -87,7 +87,7 @@ func TestF18RunApprovedUnchangedFileSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := r.RunApproved(context.Background(), "edit_file", args, preview.State)
+	out := legacyApproved(t, r, context.Background(), "edit_file", args, preview.State)
 	if !strings.Contains(out, "Successfully updated") {
 		t.Fatalf("edit failed: %q", out)
 	}
