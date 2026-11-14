@@ -225,9 +225,13 @@ func (r *Registry) resolveSafePath(relPath string) (string, error) {
 // case-insensitive filesystems such as Android shared storage.
 func isSensitivePath(rel string) bool {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
-	for _, part := range parts {
-		switch strings.ToLower(part) {
+	for i, part := range parts {
+		lower := strings.ToLower(part)
+		switch lower {
 		case ".nabd", ".git":
+			return true
+		}
+		if strings.HasPrefix(lower, ".env") && (i != len(parts)-1 || !isEnvTemplate(lower)) {
 			return true
 		}
 	}
@@ -237,14 +241,6 @@ func isSensitivePath(rel string) bool {
 		return true
 	}
 	switch {
-	case base == ".env":
-		return true
-	case strings.HasPrefix(base, ".env."):
-		switch base {
-		case ".env.example", ".env.sample", ".env.template", ".env.dist":
-			return false
-		}
-		return true
 	case strings.HasPrefix(base, "id_") && !strings.HasSuffix(base, ".pub"):
 		return true
 	}
@@ -254,6 +250,16 @@ func isSensitivePath(rel string) bool {
 		return true
 	}
 	return false
+}
+
+// Only these exact final names are exempt from .env* filtering.
+func isEnvTemplate(name string) bool {
+	switch strings.ToLower(name) {
+	case ".env.example", ".env.sample", ".env.template", ".env.dist":
+		return true
+	default:
+		return false
+	}
 }
 
 // FileDigest returns the SHA-256 of a file inside the workspace. The approval
@@ -318,6 +324,9 @@ func (r *Registry) readFile(rel string) (string, error) {
 }
 
 func (r *Registry) listDir(rel string) (string, error) {
+	if isEnvTemplate(filepath.Base(rel)) {
+		return "", fmt.Errorf("access to sensitive directory denied: %s", rel)
+	}
 	info, err := r.root.Stat(rel)
 	if err != nil {
 		return "", err
@@ -362,7 +371,7 @@ func (r *Registry) listDir(rel string) (string, error) {
 	var b strings.Builder
 	shown, hidden := 0, 0
 	for _, e := range entries {
-		if isSensitivePath(filepath.Join(rel, e.Name())) {
+		if isSensitivePath(filepath.Join(rel, e.Name())) || (isEnvTemplate(e.Name()) && (e.IsDir() || e.Type()&os.ModeSymlink != 0)) {
 			continue
 		}
 		if shown >= maxListEntries {
