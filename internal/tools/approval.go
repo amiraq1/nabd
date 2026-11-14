@@ -112,10 +112,19 @@ var editBeforeRenameHook func()
 // applyEdit performs the in-memory transformation used by both the preview and
 // the write path.
 func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText string) ([]byte, error) {
+	if oldText == "" {
+		return nil, fmt.Errorf("old_text cannot be empty")
+	}
+	if oldText == newText {
+		return nil, fmt.Errorf("old_text and new_text are identical")
+	}
 	hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
 	content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
 	oldNorm := strings.ReplaceAll(oldText, "\r\n", "\n")
 	newNorm := strings.ReplaceAll(newText, "\r\n", "\n")
+	if oldNorm == newNorm {
+		return nil, fmt.Errorf("old_text and new_text are identical after line-ending normalization")
+	}
 
 	count := strings.Count(content, oldNorm)
 	if count == 0 {
@@ -138,6 +147,9 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	}
 	if len(updated) > maxEditBytes {
 		return nil, fmt.Errorf("edited file too large (limit %d bytes)", maxEditBytes)
+	}
+	if bytes.Equal(updated, contentBytes) {
+		return nil, fmt.Errorf("edit would not change %s", displayPath)
 	}
 	return updated, nil
 }

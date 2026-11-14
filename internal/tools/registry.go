@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/format"
 	"io"
 	"os"
 	"os/exec"
@@ -765,42 +763,12 @@ func (r *Registry) registerDefaults() {
 				}
 			}
 
-			hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
-			content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
-			oldNorm := strings.ReplaceAll(p.OldText, "\r\n", "\n")
-			newNorm := strings.ReplaceAll(p.NewText, "\r\n", "\n")
-			if oldNorm == newNorm {
-				return "", fmt.Errorf("old_text and new_text are identical after line-ending normalization")
-			}
-
-			count := strings.Count(content, oldNorm)
-			if count == 0 {
-				return "", fmt.Errorf("old_text not found in %s", p.Path)
-			}
-			if count != 1 {
-				return "", fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
-			}
-
-			updatedBytes := []byte(strings.Replace(content, oldNorm, newNorm, 1))
-
-			if strings.HasSuffix(rel, ".go") {
-				formatted, err := format.Source(updatedBytes)
-				if err != nil {
-					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
-				}
-				updatedBytes = formatted
-			}
-			if hasCRLF {
-				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
-			}
-			if len(updatedBytes) > maxEditBytes {
-				return "", fmt.Errorf("edited file too large (limit %d bytes)", maxEditBytes)
+			updatedBytes, err := applyEdit(contentBytes, p.Path, rel, p.OldText, p.NewText)
+			if err != nil {
+				return "", err
 			}
 			if err := ctx.Err(); err != nil {
 				return "", err
-			}
-			if bytes.Equal(updatedBytes, contentBytes) {
-				return "", fmt.Errorf("edit would not change %s", p.Path)
 			}
 
 			entry, err := r.shadow.Backup(rel, contentBytes, info.Mode(), updatedBytes)
