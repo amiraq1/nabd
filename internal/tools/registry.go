@@ -178,7 +178,8 @@ func (r *Registry) registerDefaults() {
 					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
 				}
 				updatedBytes = formatted
-			} else if hasCRLF {
+			}
+			if hasCRLF {
 				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
 			}
 
