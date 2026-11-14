@@ -12,10 +12,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
-	"github.com/mark3labs/mcp-go/mcp"
 )
 
 const maxOutputBytes = 4096
@@ -318,90 +314,9 @@ func (r *Registry) registerDefaults() {
 				return "", fmt.Errorf("command and tool are required")
 			}
 
-			tCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			defer cancel()
-
-			var spawned *exec.Cmd
-			defer func() { killProcessGroup(spawned) }()
-
-			stdioTransport := transport.NewStdioWithOptions(p.Command, nil, nil, transport.WithCommandFunc(func(ctx context.Context, command string, env []string, args []string) (*exec.Cmd, error) {
-				cmd := exec.CommandContext(ctx, command, args...)
-				cmd.Env = mcpEnv()
-				prepareProcess(cmd)
-				cmd.WaitDelay = 5 * time.Second
-				spawned = cmd
-				return cmd, nil
-			}))
-			c := client.NewClient(stdioTransport)
-			if err := c.Start(tCtx); err != nil {
-				return "", fmt.Errorf("failed to start MCP server: %w", err)
-			}
-			defer c.Close()
-
-			result, err := c.CallTool(tCtx, mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name:      p.Tool,
-					Arguments: p.Arguments,
-				},
-			})
-			if err != nil {
-				return "", fmt.Errorf("mcp call failed: %w", err)
-			}
-
-			return collectMCPText(result), nil
+			return callExternalMCP(ctx, r.workDir, p.Command, p.Tool, p.Arguments)
 		},
 	}
-}
-
-const maxMCPResponseBytes = 8192
-
-func mcpEnv() []string {
-	allowed := map[string]bool{
-		"PATH": true, "HOME": true, "TMPDIR": true,
-		"LANG": true, "LC_ALL": true, "TERM": true, "PREFIX": true,
-	}
-	env := []string{}
-	for _, entry := range os.Environ() {
-		key := entry
-		if i := strings.IndexByte(entry, '='); i >= 0 {
-			key = entry[:i]
-		}
-		if allowed[key] {
-			env = append(env, entry)
-		}
-	}
-	return env
-}
-
-func collectMCPText(result *mcp.CallToolResult) string {
-	var out strings.Builder
-	for _, content := range result.Content {
-		tc, ok := content.(mcp.TextContent)
-		if !ok {
-			continue
-		}
-		if out.Len() >= maxMCPResponseBytes {
-			out.WriteString("\n...[mcp output truncated]...\n")
-			break
-		}
-		remaining := maxMCPResponseBytes - out.Len()
-		text := tc.Text
-		if len(text) > remaining {
-			text = text[:remaining]
-			for len(text) > 0 && !utf8.ValidString(text) {
-				text = text[:len(text)-1]
-			}
-			out.WriteString(text)
-			out.WriteString("\n...[mcp output truncated]...\n")
-			break
-		}
-		out.WriteString(text)
-		out.WriteString("\n")
-	}
-	if out.Len() == 0 {
-		return "(no text content returned)"
-	}
-	return out.String()
 }
 
 func truncateOutput(s string) string {

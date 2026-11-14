@@ -1,3 +1,5 @@
+//go:build linux
+
 package tools
 
 import (
@@ -39,11 +41,10 @@ func TestMCPCallDoesNotInheritEnvironment(t *testing.T) {
 
 	r := mustRegistry(t, dir)
 	out := r.RunApproved(context.Background(), "mcp_call", mcpArgs(t, script), ApprovalState{})
-	_ = out
 
 	data, err := os.ReadFile(outFile)
 	if err != nil {
-		t.Fatalf("probe did not run: %v", err)
+		t.Fatalf("probe did not run (tool output %q): %v", out, err)
 	}
 	names := string(data)
 	if strings.Contains(names, "NABD_MCP_SENTINEL") {
