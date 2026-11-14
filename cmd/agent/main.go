@@ -168,8 +168,8 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, callLLMCmd(m.registry, m.messages)
 		}
 	case tea.WindowSizeMsg:
-		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - 6
+		m.viewport.Width = max(1, msg.Width)
+		m.viewport.Height = max(1, msg.Height-6)
 		m.textInput.Width = max(20, msg.Width-4)
 		m.refresh()
 	case llmResponseMsg:
