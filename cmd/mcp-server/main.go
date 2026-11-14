@@ -24,21 +24,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	s := server.NewMCPServer(
-		"NabdCoder Tools",
-		"1.0.0",
-		server.WithToolCapabilities(true),
-	)
-
-	// Register tools from the registry
-	for _, toolDef := range reg.OpenAITools() {
-		fn := toolDef["function"].(map[string]any)
-		name := fn["name"].(string)
-		desc := fn["description"].(string)
-
-		tool := mcp.NewTool(name, mcp.WithDescription(desc))
-		s.AddTool(tool, makeHandler(reg, name))
-	}
+	s := newMCPServer(reg)
 
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
@@ -46,8 +32,31 @@ func main() {
 	}
 }
 
+func newMCPServer(reg *tools.Registry) *server.MCPServer {
+	s := server.NewMCPServer(
+		"NabdCoder Tools",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+	)
+
+	for _, toolDef := range reg.OpenAITools() {
+		fn := toolDef["function"].(map[string]any)
+		name := fn["name"].(string)
+		if reg.NeedsApproval(name) {
+			continue
+		}
+		desc := fn["description"].(string)
+		tool := mcp.NewTool(name, mcp.WithDescription(desc))
+		s.AddTool(tool, makeHandler(reg, name))
+	}
+	return s
+}
+
 func makeHandler(reg *tools.Registry, name string) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if reg.NeedsApproval(name) {
+			return mcp.NewToolResultError(fmt.Sprintf("tool %q requires approval and is not available over MCP", name)), nil
+		}
 		args, _ := json.Marshal(request.GetArguments())
 		result := reg.Run(ctx, name, args)
 		return mcp.NewToolResultText(result), nil
