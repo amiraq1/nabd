@@ -460,6 +460,10 @@ func TestEditAtomicPreservesModeAndLeavesNoTemp(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\necho old\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	out := runToolApproved(t, reg, "edit_file", map[string]any{
 		"path": "script.sh", "old_text": "echo old", "new_text": "echo new",
@@ -472,8 +476,8 @@ func TestEditAtomicPreservesModeAndLeavesNoTemp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
-		t.Fatalf("mode = %v, want 0755", info.Mode().Perm())
+	if runtime.GOOS != "windows" && info.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("mode = %v, want %v", info.Mode().Perm(), before.Mode().Perm())
 	}
 
 	entries, err := os.ReadDir(root)
