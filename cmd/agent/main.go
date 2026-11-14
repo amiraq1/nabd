@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/amiraq1/nabd/internal/tools"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -24,6 +25,7 @@ const (
 	maxIterations     = 10
 	maxLLMToolOutput  = 8000
 	maxUIDisplayChars = 400
+	maxApprovalArgs   = 4000
 )
 
 var (
@@ -65,6 +67,9 @@ type ToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	Approval   tools.ApprovalState `json:"-"`
+	Preview    string              `json:"-"`
+	PreviewSet bool                `json:"-"`
 }
 
 type uiModel struct {
@@ -163,14 +168,29 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, callLLMCmd(m.registry, m.messages)
 		}
 	case tea.WindowSizeMsg:
-		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - 6
+		m.viewport.Width = max(1, msg.Width)
+		m.viewport.Height = max(1, msg.Height-6)
 		m.textInput.Width = max(20, msg.Width-4)
 		m.refresh()
 	case llmResponseMsg:
 		m.messages = append(m.messages, msg.assistantMsg)
 		m.iteration++
-		if len(msg.assistantMsg.ToolCalls) == 0 || m.iteration >= maxIterations {
+		if len(msg.assistantMsg.ToolCalls) == 0 {
+			m.busy = false
+			m.status = "Ready"
+			m.refresh()
+			return m, nil
+		}
+		if m.iteration >= maxIterations {
+			for _, tc := range msg.assistantMsg.ToolCalls {
+				m.messages = append(m.messages, Message{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    "Rejected: iteration limit reached.",
+					Display:    "Rejected " + tc.Function.Name,
+				})
+			}
+			m.pendingTools = nil
 			m.busy = false
 			m.status = "Ready"
 			m.refresh()
@@ -210,6 +230,33 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 	}
 	next := m.pendingTools[0]
 	if m.registry.NeedsApproval(next.Function.Name) {
+		preview, err := m.registry.PreviewApproval(next.Function.Name, json.RawMessage(next.Function.Arguments))
+		if err != nil {
+			m.pendingTools = m.pendingTools[1:]
+			m.messages = append(m.messages, Message{
+				Role:       "tool",
+				ToolCallID: next.ID,
+				Content:    fmt.Sprintf("Rejected: could not prepare an approval diff: %v", err),
+				Display:    "Rejected " + next.Function.Name,
+			})
+			m.refresh()
+			return m.advance()
+		}
+		if len(next.Function.Arguments) > maxApprovalArgs || len(preview.Display) > maxApprovalArgs {
+			_, hidden := approvalPreview(preview.Display)
+			m.pendingTools = m.pendingTools[1:]
+			m.messages = append(m.messages, Message{
+				Role:       "tool",
+				ToolCallID: next.ID,
+				Content:    fmt.Sprintf("Rejected: arguments are %d bytes and the approval preview is %d bytes, above the %d-byte approval limit (%d bytes not shown). Split this edit into smaller edits and retry.", len(next.Function.Arguments), len(preview.Display), maxApprovalArgs, hidden),
+				Display:    fmt.Sprintf("Rejected %s: %d bytes not shown", next.Function.Name, hidden),
+			})
+			m.refresh()
+			return m.advance()
+		}
+		m.pendingTools[0].Preview = preview.Display
+		m.pendingTools[0].PreviewSet = true
+		m.pendingTools[0].Approval = preview.State
 		m.awaitingApproval = true
 		m.status = "Approval required [y/n]"
 		m.refresh()
@@ -227,7 +274,16 @@ func (m uiModel) View() string {
 	b.WriteString(helpStyle.Render("────────────────────────────────") + "\n")
 	if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
+		content := tc.Function.Arguments
+		if tc.PreviewSet {
+			content = tc.Preview
+		}
+		preview, hidden := approvalPreview(content)
 		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", tc.Function.Name)) + "\n")
+		b.WriteString(statusStyle.Render(preview) + "\n")
+		if hidden > 0 {
+			b.WriteString(approvalStyle.Render(fmt.Sprintf("%d bytes not shown — this edit exceeds the approval limit and will be rejected", hidden)) + "\n")
+		}
 	} else {
 		b.WriteString(m.textInput.View() + "\n")
 	}
@@ -302,7 +358,10 @@ func callLLM(reg *tools.Registry, messages []Message) (*Message, error) {
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, truncate(string(data), 300))
 	}
@@ -334,7 +393,7 @@ func callLLM(reg *tools.Registry, messages []Message) (*Message, error) {
 
 func executeToolCmd(reg *tools.Registry, tc ToolCall) tea.Cmd {
 	return func() tea.Msg {
-		result := reg.Run(context.Background(), tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+		result := reg.RunApproved(context.Background(), tc.Function.Name, json.RawMessage(tc.Function.Arguments), tc.Approval)
 		return toolExecutedMsg{
 			toolMsg: Message{
 				Role:       "tool",
@@ -346,9 +405,26 @@ func executeToolCmd(reg *tools.Registry, tc ToolCall) tea.Cmd {
 	}
 }
 
+func approvalPreview(args string) (string, int) {
+	if len(args) <= maxApprovalArgs {
+		return args, 0
+	}
+	cut := maxApprovalArgs
+	for cut > 0 && !utf8.RuneStart(args[cut]) {
+		cut--
+	}
+	return args[:cut], len(args) - cut
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	if n < 0 {
+		n = 0
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }
@@ -367,7 +443,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	reg, err := tools.NewRegistry(cwd, nil)
+	reg, err := tools.NewRegistry(cwd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to init tools: %v\n", err)
 		os.Exit(1)
@@ -378,5 +454,4 @@ func main() {
 		fmt.Printf("TUI error: %v\n", err)
 		os.Exit(1)
 	}
-	_ = time.Second
 }

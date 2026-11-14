@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go/format"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,8 +20,6 @@ import (
 
 const maxOutputBytes = 4096
 
-type ApprovalFunc func(toolName, summary string) bool
-
 type ToolSpec struct {
 	Name         string
 	Description  string
@@ -33,11 +30,12 @@ type ToolSpec struct {
 
 type Registry struct {
 	workDir  string
-	approve  ApprovalFunc
 	handlers map[string]ToolSpec
 }
 
-func NewRegistry(workDir string, approve ApprovalFunc) (*Registry, error) {
+// NewRegistry builds a registry. Run is fail-closed; confirmation tools only
+// execute through RunApproved.
+func NewRegistry(workDir string) (*Registry, error) {
 	absRoot, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, err
@@ -47,7 +45,6 @@ func NewRegistry(workDir string, approve ApprovalFunc) (*Registry, error) {
 	}
 	r := &Registry{
 		workDir:  absRoot,
-		approve:  approve,
 		handlers: make(map[string]ToolSpec),
 	}
 	r.registerDefaults()
@@ -92,6 +89,9 @@ func (r *Registry) NeedsApproval(name string) bool {
 }
 
 func (r *Registry) resolveSafePath(relPath string) (string, error) {
+	if strings.ContainsRune(relPath, 0) {
+		return "", fmt.Errorf("invalid path: contains NUL byte")
+	}
 	if strings.TrimSpace(relPath) == "" {
 		return "", fmt.Errorf("empty path is not allowed")
 	}
@@ -117,14 +117,41 @@ func (r *Registry) resolveSafePath(relPath string) (string, error) {
 }
 
 func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage) string {
+	return r.run(ctx, name, rawArgs, false)
+}
+
+// RunApproved executes a tool after the caller has already collected consent.
+// For edit_file, state must be the ApprovalState from PreviewApproval; the file
+// is re-read and rejected if it changed since that preview.
+func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage, state ApprovalState) string {
+	if name == "edit_file" {
+		p, err := parseEditParams(rawArgs)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		content, safePath, err := r.verifyEditState(p, state)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		if content == nil {
+			return fmt.Sprintf("Error: file does not exist: %s", p.Path)
+		}
+		out, err := r.writeEdit(safePath, p, content)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		return truncateOutput(out)
+	}
+	return r.run(ctx, name, rawArgs, true)
+}
+
+func (r *Registry) run(ctx context.Context, name string, rawArgs json.RawMessage, approved bool) string {
 	spec, ok := r.handlers[name]
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", name)
 	}
-	if spec.NeedsConfirm && r.approve != nil {
-		if !r.approve(name, string(rawArgs)) {
-			return "Action rejected by user."
-		}
+	if spec.NeedsConfirm && !approved {
+		return fmt.Sprintf("Error: tool %q requires approval; use RunApproved", name)
 	}
 	out, err := spec.Execute(ctx, rawArgs)
 	if err != nil {
@@ -140,16 +167,9 @@ func (r *Registry) registerDefaults() {
 		NeedsConfirm: true,
 		Parameters:   json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"old_text":{"type":"string","description":"Exact existing block to replace"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
-			var p struct {
-				Path    string `json:"path"`
-				OldText string `json:"old_text"`
-				NewText string `json:"new_text"`
-			}
-			if err := json.Unmarshal(args, &p); err != nil {
+			p, err := parseEditParams(args)
+			if err != nil {
 				return "", err
-			}
-			if p.OldText == "" {
-				return "", fmt.Errorf("old_text cannot be empty")
 			}
 
 			safePath, err := r.resolveSafePath(p.Path)
@@ -161,48 +181,24 @@ func (r *Registry) registerDefaults() {
 				return "", err
 			}
 
-			hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
-			content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
-			oldNorm := strings.ReplaceAll(p.OldText, "\r\n", "\n")
-			newNorm := strings.ReplaceAll(p.NewText, "\r\n", "\n")
-
-			count := strings.Count(content, oldNorm)
-			if count == 0 {
-				return "", fmt.Errorf("old_text not found in %s", p.Path)
-			}
-			if count != 1 {
-				return "", fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
-			}
-
-			updatedBytes := []byte(strings.Replace(content, oldNorm, newNorm, 1))
-
-			if strings.HasSuffix(safePath, ".go") {
-				formatted, err := format.Source(updatedBytes)
-				if err != nil {
-					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
-				}
-				updatedBytes = formatted
-			} else if hasCRLF {
-				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
-			}
-
-			if err := os.WriteFile(safePath, updatedBytes, 0644); err != nil {
-				return "", err
-			}
-			return fmt.Sprintf("Successfully updated %s", p.Path), nil
+			return r.writeEdit(safePath, p, contentBytes)
 		},
 	}
 
 	r.handlers["go_verify"] = ToolSpec{
 		Name:         "go_verify",
 		Description:  "Run go test and go vet with Termux-safe memory limits.",
-		NeedsConfirm: false,
+		NeedsConfirm: true,
 		Parameters:   json.RawMessage(`{"type":"object","properties":{"pkg":{"type":"string","description":"Package pattern, default ./..."}}}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
 				Pkg string `json:"pkg"`
 			}
-			_ = json.Unmarshal(args, &p)
+			if len(args) > 0 {
+				if err := json.Unmarshal(args, &p); err != nil {
+					return "", fmt.Errorf("invalid arguments: %w", err)
+				}
+			}
 			pkg := strings.TrimSpace(p.Pkg)
 			if pkg == "" {
 				pkg = "./..."
@@ -221,6 +217,8 @@ func (r *Registry) registerDefaults() {
 			defer cancel()
 
 			cmd := exec.CommandContext(tCtx, "go", "test", "-p", "2", "-vet=all", pkg)
+			prepareProcess(cmd)
+			cmd.WaitDelay = 5 * time.Second
 			cmd.Dir = r.workDir
 			env := append(os.Environ(),
 				"GOMEMLIMIT=512MiB",
@@ -274,7 +272,11 @@ func (r *Registry) registerDefaults() {
 			var p struct {
 				Path string `json:"path"`
 			}
-			_ = json.Unmarshal(args, &p)
+			if len(args) > 0 {
+				if err := json.Unmarshal(args, &p); err != nil {
+					return "", fmt.Errorf("invalid arguments: %w", err)
+				}
+			}
 			if strings.TrimSpace(p.Path) == "" {
 				p.Path = "."
 			}
