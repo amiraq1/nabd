@@ -139,11 +139,17 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.awaitingApproval = false
 				m.approval = approvalPreview{}
 				m.pendingTools = m.pendingTools[1:]
+				content := "Rejected by user."
+				display := "Rejected " + sanitizeForDisplay(tc.Function.Name)
+				if err := m.registry.RecordDenied(tc.Function.Name, json.RawMessage(tc.Function.Arguments)); err != nil {
+					content += " Warning: rejection could not be recorded in audit log."
+					display += " (audit recording failed)"
+				}
 				m.messages = append(m.messages, Message{
 					Role:       "tool",
 					ToolCallID: tc.ID,
-					Content:    "Rejected by user.",
-					Display:    "Rejected " + sanitizeForDisplay(tc.Function.Name),
+					Content:    content,
+					Display:    display,
 				})
 				m.refresh()
 				return m.advance()

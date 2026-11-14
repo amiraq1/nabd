@@ -628,6 +628,19 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 	return r.execute(ctx, spec, name, rawArgs, hash)
 }
 
+// RecordDenied records a user rejection without storing raw arguments.
+// A logging error never turns a rejection into an approval.
+func (r *Registry) RecordDenied(name string, rawArgs json.RawMessage) error {
+	if !r.Has(name) || !r.RequiresApproval(name) {
+		return fmt.Errorf("tool %q is not a registered approval tool", name)
+	}
+	hash := hashBytes(rawArgs)
+	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash}); err != nil {
+		return err
+	}
+	return r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "user rejected"})
+}
+
 // Approve records an explicit approval and returns a single-use token bound to
 // this exact tool call. The audit write is mandatory: if it fails, no token is
 // issued and nothing can execute.
