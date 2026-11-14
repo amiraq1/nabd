@@ -60,9 +60,11 @@ type Registry struct {
 }
 
 type pendingApproval struct {
-	tool     string
-	argsHash string
-	expires  time.Time
+	state        *ApprovalState
+	preflightErr error
+	tool         string
+	argsHash     string
+	expires      time.Time
 }
 
 // Approval is a single-use token proving that the UI obtained an explicit
@@ -75,7 +77,14 @@ type Approval struct {
 
 const approvalTTL = 5 * time.Minute
 
-func NewRegistry(workDir string, approve ApprovalFunc) (*Registry, error) {
+func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
+	var approve ApprovalFunc
+	if len(approvers) > 1 {
+		return nil, fmt.Errorf("multiple approvers")
+	}
+	if len(approvers) == 1 {
+		approve = approvers[0]
+	}
 	absRoot, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, err
@@ -162,6 +171,8 @@ func (r *Registry) RequiresApproval(name string) bool {
 }
 
 // Has reports whether a tool is registered.
+func (r *Registry) NeedsApproval(name string) bool { return r.RequiresApproval(name) }
+
 func (r *Registry) Has(name string) bool {
 	_, ok := r.handlers[name]
 	return ok
@@ -392,6 +403,9 @@ func (r *Registry) Undo(relPath string) (string, error) {
 // atomicWrite writes data to a temporary file in the target directory, syncs
 // it, and renames it over the destination. All operations stay inside root.
 func (r *Registry) atomicWrite(rel string, data []byte, mode os.FileMode) error {
+	return r.atomicWriteChecked(rel, data, mode, "")
+}
+func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode, expectedHash string) error {
 	tmp := filepath.Join(filepath.Dir(rel), ".nabd-tmp-"+randomHex(8))
 	f, err := r.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
 	if err != nil {
@@ -406,6 +420,17 @@ func (r *Registry) atomicWrite(rel string, data []byte, mode os.FileMode) error 
 		return fmt.Errorf("write temporary file: %w", err)
 	}
 
+	if expectedHash != "" {
+		if editBeforeRenameHook != nil {
+			editBeforeRenameHook()
+		}
+		info, statErr := r.root.Lstat(rel)
+		current, readErr := r.root.ReadFile(rel)
+		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != expectedHash {
+			_ = r.root.Remove(tmp)
+			return fmt.Errorf("file changed since approval: %s", rel)
+		}
+	}
 	if err := r.root.Rename(tmp, rel); err != nil {
 		_ = r.root.Remove(tmp)
 		return fmt.Errorf("replace %s: %w", rel, err)
@@ -446,9 +471,21 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: detail}); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
+	if name == "mcp_call" {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "RunApproved required"})
+		return fmt.Sprintf("Error: tool %q requires approval; use RunApproved", name)
+	}
 	if r.approve == nil {
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "no approver configured"})
 		return fmt.Sprintf("Error: tool %q requires approval, but no approver is configured", name)
+	}
+	var editState *ApprovalState
+	if name == "edit_file" {
+		preview, err := r.PreviewApproval(name, rawArgs)
+		if err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		editState = &preview.State
 	}
 	if !r.approve(name, string(rawArgs)) {
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "denied by approver"})
@@ -457,6 +494,16 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
+	if editState != nil {
+		p, err := parseEditParams(rawArgs)
+		if err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		if _, _, err := r.verifyEditState(p, *editState); err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		ctx = context.WithValue(ctx, editApprovalKey{}, *editState)
+	}
 	return r.execute(ctx, spec, name, rawArgs, hash)
 }
 
@@ -464,6 +511,26 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 // this exact tool call. The audit write is mandatory: if it fails, no token is
 // issued and nothing can execute.
 func (r *Registry) Approve(name string, rawArgs json.RawMessage) (Approval, error) {
+	var state *ApprovalState
+	var previewErr error
+	if name == "edit_file" {
+		preview, err := r.PreviewApproval(name, rawArgs)
+		previewErr = err
+		if err == nil {
+			state = &preview.State
+		}
+	}
+	return r.approveWithState(name, rawArgs, state, previewErr)
+}
+
+// ApprovePreview binds a single-use token to the file state shown in the UI.
+func (r *Registry) ApprovePreview(name string, rawArgs json.RawMessage, state ApprovalState) (Approval, error) {
+	if name != "edit_file" {
+		return Approval{}, fmt.Errorf("preview state is only valid for edit_file")
+	}
+	return r.approveWithState(name, rawArgs, &state, nil)
+}
+func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state *ApprovalState, preflightErr error) (Approval, error) {
 	spec, ok := r.handlers[name]
 	if !ok {
 		return Approval{}, fmt.Errorf("unknown tool %q", name)
@@ -484,7 +551,7 @@ func (r *Registry) Approve(name string, rawArgs json.RawMessage) (Approval, erro
 	token := randomHex(16)
 	r.mu.Lock()
 	r.pruneApprovalsLocked(now)
-	r.pending[token] = pendingApproval{tool: name, argsHash: hash, expires: now.Add(approvalTTL)}
+	r.pending[token] = pendingApproval{state: state, preflightErr: preflightErr, tool: name, argsHash: hash, expires: now.Add(approvalTTL)}
 	r.mu.Unlock()
 
 	return Approval{Token: token, Tool: name, ArgsSHA256: hash}, nil
@@ -504,12 +571,38 @@ func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.Ra
 		return r.execute(ctx, spec, name, rawArgs, hash)
 	}
 
-	if !r.consumeApproval(name, hash, approval) {
+	pending, ok := r.consumeApproval(name, hash, approval)
+	if !ok {
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "invalid or expired approval token"})
 		return "Error: approval token is invalid or expired"
 	}
+
+	if name == "edit_file" {
+		if pending.preflightErr != nil {
+			return r.failedResult(name, hash, pending.preflightErr)
+		}
+		if pending.state == nil {
+			return r.failedResult(name, hash, fmt.Errorf("missing approval state"))
+		}
+		p, err := parseEditParams(rawArgs)
+		if err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		if _, _, err = r.verifyEditState(p, *pending.state); err != nil {
+			return r.failedResult(name, hash, err)
+		}
+		ctx = context.WithValue(ctx, editApprovalKey{}, *pending.state)
+	}
 	return r.execute(ctx, spec, name, rawArgs, hash)
 }
+
+func (r *Registry) failedResult(name, hash string, err error) string {
+	result := fmt.Sprintf("Error: %v", err)
+	_ = r.logEvent(audit.Event{Event: "failed", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))})
+	return result
+}
+
+type editApprovalKey struct{}
 
 func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawArgs json.RawMessage, hash string) string {
 	out, err := spec.Execute(ctx, rawArgs)
@@ -525,19 +618,18 @@ func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawA
 	return result
 }
 
-func (r *Registry) consumeApproval(name, hash string, approval Approval) bool {
+func (r *Registry) consumeApproval(name, hash string, approval Approval) (pendingApproval, bool) {
 	if approval.Token == "" || approval.Tool != name || approval.ArgsSHA256 != hash {
-		return false
+		return pendingApproval{}, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	pending, ok := r.pending[approval.Token]
 	if !ok {
-		return false
+		return pendingApproval{}, false
 	}
 	delete(r.pending, approval.Token)
-	return pending.tool == name && pending.argsHash == hash && !r.now().After(pending.expires)
+	return pending, pending.tool == name && pending.argsHash == hash && !r.now().After(pending.expires)
 }
 
 func (r *Registry) pruneApprovalsLocked(now time.Time) {
@@ -625,6 +717,11 @@ func (r *Registry) registerDefaults() {
 			if err != nil {
 				return "", err
 			}
+			if state, ok := ctx.Value(editApprovalKey{}).(ApprovalState); ok {
+				if state.Path != rel || !state.Exists || hashBytes(contentBytes) != state.Hash {
+					return "", fmt.Errorf("file changed since approval: %s", p.Path)
+				}
+			}
 
 			hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
 			content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
@@ -662,7 +759,7 @@ func (r *Registry) registerDefaults() {
 			if err != nil {
 				return "", err
 			}
-			if err := r.atomicWrite(rel, updatedBytes, info.Mode()); err != nil {
+			if err := r.atomicWriteChecked(rel, updatedBytes, info.Mode(), hashBytes(contentBytes)); err != nil {
 				_ = r.shadow.MarkUndone(entry.ID)
 				return "", err
 			}

@@ -12,11 +12,13 @@ import (
 )
 
 const maxApprovalChars = 1600
+const maxApprovalArgs = 4000
 
 type approvalPreview struct {
 	Summary   string
 	GuardPath string
 	GuardSHA  string
+	State     tools.ApprovalState
 }
 
 func (m *uiModel) approvalStillValid() bool {
@@ -91,6 +93,47 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 	default:
 		return approvalPreview{Summary: clip(sanitizeForDisplay("arguments: "+tc.Function.Arguments), maxApprovalChars)}
 	}
+}
+
+// prepareApprovalPreview refuses to ask for consent if any relevant material
+// would be hidden or sanitized, and records the exact file state shown.
+func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, error) {
+	raw := tc.Function.Arguments
+	if len(raw) > maxApprovalArgs {
+		return approvalPreview{}, fmt.Errorf("arguments are %d bytes, above the %d-byte approval limit; split into smaller edits and retry", len(raw), maxApprovalArgs)
+	}
+	p := buildApprovalPreview(reg, tc)
+	if tc.Function.Name == "edit_file" {
+		preview, err := reg.PreviewApproval(tc.Function.Name, json.RawMessage(raw))
+		if err != nil {
+			return approvalPreview{}, err
+		}
+		if sanitizeForDisplay(preview.Display) != preview.Display {
+			return approvalPreview{}, fmt.Errorf("approval diff contains undisplayable control characters")
+		}
+		p.State = preview.State
+		p.Summary += "\n" + preview.Display
+	} else {
+		if sanitizeForDisplay(raw) != raw {
+			return approvalPreview{}, fmt.Errorf("arguments contain undisplayable control characters")
+		}
+		if tc.Function.Name == "mcp_call" {
+			var a struct {
+				Command string `json:"command"`
+			}
+			if err := json.Unmarshal([]byte(raw), &a); err != nil {
+				return approvalPreview{}, err
+			}
+			if strings.ContainsAny(a.Command, "\n\r\t") || sanitizeForDisplay(a.Command) != a.Command || !strings.Contains(p.Summary, "command: "+a.Command+"\n") {
+				return approvalPreview{}, fmt.Errorf("command cannot be fully displayed for approval")
+			}
+		}
+		p.Summary += "\narguments: " + raw
+	}
+	if len(p.Summary) > maxApprovalArgs {
+		return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; split the request", maxApprovalArgs)
+	}
+	return p, nil
 }
 
 func prefixBlock(text, prefix string) string {

@@ -102,13 +102,19 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.messages = append(m.messages, Message{
 						Role:       "tool",
 						ToolCallID: tc.ID,
-						Content:    "Error: the file changed after the approval preview; re-read it and retry.",
+						Content:    "Error: file changed since approval preview; re-read it and retry.",
 						Display:    "Blocked: file changed after preview",
 					})
 					m.refresh()
 					return m.advance()
 				}
-				approval, err := m.registry.Approve(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+				var approval tools.Approval
+				var err error
+				if tc.Function.Name == "edit_file" {
+					approval, err = m.registry.ApprovePreview(tc.Function.Name, json.RawMessage(tc.Function.Arguments), m.approval.State)
+				} else {
+					approval, err = m.registry.Approve(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+				}
 				if err != nil {
 					m.pendingTools = m.pendingTools[1:]
 					m.approval = approvalPreview{}
@@ -275,8 +281,15 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 		return m, executeToolCmd(m.registry, next, nil)
 	}
 	if m.registry.RequiresApproval(next.Function.Name) {
+		preview, err := prepareApprovalPreview(m.registry, next)
+		if err != nil {
+			m.pendingTools = m.pendingTools[1:]
+			m.messages = append(m.messages, Message{Role: "tool", ToolCallID: next.ID, Content: "Rejected: " + err.Error(), Display: "Rejected " + sanitizeForDisplay(next.Function.Name)})
+			m.refresh()
+			return m.advance()
+		}
 		m.awaitingApproval = true
-		m.approval = buildApprovalPreview(m.registry, next)
+		m.approval = preview
 		m.status = "Approval required [y/n]"
 		m.refresh()
 		return m, nil
