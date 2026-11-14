@@ -320,7 +320,10 @@ func callLLM(reg *tools.Registry, messages []Message) (*Message, error) {
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, truncate(string(data), 300))
 	}
