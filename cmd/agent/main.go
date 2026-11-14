@@ -24,6 +24,7 @@ const (
 	maxIterations     = 10
 	maxLLMToolOutput  = 8000
 	maxUIDisplayChars = 400
+	maxApprovalArgs   = 600
 )
 
 var (
@@ -228,6 +229,7 @@ func (m uiModel) View() string {
 	if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
 		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", tc.Function.Name)) + "\n")
+		b.WriteString(statusStyle.Render(truncate(tc.Function.Arguments, maxApprovalArgs)) + "\n")
 	} else {
 		b.WriteString(m.textInput.View() + "\n")
 	}
