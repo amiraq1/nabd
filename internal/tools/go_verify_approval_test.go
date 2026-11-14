@@ -71,7 +71,7 @@ func TestGoVerifyRunApprovedExecutes(t *testing.T) {
 		t.Fatal("go test executed despite rejection")
 	}
 
-	out = r.RunApproved(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`))
+	out = r.RunApproved(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})
 	if strings.Contains(out, "Error") {
 		t.Fatalf("RunApproved failed: %q", out)
 	}

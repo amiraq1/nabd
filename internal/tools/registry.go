@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go/format"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,7 +119,14 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 }
 
 // RunApproved executes a tool after the caller has already collected consent.
-func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage) string {
+// For edit_file, state must be the ApprovalState from PreviewApproval; the file
+// is re-read and rejected if it changed since that preview.
+func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage, state ApprovalState) string {
+	if name == "edit_file" {
+		if err := r.verifyFileState(rawArgs, state); err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+	}
 	return r.run(ctx, name, rawArgs, true)
 }
 
@@ -172,30 +178,9 @@ func (r *Registry) registerDefaults() {
 				return "", err
 			}
 
-			hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
-			content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
-			oldNorm := strings.ReplaceAll(p.OldText, "\r\n", "\n")
-			newNorm := strings.ReplaceAll(p.NewText, "\r\n", "\n")
-
-			count := strings.Count(content, oldNorm)
-			if count == 0 {
-				return "", fmt.Errorf("old_text not found in %s", p.Path)
-			}
-			if count != 1 {
-				return "", fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
-			}
-
-			updatedBytes := []byte(strings.Replace(content, oldNorm, newNorm, 1))
-
-			if strings.HasSuffix(safePath, ".go") {
-				formatted, err := format.Source(updatedBytes)
-				if err != nil {
-					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
-				}
-				updatedBytes = formatted
-			}
-			if hasCRLF {
-				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
+			updatedBytes, err := applyEdit(contentBytes, p.Path, safePath, p.OldText, p.NewText)
+			if err != nil {
+				return "", err
 			}
 
 			realPath, err := filepath.EvalSymlinks(safePath)

@@ -67,6 +67,9 @@ type ToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	Approval   tools.ApprovalState `json:"-"`
+	Preview    string              `json:"-"`
+	PreviewSet bool                `json:"-"`
 }
 
 type uiModel struct {
@@ -227,18 +230,33 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 	}
 	next := m.pendingTools[0]
 	if m.registry.NeedsApproval(next.Function.Name) {
-		_, hidden := approvalPreview(next.Function.Arguments)
-		if hidden > 0 {
+		preview, err := m.registry.PreviewApproval(next.Function.Name, json.RawMessage(next.Function.Arguments))
+		if err != nil {
 			m.pendingTools = m.pendingTools[1:]
 			m.messages = append(m.messages, Message{
 				Role:       "tool",
 				ToolCallID: next.ID,
-				Content:    fmt.Sprintf("Rejected: arguments are %d bytes, above the %d-byte approval limit (%d bytes not shown). Split this edit into smaller edits and retry.", len(next.Function.Arguments), maxApprovalArgs, hidden),
+				Content:    fmt.Sprintf("Rejected: could not prepare an approval diff: %v", err),
+				Display:    "Rejected " + next.Function.Name,
+			})
+			m.refresh()
+			return m.advance()
+		}
+		if len(next.Function.Arguments) > maxApprovalArgs || len(preview.Display) > maxApprovalArgs {
+			_, hidden := approvalPreview(preview.Display)
+			m.pendingTools = m.pendingTools[1:]
+			m.messages = append(m.messages, Message{
+				Role:       "tool",
+				ToolCallID: next.ID,
+				Content:    fmt.Sprintf("Rejected: arguments are %d bytes and the approval preview is %d bytes, above the %d-byte approval limit (%d bytes not shown). Split this edit into smaller edits and retry.", len(next.Function.Arguments), len(preview.Display), maxApprovalArgs, hidden),
 				Display:    fmt.Sprintf("Rejected %s: %d bytes not shown", next.Function.Name, hidden),
 			})
 			m.refresh()
 			return m.advance()
 		}
+		m.pendingTools[0].Preview = preview.Display
+		m.pendingTools[0].PreviewSet = true
+		m.pendingTools[0].Approval = preview.State
 		m.awaitingApproval = true
 		m.status = "Approval required [y/n]"
 		m.refresh()
@@ -256,7 +274,11 @@ func (m uiModel) View() string {
 	b.WriteString(helpStyle.Render("────────────────────────────────") + "\n")
 	if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
-		preview, hidden := approvalPreview(tc.Function.Arguments)
+		content := tc.Function.Arguments
+		if tc.PreviewSet {
+			content = tc.Preview
+		}
+		preview, hidden := approvalPreview(content)
 		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", tc.Function.Name)) + "\n")
 		b.WriteString(statusStyle.Render(preview) + "\n")
 		if hidden > 0 {
@@ -371,7 +393,7 @@ func callLLM(reg *tools.Registry, messages []Message) (*Message, error) {
 
 func executeToolCmd(reg *tools.Registry, tc ToolCall) tea.Cmd {
 	return func() tea.Msg {
-		result := reg.RunApproved(context.Background(), tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+		result := reg.RunApproved(context.Background(), tc.Function.Name, json.RawMessage(tc.Function.Arguments), tc.Approval)
 		return toolExecutedMsg{
 			toolMsg: Message{
 				Role:       "tool",
