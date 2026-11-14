@@ -183,7 +183,35 @@ func (r *Registry) registerDefaults() {
 				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
 			}
 
-			if err := os.WriteFile(safePath, updatedBytes, 0644); err != nil {
+			realPath, err := filepath.EvalSymlinks(safePath)
+			if err != nil {
+				return "", err
+			}
+			info, err := os.Stat(realPath)
+			if err != nil {
+				return "", err
+			}
+			tmp, err := os.CreateTemp(filepath.Dir(realPath), "."+filepath.Base(realPath)+".tmp-*")
+			if err != nil {
+				return "", err
+			}
+			tmpName := tmp.Name()
+			if _, err := tmp.Write(updatedBytes); err != nil {
+				tmp.Close()
+				os.Remove(tmpName)
+				return "", err
+			}
+			if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+				tmp.Close()
+				os.Remove(tmpName)
+				return "", err
+			}
+			if err := tmp.Close(); err != nil {
+				os.Remove(tmpName)
+				return "", err
+			}
+			if err := os.Rename(tmpName, realPath); err != nil {
+				os.Remove(tmpName)
 				return "", err
 			}
 			return fmt.Sprintf("Successfully updated %s", p.Path), nil
