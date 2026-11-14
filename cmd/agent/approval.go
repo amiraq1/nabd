@@ -160,7 +160,7 @@ func prefixBlock(text, prefix string) string {
 
 // sanitizeForDisplay removes ANSI escape sequences and control characters so
 // model- or file-controlled text cannot repaint the terminal or spoof the
-// approval prompt.
+// approval prompt. Unicode bidirectional controls are rendered visibly.
 func sanitizeForDisplay(s string) string {
 	s = strings.ToValidUTF8(s, "\uFFFD")
 
@@ -186,6 +186,14 @@ func sanitizeForDisplay(s string) string {
 		if c == 0xc2 && i+1 < len(s) && s[i+1] >= 0x80 && s[i+1] <= 0x9f {
 			i += 2
 			continue
+		}
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == '\u061c' || r == '\u200e' || r == '\u200f' || (r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u206f') {
+				fmt.Fprintf(&b, "\\u%04X", r)
+				i += size
+				continue
+			}
 		}
 		b.WriteByte(c)
 		i++
