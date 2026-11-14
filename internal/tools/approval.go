@@ -10,6 +10,7 @@ import (
 	"go/format"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -55,7 +56,7 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 		return ApprovalPreview{}, err
 	}
 
-	state := ApprovalState{Path: p.Path}
+	state := ApprovalState{Path: safePath}
 	content, readErr := os.ReadFile(safePath)
 	if readErr != nil {
 		if errors.Is(readErr, fs.ErrNotExist) {
@@ -76,6 +77,86 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 		return ApprovalPreview{}, err
 	}
 	return ApprovalPreview{Display: unifiedDiff(content, updated, p.Path), State: state}, nil
+}
+
+type editParams struct {
+	Path    string `json:"path"`
+	OldText string `json:"old_text"`
+	NewText string `json:"new_text"`
+}
+
+func parseEditParams(rawArgs json.RawMessage) (editParams, error) {
+	var p editParams
+	if len(rawArgs) > 0 {
+		if err := json.Unmarshal(rawArgs, &p); err != nil {
+			return p, fmt.Errorf("invalid arguments: %w", err)
+		}
+	}
+	if p.OldText == "" {
+		return p, fmt.Errorf("old_text cannot be empty")
+	}
+	return p, nil
+}
+
+// editBeforeRenameHook is a test-only seam; production leaves it nil.
+var editBeforeRenameHook func()
+
+func (r *Registry) writeEdit(safePath string, p editParams, content []byte) (string, error) {
+	updatedBytes, err := applyEdit(content, p.Path, safePath, p.OldText, p.NewText)
+	if err != nil {
+		return "", err
+	}
+	expected := sha256.Sum256(content)
+	expectedHash := hex.EncodeToString(expected[:])
+
+	realPath, err := filepath.EvalSymlinks(safePath)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(realPath), "."+filepath.Base(realPath)+".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(updatedBytes); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", err
+	}
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
+
+	if editBeforeRenameHook != nil {
+		editBeforeRenameHook()
+	}
+
+	current, readErr := os.ReadFile(realPath)
+	if readErr != nil {
+		os.Remove(tmpName)
+		return "", fmt.Errorf("file changed since approval: %s", p.Path)
+	}
+	sum := sha256.Sum256(current)
+	if hex.EncodeToString(sum[:]) != expectedHash {
+		os.Remove(tmpName)
+		return "", fmt.Errorf("file changed since approval: %s", p.Path)
+	}
+
+	if err := os.Rename(tmpName, realPath); err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
+	return fmt.Sprintf("Successfully updated %s", p.Path), nil
 }
 
 // applyEdit performs the in-memory transformation used by both the preview and
@@ -108,36 +189,36 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	return updated, nil
 }
 
-// verifyFileState re-reads the target and compares it with the approved state.
-func (r *Registry) verifyFileState(rawArgs json.RawMessage, state ApprovalState) error {
-	var p struct {
-		Path string `json:"path"`
-	}
-	if len(rawArgs) > 0 {
-		if err := json.Unmarshal(rawArgs, &p); err != nil {
-			return fmt.Errorf("invalid arguments: %w", err)
-		}
-	}
+// verifyEditState re-reads the target once and returns the bytes it hashed.
+// The write path must apply the edit to those bytes instead of reading again.
+func (r *Registry) verifyEditState(p editParams, state ApprovalState) ([]byte, string, error) {
 	safePath, err := r.resolveSafePath(p.Path)
 	if err != nil {
-		return err
+		return nil, "", err
+	}
+	if state.Path == "" {
+		return nil, "", fmt.Errorf("missing approval state")
+	}
+	if state.Path != safePath {
+		return nil, "", fmt.Errorf("file changed since approval: path mismatch")
 	}
 
 	content, readErr := os.ReadFile(safePath)
 	exists := readErr == nil
 	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
-		return readErr
+		return nil, "", readErr
 	}
 	if exists != state.Exists {
-		return fmt.Errorf("file changed since approval: %s", p.Path)
+		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
 	}
-	if exists {
-		sum := sha256.Sum256(content)
-		if hex.EncodeToString(sum[:]) != state.Hash {
-			return fmt.Errorf("file changed since approval: %s", p.Path)
-		}
+	if !exists {
+		return nil, safePath, nil
 	}
-	return nil
+	sum := sha256.Sum256(content)
+	if hex.EncodeToString(sum[:]) != state.Hash {
+		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
+	}
+	return content, safePath, nil
 }
 
 func splitDiffLines(s string) []string {

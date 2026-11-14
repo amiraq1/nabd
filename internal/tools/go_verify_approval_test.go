@@ -64,8 +64,8 @@ func TestGoVerifyRunApprovedExecutes(t *testing.T) {
 
 	r := approvalRegistry(t, dir, func(string, string) bool { return false })
 	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`))
-	if !strings.Contains(out, "rejected by user") {
-		t.Fatalf("Run did not honor the rejecting approver: %q", out)
+	if !strings.Contains(out, "requires approval") {
+		t.Fatalf("Run did not fail closed: %q", out)
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("go test executed despite rejection")

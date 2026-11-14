@@ -101,22 +101,22 @@ func TestEditFileRequiresApprovalWhenNoApprover(t *testing.T) {
 	}
 }
 
-func approvedRegistry(t *testing.T, dir string) *Registry {
+func runEditApproved(t *testing.T, r *Registry, args json.RawMessage) string {
 	t.Helper()
-	r, err := NewRegistry(dir, func(string, string) bool { return true })
+	preview, err := r.PreviewApproval("edit_file", args)
 	if err != nil {
-		t.Fatalf("NewRegistry: %v", err)
+		t.Fatalf("PreviewApproval: %v", err)
 	}
-	return r
+	return r.RunApproved(context.Background(), "edit_file", args, preview.State)
 }
 
 func TestEditFilePreservesCRLFInGoFile(t *testing.T) {
 	dir := t.TempDir()
-	r := approvedRegistry(t, dir)
+	r := mustRegistry(t, dir)
 	p := filepath.Join(dir, "x.go")
 	mustWrite(t, p, "package x\r\n\r\nfunc A() {}\r\n", 0644)
 
-	out := r.Run(context.Background(), "edit_file", json.RawMessage(`{"path":"x.go","old_text":"func A() {}","new_text":"func A() { _ = 1 }"}`))
+	out := runEditApproved(t, r, json.RawMessage(`{"path":"x.go","old_text":"func A() {}","new_text":"func A() { _ = 1 }"}`))
 	if !strings.HasPrefix(out, "Successfully") {
 		t.Fatalf("edit failed: %q", out)
 	}
@@ -135,7 +135,7 @@ func TestEditFilePreservesCRLFInGoFile(t *testing.T) {
 
 func TestEditFileUsesAtomicRename(t *testing.T) {
 	dir := t.TempDir()
-	r := approvedRegistry(t, dir)
+	r := mustRegistry(t, dir)
 	p := filepath.Join(dir, "a.txt")
 	mustWrite(t, p, "old\n", 0600)
 
@@ -143,7 +143,7 @@ func TestEditFileUsesAtomicRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := r.Run(context.Background(), "edit_file", json.RawMessage(`{"path":"a.txt","old_text":"old","new_text":"new"}`))
+	out := runEditApproved(t, r, json.RawMessage(`{"path":"a.txt","old_text":"old","new_text":"new"}`))
 	if !strings.HasPrefix(out, "Successfully") {
 		t.Fatalf("edit failed: %q", out)
 	}
@@ -168,20 +168,19 @@ func TestEditFileUsesAtomicRename(t *testing.T) {
 
 func TestEditFileRejectsAmbiguousAndSyntaxErrors(t *testing.T) {
 	dir := t.TempDir()
-	r := approvedRegistry(t, dir)
+	r := mustRegistry(t, dir)
 
 	p := filepath.Join(dir, "dup.txt")
 	mustWrite(t, p, "x\nx\n", 0644)
-	out := r.Run(context.Background(), "edit_file", json.RawMessage(`{"path":"dup.txt","old_text":"x","new_text":"y"}`))
-	if !strings.Contains(out, "Error") {
-		t.Fatalf("ambiguous match was not rejected: %q", out)
+	if _, err := r.PreviewApproval("edit_file", json.RawMessage(`{"path":"dup.txt","old_text":"x","new_text":"y"}`)); err == nil {
+		t.Fatal("ambiguous match was not rejected")
 	}
 
 	g := filepath.Join(dir, "bad.go")
 	mustWrite(t, g, "package bad\n", 0644)
-	out = r.Run(context.Background(), "edit_file", json.RawMessage(`{"path":"bad.go","old_text":"package bad","new_text":"package bad\nfunc {"}`))
-	if !strings.Contains(out, "syntax") {
-		t.Fatalf("invalid Go was not rejected: %q", out)
+	_, err := r.PreviewApproval("edit_file", json.RawMessage(`{"path":"bad.go","old_text":"package bad","new_text":"package bad\nfunc {"}`))
+	if err == nil || !strings.Contains(err.Error(), "syntax") {
+		t.Fatalf("invalid Go was not rejected: %v", err)
 	}
 	got, err := os.ReadFile(g)
 	if err != nil {
@@ -212,8 +211,8 @@ func TestGoVerifyReceivesMemoryLimits(t *testing.T) {
 	t.Setenv("NABD_PROBE_OUT", outFile)
 	fakeGo(t, `printf '%s|%s' "$GOMEMLIMIT" "$GOGC" > "$NABD_PROBE_OUT"`)
 
-	r := approvedRegistry(t, dir)
-	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`))
+	r := mustRegistry(t, dir)
+	out := r.RunApproved(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})
 	got, err := os.ReadFile(outFile)
 	if err != nil {
 		t.Fatalf("probe not written (tool output %q): %v", out, err)
@@ -224,8 +223,8 @@ func TestGoVerifyReceivesMemoryLimits(t *testing.T) {
 }
 
 func TestGoVerifyRejectsFlagLikePkg(t *testing.T) {
-	r := approvedRegistry(t, t.TempDir())
-	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":"-exec=sh"}`))
+	r := mustRegistry(t, t.TempDir())
+	out := r.RunApproved(context.Background(), "go_verify", json.RawMessage(`{"pkg":"-exec=sh"}`), ApprovalState{})
 	if !strings.Contains(out, "flags are not allowed") {
 		t.Fatalf("flag injection was not rejected: %q", out)
 	}
@@ -236,8 +235,8 @@ func TestGoVerifyRejectsMalformedJSON(t *testing.T) {
 	mustWrite(t, filepath.Join(dir, "go.mod"), "module probe\n\ngo 1.22\n", 0644)
 	mustWrite(t, filepath.Join(dir, "probe_test.go"), "package probe\n\nimport \"testing\"\n\nfunc TestP(t *testing.T) {}\n", 0644)
 
-	r := approvedRegistry(t, dir)
-	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":`))
+	r := mustRegistry(t, dir)
+	out := r.RunApproved(context.Background(), "go_verify", json.RawMessage(`{"pkg":`), ApprovalState{})
 	if !strings.Contains(out, "Error") {
 		t.Fatalf("malformed arguments ran the tool instead of failing: %q", out)
 	}
@@ -249,10 +248,10 @@ func TestGoVerifyTimeoutKillsChildProcesses(t *testing.T) {
 	t.Setenv("NABD_PROBE_OUT", marker)
 	fakeGo(t, `( sleep 2; printf alive > "$NABD_PROBE_OUT" ) &`+"\nwait")
 
-	r := approvedRegistry(t, dir)
+	r := mustRegistry(t, dir)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	out := r.Run(ctx, "go_verify", json.RawMessage(`{"pkg":"./..."}`))
+	out := r.RunApproved(ctx, "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})
 	if !strings.Contains(out, "Error") {
 		t.Fatalf("expected a timeout error, got %q", out)
 	}

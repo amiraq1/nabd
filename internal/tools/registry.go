@@ -28,11 +28,13 @@ type ToolSpec struct {
 
 type Registry struct {
 	workDir  string
-	approve  ApprovalFunc
 	handlers map[string]ToolSpec
 }
 
+// NewRegistry builds a registry. approve is retained for source compatibility;
+// Run is fail-closed and confirmation tools only execute through RunApproved.
 func NewRegistry(workDir string, approve ApprovalFunc) (*Registry, error) {
+	_ = approve
 	absRoot, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, err
@@ -42,7 +44,6 @@ func NewRegistry(workDir string, approve ApprovalFunc) (*Registry, error) {
 	}
 	r := &Registry{
 		workDir:  absRoot,
-		approve:  approve,
 		handlers: make(map[string]ToolSpec),
 	}
 	r.registerDefaults()
@@ -123,9 +124,22 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 // is re-read and rejected if it changed since that preview.
 func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage, state ApprovalState) string {
 	if name == "edit_file" {
-		if err := r.verifyFileState(rawArgs, state); err != nil {
+		p, err := parseEditParams(rawArgs)
+		if err != nil {
 			return fmt.Sprintf("Error: %v", err)
 		}
+		content, safePath, err := r.verifyEditState(p, state)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		if content == nil {
+			return fmt.Sprintf("Error: file does not exist: %s", p.Path)
+		}
+		out, err := r.writeEdit(safePath, p, content)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		return truncateOutput(out)
 	}
 	return r.run(ctx, name, rawArgs, true)
 }
@@ -136,12 +150,7 @@ func (r *Registry) run(ctx context.Context, name string, rawArgs json.RawMessage
 		return fmt.Sprintf("Error: unknown tool %q", name)
 	}
 	if spec.NeedsConfirm && !approved {
-		if r.approve == nil {
-			return fmt.Sprintf("Error: tool %q requires approval and no approver is configured", name)
-		}
-		if !r.approve(name, string(rawArgs)) {
-			return "Action rejected by user."
-		}
+		return fmt.Sprintf("Error: tool %q requires approval; use RunApproved", name)
 	}
 	out, err := spec.Execute(ctx, rawArgs)
 	if err != nil {
@@ -157,16 +166,9 @@ func (r *Registry) registerDefaults() {
 		NeedsConfirm: true,
 		Parameters:   json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"old_text":{"type":"string","description":"Exact existing block to replace"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
-			var p struct {
-				Path    string `json:"path"`
-				OldText string `json:"old_text"`
-				NewText string `json:"new_text"`
-			}
-			if err := json.Unmarshal(args, &p); err != nil {
+			p, err := parseEditParams(args)
+			if err != nil {
 				return "", err
-			}
-			if p.OldText == "" {
-				return "", fmt.Errorf("old_text cannot be empty")
 			}
 
 			safePath, err := r.resolveSafePath(p.Path)
@@ -178,43 +180,7 @@ func (r *Registry) registerDefaults() {
 				return "", err
 			}
 
-			updatedBytes, err := applyEdit(contentBytes, p.Path, safePath, p.OldText, p.NewText)
-			if err != nil {
-				return "", err
-			}
-
-			realPath, err := filepath.EvalSymlinks(safePath)
-			if err != nil {
-				return "", err
-			}
-			info, err := os.Stat(realPath)
-			if err != nil {
-				return "", err
-			}
-			tmp, err := os.CreateTemp(filepath.Dir(realPath), "."+filepath.Base(realPath)+".tmp-*")
-			if err != nil {
-				return "", err
-			}
-			tmpName := tmp.Name()
-			if _, err := tmp.Write(updatedBytes); err != nil {
-				tmp.Close()
-				os.Remove(tmpName)
-				return "", err
-			}
-			if err := tmp.Chmod(info.Mode().Perm()); err != nil {
-				tmp.Close()
-				os.Remove(tmpName)
-				return "", err
-			}
-			if err := tmp.Close(); err != nil {
-				os.Remove(tmpName)
-				return "", err
-			}
-			if err := os.Rename(tmpName, realPath); err != nil {
-				os.Remove(tmpName)
-				return "", err
-			}
-			return fmt.Sprintf("Successfully updated %s", p.Path), nil
+			return r.writeEdit(safePath, p, contentBytes)
 		},
 	}
 
