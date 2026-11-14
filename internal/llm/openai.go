@@ -197,12 +197,28 @@ func parseResponse(data []byte) (*Response, error) {
 	if msg.Role == "" {
 		msg.Role = "assistant"
 	}
+	if msg.Role != "assistant" {
+		return nil, fmt.Errorf("response message role must be assistant")
+	}
+	ids := make(map[string]struct{}, len(msg.ToolCalls))
 	for i := range msg.ToolCalls {
-		if msg.ToolCalls[i].ID == "" {
-			msg.ToolCalls[i].ID = newCallID(i)
+		call := &msg.ToolCalls[i]
+		if call.ID == "" {
+			call.ID = newCallID(i)
 		}
-		if msg.ToolCalls[i].Type == "" {
-			msg.ToolCalls[i].Type = "function"
+		if _, exists := ids[call.ID]; exists {
+			return nil, fmt.Errorf("response contains duplicate tool call IDs")
+		}
+		ids[call.ID] = struct{}{}
+		if call.Type == "" {
+			call.Type = "function"
+		}
+		if call.Type != "function" || strings.TrimSpace(call.Function.Name) == "" {
+			return nil, fmt.Errorf("response contains invalid tool call")
+		}
+		var args map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || args == nil {
+			return nil, fmt.Errorf("tool call arguments must be a JSON object")
 		}
 	}
 	return &Response{Message: msg, FinishReason: choice.FinishReason, Usage: result.Usage}, nil
