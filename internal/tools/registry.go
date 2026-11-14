@@ -25,6 +25,7 @@ import (
 const (
 	maxOutputBytes       = 4096
 	maxReadBytes         = 512 << 10
+	maxReadPageBytes     = 3584
 	maxEditBytes         = 2 << 20
 	maxListEntries       = 1000
 	maxListScan          = 4096
@@ -321,6 +322,79 @@ func (r *Registry) readFile(rel string) (string, error) {
 		out += fmt.Sprintf("\n...[truncated at %d bytes]", maxReadBytes)
 	}
 	return out, nil
+}
+
+// readFilePage bounds both raw input and encoded output so the continuation
+// marker survives the registry's output cap, even with invalid UTF-8 bytes.
+func (r *Registry) readFilePage(rel string, offset, limit int64, structured bool) (string, error) {
+	if offset < 0 {
+		return "", fmt.Errorf("offset must be non-negative")
+	}
+	if limit < 1 || limit > maxReadPageBytes {
+		return "", fmt.Errorf("limit must be between 1 and %d", maxReadPageBytes)
+	}
+	f, err := openRegularSingleLink(r.root, rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit+utf8.UTFMax))
+	if err != nil {
+		return "", err
+	}
+	if err := ensureNoHardLinks(f); err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	consumed, encodedBytes := 0, 0
+	for consumed < len(data) {
+		r, size := utf8.DecodeRune(data[consumed:])
+		encodedSize := utf8.RuneLen(r)
+		if structured {
+			encoded, err := json.Marshal(string(r))
+			if err != nil {
+				return "", err
+			}
+			encodedSize = len(encoded) - 2 // exclude the JSON string quotes
+		}
+		budget := maxReadPageBytes
+		if structured {
+			budget = maxOutputBytes - 128
+		} // reserve object and offset metadata
+		if consumed > 0 && (int64(consumed+size) > limit || encodedBytes+encodedSize > budget) {
+			break
+		}
+		out.WriteRune(r)
+		encodedBytes += encodedSize
+		consumed += size
+	}
+	more := consumed < len(data)
+	if structured {
+		page := struct {
+			Content    string `json:"content"`
+			Truncated  bool   `json:"truncated"`
+			NextOffset *int64 `json:"next_offset,omitempty"`
+		}{Content: out.String(), Truncated: more}
+		if more {
+			next := offset + int64(consumed)
+			page.NextOffset = &next
+		}
+		encoded, err := json.Marshal(page)
+		if err != nil {
+			return "", err
+		}
+		if len(encoded) > maxOutputBytes {
+			return "", fmt.Errorf("structured page exceeds output limit")
+		}
+		return string(encoded), nil
+	}
+	if more {
+		fmt.Fprintf(&out, "\n...[truncated; continue at byte offset %d]", offset+int64(consumed))
+	}
+	return out.String(), nil
 }
 
 func (r *Registry) listDir(rel string) (string, error) {
@@ -816,12 +890,15 @@ func (r *Registry) registerDefaults() {
 
 	r.handlers["read_file"] = ToolSpec{
 		Name:        "read_file",
-		Description: "Read the contents of a file inside the workspace.",
+		Description: "Read a bounded UTF-8-safe byte range inside the workspace; follow the continuation offset when truncated.",
 		ReadOnly:    true,
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"offset":{"type":"integer","minimum":0,"description":"Zero-based byte offset, default 0"},"limit":{"type":"integer","minimum":1,"maximum":3584,"description":"Maximum input bytes per page, default 3584; a first UTF-8 rune may extend this by up to 3 bytes"},"format":{"type":"string","enum":["text","json"],"description":"text by default; json returns content, truncated, and next_offset"}},"required":["path"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
-				Path string `json:"path"`
+				Path   string `json:"path"`
+				Offset int64  `json:"offset"`
+				Limit  *int64 `json:"limit"`
+				Format string `json:"format"`
 			}
 			if err := json.Unmarshal(args, &p); err != nil {
 				return "", err
@@ -830,7 +907,14 @@ func (r *Registry) registerDefaults() {
 			if err != nil {
 				return "", err
 			}
-			return r.readFile(rel)
+			limit := int64(maxReadPageBytes)
+			if p.Limit != nil {
+				limit = *p.Limit
+			}
+			if p.Format != "" && p.Format != "text" && p.Format != "json" {
+				return "", fmt.Errorf("format must be text or json")
+			}
+			return r.readFilePage(rel, p.Offset, limit, p.Format == "json")
 		},
 	}
 

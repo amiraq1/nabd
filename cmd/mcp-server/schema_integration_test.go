@@ -69,8 +69,10 @@ func TestIntegrationMCPListsActualInputSchemas(t *testing.T) {
 	}
 	for _, tool := range result.Tools {
 		if tool.Name == "read_file" {
-			if _, ok := tool.InputSchema.Properties["path"]; !ok {
-				t.Fatal("read_file path schema missing")
+			for _, name := range []string{"path", "offset", "limit", "format"} {
+				if _, ok := tool.InputSchema.Properties[name]; !ok {
+					t.Errorf("read_file schema missing %s", name)
+				}
 			}
 			return
 		}
