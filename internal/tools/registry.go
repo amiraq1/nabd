@@ -239,7 +239,11 @@ func (r *Registry) registerDefaults() {
 			var p struct {
 				Pkg string `json:"pkg"`
 			}
-			_ = json.Unmarshal(args, &p)
+			if len(args) > 0 {
+				if err := json.Unmarshal(args, &p); err != nil {
+					return "", fmt.Errorf("invalid arguments: %w", err)
+				}
+			}
 			pkg := strings.TrimSpace(p.Pkg)
 			if pkg == "" {
 				pkg = "./..."
@@ -311,7 +315,11 @@ func (r *Registry) registerDefaults() {
 			var p struct {
 				Path string `json:"path"`
 			}
-			_ = json.Unmarshal(args, &p)
+			if len(args) > 0 {
+				if err := json.Unmarshal(args, &p); err != nil {
+					return "", fmt.Errorf("invalid arguments: %w", err)
+				}
+			}
 			if strings.TrimSpace(p.Path) == "" {
 				p.Path = "."
 			}
