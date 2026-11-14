@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -18,11 +19,15 @@ import (
 )
 
 const (
-	baseDir    = ".nabd/shadow"
-	metaSuffix = ".json"
-	backupExt  = ".bak"
-	maxPerPath = 20
-	retention  = 7 * 24 * time.Hour
+	baseDir          = ".nabd/shadow"
+	metaSuffix       = ".json"
+	backupExt        = ".bak"
+	maxPerPath       = 20
+	retention        = 7 * 24 * time.Hour
+	maxBackupBytes   = 2 << 20
+	maxMetadataBytes = 16 << 10
+	maxTotalBytes    = 128 << 20
+	maxStoreEntries  = 10000
 )
 
 // ErrNotFound reports that no usable shadow entry exists for the request.
@@ -76,6 +81,24 @@ func (s *Store) Backup(relPath string, original []byte, mode os.FileMode, update
 		CreatedAt:    now,
 	}
 
+	if len(original) > maxBackupBytes {
+		return Entry{}, fmt.Errorf("shadow: backup too large")
+	}
+	meta, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return Entry{}, fmt.Errorf("shadow: encode metadata: %w", err)
+	}
+	if len(meta) > maxMetadataBytes {
+		return Entry{}, fmt.Errorf("shadow: metadata too large")
+	}
+	used, err := s.diskUsageLocked()
+	if err != nil {
+		return Entry{}, err
+	}
+	if used+int64(len(original))+int64(len(meta)) > maxTotalBytes {
+		return Entry{}, fmt.Errorf("shadow: total backup quota exceeded")
+	}
+
 	if err := s.writeNewLocked(backupName(entry.ID), original); err != nil {
 		_ = s.root.Remove(backupName(entry.ID))
 		return Entry{}, fmt.Errorf("shadow: write backup: %w", err)
@@ -122,7 +145,7 @@ func (s *Store) Latest(relPath string) (Entry, []byte, error) {
 	})
 
 	entry := matches[0]
-	data, err := s.root.ReadFile(backupName(entry.ID))
+	data, err := s.readLimited(backupName(entry.ID), maxBackupBytes)
 	if err != nil {
 		return Entry{}, nil, fmt.Errorf("shadow: read backup %s: %w", entry.ID, err)
 	}
@@ -183,27 +206,94 @@ func (s *Store) listLocked() ([]Entry, error) {
 	}
 	defer f.Close()
 
-	dirEntries, err := f.ReadDir(-1)
-	if err != nil {
-		return nil, fmt.Errorf("shadow: read directory: %w", err)
-	}
-
 	var entries []Entry
-	for _, dirEntry := range dirEntries {
-		if dirEntry.IsDir() || !strings.HasSuffix(dirEntry.Name(), metaSuffix) {
-			continue
+	count := 0
+	for {
+		dirEntries, readErr := f.ReadDir(128)
+		for _, dirEntry := range dirEntries {
+			count++
+			if count > maxStoreEntries {
+				return nil, fmt.Errorf("shadow: directory scan entry limit exceeded")
+			}
+			if dirEntry.IsDir() || !strings.HasSuffix(dirEntry.Name(), metaSuffix) {
+				continue
+			}
+			entry, err := s.readMetaLocked(strings.TrimSuffix(dirEntry.Name(), metaSuffix))
+			if err == nil {
+				entries = append(entries, entry)
+			}
 		}
-		entry, err := s.readMetaLocked(strings.TrimSuffix(dirEntry.Name(), metaSuffix))
-		if err != nil {
-			continue
+		if readErr == io.EOF {
+			break
 		}
-		entries = append(entries, entry)
+		if readErr != nil {
+			return nil, fmt.Errorf("shadow: read directory: %w", readErr)
+		}
+		if len(dirEntries) == 0 {
+			break
+		}
 	}
 	return entries, nil
 }
 
+// diskUsageLocked includes orphaned files and fails closed on unexpected types.
+// The mutex protects writers in this Store; other processes are not coordinated.
+func (s *Store) diskUsageLocked() (int64, error) {
+	f, err := s.root.Open(baseDir)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var total int64
+	count := 0
+	for {
+		entries, readErr := f.ReadDir(128)
+		for _, entry := range entries {
+			count++
+			if count > maxStoreEntries {
+				return 0, fmt.Errorf("shadow: quota scan entry limit exceeded")
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return 0, err
+			}
+			if !info.Mode().IsRegular() {
+				return 0, fmt.Errorf("shadow: unexpected non-regular store entry")
+			}
+			total += info.Size()
+			if total > maxTotalBytes {
+				return 0, fmt.Errorf("shadow: total backup quota exceeded")
+			}
+		}
+		if readErr == io.EOF {
+			return total, nil
+		}
+		if readErr != nil {
+			return 0, readErr
+		}
+		if len(entries) == 0 {
+			return total, nil
+		}
+	}
+}
+func (s *Store) readLimited(name string, limit int64) ([]byte, error) {
+	f, err := s.root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("shadow: file too large: %s", name)
+	}
+	return data, nil
+}
+
 func (s *Store) readMetaLocked(id string) (Entry, error) {
-	data, err := s.root.ReadFile(metaName(id))
+	data, err := s.readLimited(metaName(id), maxMetadataBytes)
 	if err != nil {
 		return Entry{}, fmt.Errorf("shadow: read metadata: %w", err)
 	}

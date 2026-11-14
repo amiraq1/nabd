@@ -65,7 +65,7 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 			return ApprovalPreview{}, fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
 		}
 	}
-	content, readErr := r.root.ReadFile(safePath)
+	content, readErr := readBounded(r.root, safePath, maxEditBytes)
 	if readErr != nil {
 		if errors.Is(readErr, fs.ErrNotExist) {
 			return ApprovalPreview{
@@ -136,6 +136,9 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	if hasCRLF {
 		updated = bytes.ReplaceAll(updated, []byte("\n"), []byte("\r\n"))
 	}
+	if len(updated) > maxEditBytes {
+		return nil, fmt.Errorf("edited file too large (limit %d bytes)", maxEditBytes)
+	}
 	return updated, nil
 }
 
@@ -158,9 +161,9 @@ func (r *Registry) verifyEditState(p editParams, state ApprovalState) ([]byte, s
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, "", fmt.Errorf("editing symlinks is not supported: %s", p.Path)
 	}
-	content, err := r.root.ReadFile(safePath)
+	content, err := readBounded(r.root, safePath, maxEditBytes)
 	if err != nil {
-		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
+		return nil, "", fmt.Errorf("file changed since approval: %s: %w", p.Path, err)
 	}
 	if !state.Exists || hashBytes(content) != state.Hash {
 		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)

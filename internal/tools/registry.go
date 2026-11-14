@@ -28,10 +28,12 @@ import (
 )
 
 const (
-	maxOutputBytes = 4096
-	maxReadBytes   = 512 << 10
-	maxEditBytes   = 2 << 20
-	maxListEntries = 1000
+	maxOutputBytes       = 4096
+	maxReadBytes         = 512 << 10
+	maxEditBytes         = 2 << 20
+	maxListEntries       = 1000
+	maxListScan          = 4096
+	maxVerifyOutputBytes = 64 << 10
 )
 
 type ApprovalFunc func(toolName, summary string) bool
@@ -273,9 +275,17 @@ func (r *Registry) FileDigest(relPath string) (string, error) {
 	}
 	defer f.Close()
 
+	return digestBounded(f, maxEditBytes)
+}
+
+func digestBounded(reader io.Reader, limit int64) (string, error) {
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	n, err := io.Copy(h, io.LimitReader(reader, limit+1))
+	if err != nil {
 		return "", err
+	}
+	if n > limit {
+		return "", fmt.Errorf("file too large for digest (limit %d bytes)", limit)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -316,9 +326,24 @@ func (r *Registry) listDir(rel string) (string, error) {
 	}
 	defer f.Close()
 
-	entries, err := f.ReadDir(-1)
-	if err != nil {
-		return "", err
+	entries := make([]os.DirEntry, 0, maxListScan)
+	more := false
+	for len(entries) <= maxListScan {
+		batch, readErr := f.ReadDir(min(128, maxListScan+1-len(entries)))
+		entries = append(entries, batch...)
+		if readErr != nil && readErr != io.EOF {
+			return "", readErr
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if len(batch) == 0 {
+			break
+		}
+	}
+	if len(entries) > maxListScan {
+		more = true
+		entries = entries[:maxListScan]
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
@@ -340,7 +365,10 @@ func (r *Registry) listDir(rel string) (string, error) {
 		shown++
 	}
 	if hidden > 0 {
-		b.WriteString(fmt.Sprintf("... [%d more entries]\n", hidden))
+		b.WriteString(fmt.Sprintf("... [%d more entries in scanned portion]\n", hidden))
+	}
+	if more {
+		b.WriteString("... [directory scan limit reached; more entries exist]\n")
 	}
 	return b.String(), nil
 }
@@ -376,7 +404,7 @@ func (r *Registry) Undo(relPath string) (string, error) {
 		return "", fmt.Errorf("refusing to undo a symlink: %s", entry.Path)
 	}
 
-	current, err := r.root.ReadFile(currentPath)
+	current, err := readBounded(r.root, currentPath, maxEditBytes)
 	if err != nil {
 		return "", err
 	}
@@ -425,7 +453,7 @@ func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode,
 			editBeforeRenameHook()
 		}
 		info, statErr := r.root.Lstat(rel)
-		current, readErr := r.root.ReadFile(rel)
+		current, readErr := readBounded(r.root, rel, maxEditBytes)
 		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != expectedHash {
 			_ = r.root.Remove(tmp)
 			return fmt.Errorf("file changed since approval: %s", rel)
@@ -713,7 +741,7 @@ func (r *Registry) registerDefaults() {
 				return "", fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
 			}
 
-			contentBytes, err := r.root.ReadFile(rel)
+			contentBytes, err := readBounded(r.root, rel, maxEditBytes)
 			if err != nil {
 				return "", err
 			}
@@ -751,12 +779,22 @@ func (r *Registry) registerDefaults() {
 			if hasCRLF {
 				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
 			}
+			if len(updatedBytes) > maxEditBytes {
+				return "", fmt.Errorf("edited file too large (limit %d bytes)", maxEditBytes)
+			}
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			if bytes.Equal(updatedBytes, contentBytes) {
 				return "", fmt.Errorf("edit would not change %s", p.Path)
 			}
 
 			entry, err := r.shadow.Backup(rel, contentBytes, info.Mode(), updatedBytes)
 			if err != nil {
+				return "", err
+			}
+			if err := ctx.Err(); err != nil {
+				_ = r.shadow.MarkUndone(entry.ID)
 				return "", err
 			}
 			if err := r.atomicWriteChecked(rel, updatedBytes, info.Mode(), hashBytes(contentBytes)); err != nil {
@@ -925,9 +963,9 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	cmd.WaitDelay = 2 * time.Second
 	configureProcessTree(cmd)
 
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out := newBoundedOutput(maxVerifyOutputBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
 	err := cmd.Run()
 
 	status := "PASS"
@@ -936,6 +974,8 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	}
 	if tCtx.Err() == context.DeadlineExceeded {
 		status = "FAIL (timeout)"
+	} else if tCtx.Err() == context.Canceled {
+		status = "CANCELLED (context canceled)"
 	}
 	if err != nil && !isGoTestFailure(tCtx, err) {
 		return "", err
