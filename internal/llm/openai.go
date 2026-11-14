@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	mrand "math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -51,7 +53,7 @@ func NewOpenAIClient(cfg Config) *OpenAIClient {
 	}
 	return &OpenAIClient{
 		cfg:         cfg,
-		httpClient:  &http.Client{Timeout: cfg.Timeout},
+		httpClient:  &http.Client{Timeout: cfg.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		sleep:       sleepContext,
 		backoffBase: 500 * time.Millisecond,
 	}
@@ -61,6 +63,9 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 
+	if err := validateBaseURL(c.cfg.BaseURL); err != nil {
+		return nil, err
+	}
 	body, err := c.encode(req)
 	if err != nil {
 		return nil, err
@@ -97,6 +102,25 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 		wait = retryAfter
 	}
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// validateBaseURL avoids sending credentials over insecure remote connections.
+func validateBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid model base URL")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback()) {
+			return nil
+		}
+	}
+	return fmt.Errorf("model base URL must use HTTPS or local loopback HTTP")
 }
 
 func (c *OpenAIClient) encode(req Request) ([]byte, error) {

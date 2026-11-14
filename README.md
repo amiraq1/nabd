@@ -12,6 +12,8 @@
 - **Audit log**: سجل append-only في `.nabd/audit.log` بحداثات SHA-256 فقط، بلا محتوى ملفات.
 - **LLM client**: واجهة `llm.Client` قابلة للاختبار، تنفيذ OpenAI-compatible، retries، ومهلة كلية وإلغاء فوري عند Ctrl+C.
 
+تُقبل عناوين مزوّد النموذج عبر HTTPS، أو HTTP على localhost وعناوين loopback فقط. لا يتبع العميل إعادة التوجيه، لتجنب إرسال بيانات الاعتماد إلى وجهة أخرى.
+
 ## البنية
 
 - `cmd/agent`: واجهة TUI وحلقة الوكيل.
