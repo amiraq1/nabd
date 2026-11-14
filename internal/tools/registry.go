@@ -262,6 +262,8 @@ func (r *Registry) registerDefaults() {
 			defer cancel()
 
 			cmd := exec.CommandContext(tCtx, "go", "test", "-p", "2", "-vet=all", pkg)
+			prepareProcess(cmd)
+			cmd.WaitDelay = 5 * time.Second
 			cmd.Dir = r.workDir
 			env := append(os.Environ(),
 				"GOMEMLIMIT=512MiB",
