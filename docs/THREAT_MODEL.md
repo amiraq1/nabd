@@ -56,13 +56,14 @@
 - **go_verify محكوم**: بيئة allowlist بلا مفاتيح أو proxy، `GOFLAGS=-mod=readonly`, `GOPROXY=off`, `GOTOOLCHAIN=local`، أنماط حزم workspace-relative، مهلة 90s تقتل شجرة العمليات، ونتيجة منظمة. (اختبارات: `TestGoVerifyEnvAllowlist`, `TestValidatePkgPattern`, `TestGoVerifyTimeout`, `TestProcessGroupKill` على Unix.)
 - **LLM مضبوط**: إعداد من البيئة فقط، مهلة كلية، إلغاء عند Ctrl+C، retry محدود على 429/5xx/الشبكة فقط، وميزانية سياق تقديرية مع trim واعٍ للأزواج. (اختبارات: `TestAgentCancelsRequestOnCtrlC`, `TestChatRetriesOn429And5xx`, `TestChatDoesNotRetry400`, `TestTrimHistoryKeepsToolPairs`.)
 - **واجهة مقاومة للتزوير**: إزالة ANSI/C0/C1 قبل العرض، clamp للطرفية، وخروج عند non-TTY. (اختبارات: `TestSanitizeForDisplay`, `TestApprovalPreviewSanitizesANSIText`, `TestTinyWindowDoesNotPanic`, `TestEnsureInteractiveRejectsNonTTY`.)
+- **حماية MCP الخارجي**: الحارس المطلوب بجانب الوكيل يحجب `setsid` و`setpgid` على Linux/Android المدعومين، وتُحجب البيئة إلا قائمة محددة ويُحد النقل الوارد بـ1MiB. هذه ليست عزلة ملفات أو شبكة. (اختبارات: `TestF24RealMCPCallAndEnvironment`, `TestF24SeccompBlocksSetsid`, `TestF24SeccompBlocksSetpgid`, `TestF24WireLimit`.)
 - **mcp-server للقراءة فقط**: يرفض الأدوات غير read-only لغياب approver، و`mcp_call` معطّل. (اختبار: `TestServerIsReadOnlyAndDisablesMCPCall`.)
 
 ## 6. ما لا يضمنه النظام
 
 - **لا sandbox**: `go_verify` و`mcp_call` ينفّذان كوداً/عمليات بصلاحيات المستخدم. الموافقة خطوة بشرية، وليست عزلاً.
 - **شبكة كود الاختبار**: `GOPROXY=off` يمنع تنزيل وحدات Go فقط؛ كود الاختبار يستطيع فتح sockets مباشرة.
-- **`mcp_call`**: يشغّل binary موجوداً على النظام؛ لا allowlist ولا احتواء، و`cmd` لا يستقبل وسائط. الـpreview يعرض الأمر لكنه لا يمنع الضرر.
+- **`mcp_call`**: يشغّل binary بصلاحيات المستخدم، بلا sandbox للملفات أو الشبكة؛ `command` لا يدعم وسائط. seccomp يمنع syscallين فقط، ولا يضمن منع كل الانفصالات أو الهجمات عبر namespaces أو خدمات خارجية. لا يعتمد على `NABD_MCP_GUARD` لاستبدال الحارس.
 - **تسريب المحتوى إلى LLM**: `read_file` ومخرجات الأدوات تُرسل إلى endpoint الـLLM. إذا كان بعيداً، فمحتوى ملفات المشروع يخرج من الجهاز.
 - **سياسة الأسرار بالأسماء فقط**: سر داخل `config.yaml` أو ملف غير مطابق للأنماط يمكن قراءته.
 - **سلامة سجل التدقيق**: append-only بالبناء، لكنه ليس tamper-evident؛ مستخدم محلي يستطيع حذف/تفريغ `.nabd/audit.log`. لا hash chain ولا تدوير بعد.

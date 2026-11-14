@@ -16,6 +16,7 @@
 
 - `cmd/agent`: واجهة TUI وحلقة الوكيل.
 - `cmd/mcp-server`: خادم MCP للقراءة فقط (لا approver).
+- `cmd/mcp-guard`: حارس seccomp المطلوب لتشغيل MCP الخارجي.
 - `internal/tools`: سجل الأدوات، الـjail، الموافقات، والتدقيق.
 - `internal/shadow`: نسخ ما قبل التعديل والاحتفاظ.
 - `internal/audit`: كتابة JSONL للتدقيق.
@@ -31,6 +32,7 @@ cd nabd
 go mod download
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $PREFIX/bin/nabdcoder ./cmd/agent
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $PREFIX/bin/nabd-mcp ./cmd/mcp-server
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $PREFIX/bin/nabd-mcp-guard ./cmd/mcp-guard
 nabdcoder
 ```
 
@@ -62,7 +64,8 @@ nabdcoder
 - **Gate**: preview + diff + hashes، وtoken أحادي الاستخدام مربوط بالأداة و`args_sha256`، صلاحيته 5 دقائق. لا يمكن استدعاء `RunApproved` بدونه.
 - **Audit**: أحداث `requested`/`approved`/`denied`/`applied`/`failed` مع hashes؛ الكتابة إلزامية للأدوات الكاتبة/المنفذة، وbest-effort للقراءة.
 - **go_verify**: بيئة allowlist بلا مفاتيح، `GOFLAGS=-mod=readonly`، `GOPROXY=off`، `GOTOOLCHAIN=local`، وأنماط حزم workspace-relative فقط.
-- **mcp-server**: للقراءة فقط؛ يرفض الأدوات غير read-only لغياب approver، و`mcp_call` معطّل فيه.
+- **mcp-server**: للقراءة فقط؛ يرفض الأدوات غير read-only لغياب approver، و`mcp_call` غير معروض ولا ينفّذ.
+- **mcp_call**: موافقة أولاً، ثم تشغيل عبر `nabd-mcp-guard` الموجود بجانب الوكيل؛ عند غيابه أو فشل تثبيت seccomp يُرفض التنفيذ. الحارس يدعم Linux/Android على amd64 وarm64 فقط ويحجب `setsid` و`setpgid`؛ لذلك قد يفشل خادم يحتاجهما. لا يدعم `NABD_MCP_GUARD` لتغيير الحارس. البيئة قائمة سماح، ومهلة الاستدعاء 60 ثانية، والحد الإجمالي للبيانات الواردة عبر النقل 1MiB؛ يُقتطع النص المعروض عند 8192 بايت قبل الحد النهائي للوكيل.
 - **CLI/TUI**: `process-group kill` على Unix/Termux، و`taskkill /T` كأفضل جهد على Windows.
 
 راجع [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) لما يضمنه النظام وما لا يضمنه.
@@ -81,10 +84,11 @@ staticcheck ./...
 ## القيود والمخاطر المعروفة
 
 - حدود الحجم: قراءة 512KiB، تعديل ونسخته الاحتياطية 2MiB، وسجل `go_verify` يحتفظ بـ64KiB من بدايته ونهايته. تُعرض حتى 1000 نتيجة من أول 4096 مدخلاً مفحوصاً من المجلد، مع تنبيه عند بلوغ حد المسح؛ الترتيب يخص الجزء المفحوص فقط.
-- Shadow: آخر 20 نسخة لكل مسار أو 7 أيام، وحصة إجمالية 128MiB لمحتويات مخزن النسخ. فحص الحصة يحسب الملفات المتروكة، لكنه لا ينسّق مع عمليات Nabd أخرى أو الكتابة الخارجية المتزامنة. الكتابة الذرّية عبر rename تفصل hard links.
+- Shadow: آخر 20 نسخة لكل مسار أو 7 أيام، وفحص حصة 128MiB قبل إضافة نسخة احتياطية. يشمل الفحص الملفات المتروكة، لكنه لا ينسّق مع عمليات Nabd الأخرى أو الكتابة الخارجية المتزامنة، ولا يمثل ضماناً صارماً لاستخدام القرص في كل اللحظات. الكتابة الذرّية عبر rename تفصل hard links.
 - Audit log append-only لكنه ليس tamper-evident، وينمو بلا تدوير حالياً.
 - `mcp_call` و`go_verify` يشغّلان كوداً بصلاحيات المستخدم بلا sandbox؛ كود الاختبار يستطيع استخدام الشبكة رغم `GOPROXY=off`.
-- `mcp_call` لم يُدمج معه F-24: العملية قد ترث البيئة، ولا يوجد حد للرد عند النقل أو ضمان لتنظيف الأحفاد المنفصلين، والعميل الحالي لا ينفّذ تهيئة MCP قبل الاستدعاء. لا تستخدمه حتى يُعالج ذلك.
+- الحارس ليس sandbox: لا يقيّد وصول MCP للشبكة أو الملفات أو تشغيل برامج أخرى، ولا يمنع كل طرق إنشاء عمليات منفصلة أو الهروب عبر أنظمة خارجية. لم تُختبر هجمات namespaces، ولا تعتمد عليه لاحتواء برنامج خبيث.
+- تُقتل مجموعة MCP قبل إعادة حصاد عملية الحارس على Linux/Android؛ تنظيف عمليات انفصلت بطرق لم يغلقها الفلتر غير مضمون. لا دعم لـ`mcp_call` خارج المنصات المذكورة. لم يُتحقق من هذا التغيير على Termux فعلياً.
 - `read_file` يرسل محتوى الملفات إلى endpoint الـLLM؛ سياسة الأسرار مبنية على الأسماء لا على المحتوى.
 - `go_verify` و`mcp_call` يحتاجان موافقة، لكن الموافقة ليست عزلاً.
 - Windows: قتل الشجرة best-effort، والصلاحيات approximated.

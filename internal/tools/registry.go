@@ -22,9 +22,6 @@ import (
 
 	"github.com/amiraq1/nabd/internal/audit"
 	shadowstore "github.com/amiraq1/nabd/internal/shadow"
-	"github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
-	"github.com/mark3labs/mcp-go/mcp"
 )
 
 const (
@@ -884,37 +881,7 @@ func (r *Registry) registerDefaults() {
 				return "", fmt.Errorf("command and tool are required")
 			}
 
-			tCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			defer cancel()
-
-			stdioTransport := transport.NewStdio(p.Command, nil)
-			c := client.NewClient(stdioTransport)
-			if err := c.Start(tCtx); err != nil {
-				return "", fmt.Errorf("failed to start MCP server: %w", err)
-			}
-			defer c.Close()
-
-			result, err := c.CallTool(tCtx, mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name:      p.Tool,
-					Arguments: p.Arguments,
-				},
-			})
-			if err != nil {
-				return "", fmt.Errorf("mcp call failed: %w", err)
-			}
-
-			var out strings.Builder
-			for _, content := range result.Content {
-				if tc, ok := content.(mcp.TextContent); ok {
-					out.WriteString(tc.Text)
-					out.WriteString("\n")
-				}
-			}
-			if out.Len() == 0 {
-				return "(no text content returned)", nil
-			}
-			return out.String(), nil
+			return callExternalMCP(ctx, r.workDir, p.Command, p.Tool, p.Arguments)
 		},
 	}
 }
