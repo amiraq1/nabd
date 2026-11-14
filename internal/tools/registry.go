@@ -236,7 +236,7 @@ func (r *Registry) registerDefaults() {
 	r.handlers["go_verify"] = ToolSpec{
 		Name:         "go_verify",
 		Description:  "Run go test and go vet with Termux-safe memory limits.",
-		NeedsConfirm: false,
+		NeedsConfirm: true,
 		Parameters:   json.RawMessage(`{"type":"object","properties":{"pkg":{"type":"string","description":"Package pattern, default ./..."}}}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
