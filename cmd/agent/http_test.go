@@ -21,7 +21,7 @@ func TestCallLLMReportsTruncatedBody(t *testing.T) {
 	baseURL = srv.URL
 	defer func() { baseURL = old }()
 
-	reg, err := tools.NewRegistry(t.TempDir(), nil)
+	reg, err := tools.NewRegistry(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

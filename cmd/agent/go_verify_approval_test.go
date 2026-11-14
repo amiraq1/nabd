@@ -8,7 +8,7 @@ import (
 )
 
 func TestGoVerifyApprovalShowsPackage(t *testing.T) {
-	reg, err := tools.NewRegistry(t.TempDir(), nil)
+	reg, err := tools.NewRegistry(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

@@ -10,7 +10,7 @@ import (
 
 func testModel(t *testing.T) uiModel {
 	t.Helper()
-	reg, err := tools.NewRegistry(t.TempDir(), nil)
+	reg, err := tools.NewRegistry(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

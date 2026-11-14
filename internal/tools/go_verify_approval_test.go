@@ -10,9 +10,9 @@ import (
 	"testing"
 )
 
-func approvalRegistry(t *testing.T, dir string, approve ApprovalFunc) *Registry {
+func approvalRegistry(t *testing.T, dir string) *Registry {
 	t.Helper()
-	r, err := NewRegistry(dir, approve)
+	r, err := NewRegistry(dir)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -34,7 +34,7 @@ func installProbeGo(t *testing.T, script string) {
 }
 
 func TestGoVerifyNeedsApproval(t *testing.T) {
-	r := approvalRegistry(t, t.TempDir(), nil)
+	r := approvalRegistry(t, t.TempDir())
 	if !r.NeedsApproval("go_verify") {
 		t.Fatal("go_verify must require approval")
 	}
@@ -46,7 +46,7 @@ func TestGoVerifyRunWithoutApprovalDoesNotExecute(t *testing.T) {
 	t.Setenv("NABD_PROBE_OUT", marker)
 	installProbeGo(t, `printf ran > "$NABD_PROBE_OUT"`)
 
-	r := approvalRegistry(t, dir, nil)
+	r := approvalRegistry(t, dir)
 	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`))
 	if !strings.Contains(out, "requires approval") {
 		t.Fatalf("unexpected output: %q", out)
@@ -62,7 +62,7 @@ func TestGoVerifyRunApprovedExecutes(t *testing.T) {
 	t.Setenv("NABD_PROBE_OUT", marker)
 	installProbeGo(t, `printf ran > "$NABD_PROBE_OUT"`)
 
-	r := approvalRegistry(t, dir, func(string, string) bool { return false })
+	r := approvalRegistry(t, dir)
 	out := r.Run(context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`))
 	if !strings.Contains(out, "requires approval") {
 		t.Fatalf("Run did not fail closed: %q", out)

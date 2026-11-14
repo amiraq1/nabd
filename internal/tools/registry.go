@@ -16,8 +16,6 @@ import (
 
 const maxOutputBytes = 4096
 
-type ApprovalFunc func(toolName, summary string) bool
-
 type ToolSpec struct {
 	Name         string
 	Description  string
@@ -31,10 +29,9 @@ type Registry struct {
 	handlers map[string]ToolSpec
 }
 
-// NewRegistry builds a registry. approve is retained for source compatibility;
-// Run is fail-closed and confirmation tools only execute through RunApproved.
-func NewRegistry(workDir string, approve ApprovalFunc) (*Registry, error) {
-	_ = approve
+// NewRegistry builds a registry. Run is fail-closed; confirmation tools only
+// execute through RunApproved.
+func NewRegistry(workDir string) (*Registry, error) {
 	absRoot, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, err

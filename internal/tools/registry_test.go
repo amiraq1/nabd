@@ -20,7 +20,7 @@ func newTestRegistry(t *testing.T) (*Registry, string) {
 
 func mustRegistry(t *testing.T, dir string) *Registry {
 	t.Helper()
-	r, err := NewRegistry(dir, nil)
+	r, err := NewRegistry(dir)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

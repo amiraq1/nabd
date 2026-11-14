@@ -3,7 +3,7 @@ package tools
 import "testing"
 
 func TestResolveSafePathRejectsNULByte(t *testing.T) {
-	r, err := NewRegistry(t.TempDir(), nil)
+	r, err := NewRegistry(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

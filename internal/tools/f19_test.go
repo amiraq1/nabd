@@ -80,11 +80,11 @@ func TestF19PathMismatchRejected(t *testing.T) {
 	}
 }
 
-func TestF19RunWithApproverDoesNotWrite(t *testing.T) {
+func TestF19RunDoesNotWrite(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "a.txt")
 	mustWrite(t, target, "old\n", 0600)
-	r, err := NewRegistry(dir, func(string, string) bool { return true })
+	r, err := NewRegistry(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

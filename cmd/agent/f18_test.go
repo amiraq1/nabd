@@ -14,7 +14,7 @@ import (
 
 func f18Model(t *testing.T, dir string) uiModel {
 	t.Helper()
-	reg, err := tools.NewRegistry(dir, nil)
+	reg, err := tools.NewRegistry(dir)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

@@ -443,7 +443,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	reg, err := tools.NewRegistry(cwd, nil)
+	reg, err := tools.NewRegistry(cwd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to init tools: %v\n", err)
 		os.Exit(1)
