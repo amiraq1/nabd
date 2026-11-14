@@ -171,7 +171,22 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case llmResponseMsg:
 		m.messages = append(m.messages, msg.assistantMsg)
 		m.iteration++
-		if len(msg.assistantMsg.ToolCalls) == 0 || m.iteration >= maxIterations {
+		if len(msg.assistantMsg.ToolCalls) == 0 {
+			m.busy = false
+			m.status = "Ready"
+			m.refresh()
+			return m, nil
+		}
+		if m.iteration >= maxIterations {
+			for _, tc := range msg.assistantMsg.ToolCalls {
+				m.messages = append(m.messages, Message{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    "Rejected: iteration limit reached.",
+					Display:    "Rejected " + tc.Function.Name,
+				})
+			}
+			m.pendingTools = nil
 			m.busy = false
 			m.status = "Ready"
 			m.refresh()
