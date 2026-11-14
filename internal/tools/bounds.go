@@ -54,9 +54,44 @@ func (b *boundedOutput) String() string {
 	return string(b.head) + fmt.Sprintf("\n... [%d bytes omitted] ...\n", omitted) + string(b.tail)
 }
 
+// openRegularSingleLink checks before and after a nonblocking open on Unix.
+// Checking the descriptor is essential because the path may change after Stat.
+func openRegularSingleLink(root *os.Root, path string) (*os.File, error) {
+	return openRegularSingleLinkWith(root, path, openWorkspaceFile)
+}
+
+// The opener is injectable so tests can exercise a replacement between Stat and Open.
+func openRegularSingleLinkWith(root *os.Root, path string, open func(*os.Root, string) (*os.File, error)) (*os.File, error) {
+	info, err := root.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing non-regular file: %s", path)
+	}
+	f, err := open(root, path)
+	if err != nil {
+		return nil, err
+	}
+	info, err = f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("refusing non-regular file: %s", path)
+	}
+	if err = ensureNoHardLinks(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 // readBounded enforces the limit while reading, even when a file grows after stat.
 func readBounded(root *os.Root, path string, limit int64) ([]byte, error) {
-	f, err := root.Open(path)
+	f, err := openRegularSingleLink(root, path)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +102,9 @@ func readBounded(root *os.Root, path string, limit int64) ([]byte, error) {
 	}
 	if int64(len(data)) > limit {
 		return nil, fmt.Errorf("file too large (limit %d bytes): %s", limit, path)
+	}
+	if err := ensureNoHardLinks(f); err != nil {
+		return nil, err
 	}
 	return data, nil
 }

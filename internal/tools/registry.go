@@ -266,13 +266,20 @@ func (r *Registry) FileDigest(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	f, err := r.root.Open(rel)
+	f, err := openRegularSingleLink(r.root, rel)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
-	return digestBounded(f, maxEditBytes)
+	digest, err := digestBounded(f, maxEditBytes)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureNoHardLinks(f); err != nil {
+		return "", err
+	}
+	return digest, nil
 }
 
 func digestBounded(reader io.Reader, limit int64) (string, error) {
@@ -288,14 +295,7 @@ func digestBounded(reader io.Reader, limit int64) (string, error) {
 }
 
 func (r *Registry) readFile(rel string) (string, error) {
-	info, err := r.root.Stat(rel)
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("%s is a directory", rel)
-	}
-	f, err := r.root.Open(rel)
+	f, err := openRegularSingleLink(r.root, rel)
 	if err != nil {
 		return "", err
 	}
@@ -303,6 +303,9 @@ func (r *Registry) readFile(rel string) (string, error) {
 
 	data, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
 	if err != nil {
+		return "", err
+	}
+	if err := ensureNoHardLinks(f); err != nil {
 		return "", err
 	}
 	truncated := len(data) > maxReadBytes
@@ -317,11 +320,25 @@ func (r *Registry) readFile(rel string) (string, error) {
 }
 
 func (r *Registry) listDir(rel string) (string, error) {
-	f, err := r.root.Open(rel)
+	info, err := r.root.Stat(rel)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", rel)
+	}
+	f, err := openWorkspaceFile(r.root, rel)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", rel)
+	}
 
 	entries := make([]os.DirEntry, 0, maxListScan)
 	more := false
