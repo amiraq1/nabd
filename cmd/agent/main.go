@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/amiraq1/nabd/internal/tools"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -367,7 +368,11 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	cut := s[:n]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "..."
 }
 
 func max(a, b int) int {
