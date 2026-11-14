@@ -25,7 +25,7 @@ const (
 	maxIterations     = 10
 	maxLLMToolOutput  = 8000
 	maxUIDisplayChars = 400
-	maxApprovalArgs   = 600
+	maxApprovalArgs   = 4000
 )
 
 var (
@@ -227,6 +227,18 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 	}
 	next := m.pendingTools[0]
 	if m.registry.NeedsApproval(next.Function.Name) {
+		_, hidden := approvalPreview(next.Function.Arguments)
+		if hidden > 0 {
+			m.pendingTools = m.pendingTools[1:]
+			m.messages = append(m.messages, Message{
+				Role:       "tool",
+				ToolCallID: next.ID,
+				Content:    fmt.Sprintf("Rejected: arguments are %d bytes, above the %d-byte approval limit (%d bytes not shown). Split this edit into smaller edits and retry.", len(next.Function.Arguments), maxApprovalArgs, hidden),
+				Display:    fmt.Sprintf("Rejected %s: %d bytes not shown", next.Function.Name, hidden),
+			})
+			m.refresh()
+			return m.advance()
+		}
 		m.awaitingApproval = true
 		m.status = "Approval required [y/n]"
 		m.refresh()
@@ -244,8 +256,12 @@ func (m uiModel) View() string {
 	b.WriteString(helpStyle.Render("────────────────────────────────") + "\n")
 	if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
+		preview, hidden := approvalPreview(tc.Function.Arguments)
 		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", tc.Function.Name)) + "\n")
-		b.WriteString(statusStyle.Render(truncate(tc.Function.Arguments, maxApprovalArgs)) + "\n")
+		b.WriteString(statusStyle.Render(preview) + "\n")
+		if hidden > 0 {
+			b.WriteString(approvalStyle.Render(fmt.Sprintf("%d bytes not shown — this edit exceeds the approval limit and will be rejected", hidden)) + "\n")
+		}
 	} else {
 		b.WriteString(m.textInput.View() + "\n")
 	}
@@ -365,6 +381,17 @@ func executeToolCmd(reg *tools.Registry, tc ToolCall) tea.Cmd {
 			},
 		}
 	}
+}
+
+func approvalPreview(args string) (string, int) {
+	if len(args) <= maxApprovalArgs {
+		return args, 0
+	}
+	cut := maxApprovalArgs
+	for cut > 0 && !utf8.RuneStart(args[cut]) {
+		cut--
+	}
+	return args[:cut], len(args) - cut
 }
 
 func truncate(s string, n int) string {
