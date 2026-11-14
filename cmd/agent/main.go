@@ -334,7 +334,7 @@ func callLLM(reg *tools.Registry, messages []Message) (*Message, error) {
 
 func executeToolCmd(reg *tools.Registry, tc ToolCall) tea.Cmd {
 	return func() tea.Msg {
-		result := reg.Run(context.Background(), tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+		result := reg.RunApproved(context.Background(), tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 		return toolExecutedMsg{
 			toolMsg: Message{
 				Role:       "tool",

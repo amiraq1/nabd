@@ -113,11 +113,23 @@ func (r *Registry) resolveSafePath(relPath string) (string, error) {
 }
 
 func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage) string {
+	return r.run(ctx, name, rawArgs, false)
+}
+
+// RunApproved executes a tool after the caller has already collected consent.
+func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage) string {
+	return r.run(ctx, name, rawArgs, true)
+}
+
+func (r *Registry) run(ctx context.Context, name string, rawArgs json.RawMessage, approved bool) string {
 	spec, ok := r.handlers[name]
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", name)
 	}
-	if spec.NeedsConfirm && r.approve != nil {
+	if spec.NeedsConfirm && !approved {
+		if r.approve == nil {
+			return fmt.Sprintf("Error: tool %q requires approval and no approver is configured", name)
+		}
 		if !r.approve(name, string(rawArgs)) {
 			return "Action rejected by user."
 		}
