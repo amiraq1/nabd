@@ -28,11 +28,17 @@ import (
 )
 
 const (
-	maxOutputBytes = 4096
-	maxReadBytes   = 512 << 10
-	maxEditBytes   = 2 << 20
-	maxListEntries = 1000
+	maxOutputBytes       = 4096
+	maxReadBytes         = 3584
+	maxEditBytes         = 2 << 20
+	maxListEntries       = 1000
+	maxVerifyOutputBytes = 1 << 20
 )
+
+// fileMutationMu serializes edit/undo transactions across Registry instances.
+// It is process-local; external writers are detected by inode and digest checks,
+// but cannot be locked out atomically on all supported platforms.
+var fileMutationMu sync.Mutex
 
 type ApprovalFunc func(toolName, summary string) bool
 
@@ -55,14 +61,20 @@ type Registry struct {
 	approve  ApprovalFunc
 	handlers map[string]ToolSpec
 	mu       sync.Mutex
-	pending  map[string]pendingApproval
-	now      func() time.Time
+	// beforeAtomicReplace is an internal test seam for deterministic race tests.
+	beforeAtomicReplace func()
+	pending             map[string]pendingApproval
+	now                 func() time.Time
 }
 
 type pendingApproval struct {
-	tool     string
-	argsHash string
-	expires  time.Time
+	tool       string
+	argsHash   string
+	basePath   string
+	baseSHA256 string
+	baseFile   os.FileInfo
+	baseFD     *os.File
+	expires    time.Time
 }
 
 // Approval is a single-use token proving that the UI obtained an explicit
@@ -71,6 +83,8 @@ type Approval struct {
 	Token      string
 	Tool       string
 	ArgsSHA256 string
+	BasePath   string
+	BaseSHA256 string
 }
 
 const approvalTTL = 5 * time.Minute
@@ -116,6 +130,14 @@ func (r *Registry) Close() error {
 	if r.root == nil {
 		return nil
 	}
+	r.mu.Lock()
+	for token, pending := range r.pending {
+		if pending.baseFD != nil {
+			_ = pending.baseFD.Close()
+		}
+		delete(r.pending, token)
+	}
+	r.mu.Unlock()
 	err := r.root.Close()
 	r.root = nil
 	return err
@@ -248,6 +270,34 @@ func isSensitivePath(rel string) bool {
 	return false
 }
 
+func (r *Registry) openSingleLinkFile(rel string) (*os.File, error) {
+	preInfo, err := r.root.Stat(rel)
+	if err != nil {
+		return nil, err
+	}
+	if !preInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing non-regular file %s", rel)
+	}
+	f, err := openWorkspaceFile(r.root, rel)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("refusing non-regular file %s", rel)
+	}
+	if err := ensureNoHardLinks(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 // FileDigest returns the SHA-256 of a file inside the workspace. The approval
 // UI uses it to confirm that the file did not change between the preview and
 // the approved edit.
@@ -256,46 +306,284 @@ func (r *Registry) FileDigest(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	f, err := r.root.Open(rel)
+	f, err := r.openSingleLinkFile(rel)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("refusing non-regular file %s", rel)
+	}
+	if info.Size() > maxEditBytes {
+		return "", fmt.Errorf("file is too large to fingerprint (%d bytes; limit %d)", info.Size(), maxEditBytes)
+	}
 
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	n, err := io.Copy(h, io.LimitReader(f, maxEditBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if n > maxEditBytes {
+		return "", fmt.Errorf("file is too large to fingerprint (limit %d bytes)", maxEditBytes)
+	}
+	if err := ensureNoHardLinks(f); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func (r *Registry) readFile(rel string) (string, error) {
-	info, err := r.root.Stat(rel)
+// PreviewEdit returns the exact base bytes and final bytes that edit_file
+// would use, including Go formatting and preserved CRLF line endings.
+func (r *Registry) PreviewEdit(path, oldText, newText string) (string, []byte, []byte, error) {
+	rel, err := r.resolveSafePath(path)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	content, _, err := r.readEditableFile(rel)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	updated, err := prepareEdit(rel, content, oldText, newText)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return hashBytes(content), content, updated, nil
+}
+
+func (r *Registry) readEditableFile(rel string) ([]byte, os.FileMode, error) {
+	f, content, mode, err := r.openEditableFile(rel)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, 0, err
+	}
+	return content, mode, nil
+}
+
+// openEditableFile keeps the approved inode open through the eventual rename.
+// The caller must close the returned descriptor after its final identity and
+// digest checks.
+func (r *Registry) openEditableFile(rel string) (*os.File, []byte, os.FileMode, error) {
+	info, err := r.root.Lstat(rel)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, nil, 0, fmt.Errorf("editing symlinks is not supported: %s", rel)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, 0, fmt.Errorf("refusing non-regular file %s", rel)
+	}
+	if info.Size() > maxEditBytes {
+		return nil, nil, 0, fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
+	}
+
+	f, err := r.openSingleLinkFile(rel)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	openedInfo, statErr := f.Stat()
+	var content []byte
+	var readErr error
+	if statErr == nil {
+		if !openedInfo.Mode().IsRegular() {
+			statErr = fmt.Errorf("refusing non-regular file %s", rel)
+		} else if !os.SameFile(info, openedInfo) {
+			statErr = fmt.Errorf("file changed while opening %s; re-read it and retry", rel)
+		} else if openedInfo.Size() > maxEditBytes {
+			statErr = fmt.Errorf("file is too large to edit (%d bytes; limit %d)", openedInfo.Size(), maxEditBytes)
+		} else {
+			content, readErr = io.ReadAll(io.LimitReader(f, maxEditBytes+1))
+			if readErr == nil && int64(len(content)) > maxEditBytes {
+				readErr = fmt.Errorf("file is too large to edit (limit %d bytes)", maxEditBytes)
+			}
+		}
+	}
+	linkErr := ensureNoHardLinks(f)
+	identityErr := r.checkOpenFilePath(rel, f)
+	if err := errors.Join(statErr, readErr, linkErr, identityErr); err != nil {
+		_ = f.Close()
+		return nil, nil, 0, err
+	}
+	return f, content, openedInfo.Mode(), nil
+}
+
+func (r *Registry) checkOpenFilePath(rel string, f *os.File) error {
+	openedInfo, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	pathInfo, err := r.root.Lstat(rel)
+	if err != nil {
+		return fmt.Errorf("file changed after approval; re-read it and retry: %w", err)
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !os.SameFile(openedInfo, pathInfo) {
+		return fmt.Errorf("file changed after approval; re-read it and retry")
+	}
+	if err := ensureNoHardLinks(f); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Registry) verifyApprovedFile(rel string, f *os.File, expectedSHA string) error {
+	if err := r.checkOpenFilePath(rel, f); err != nil {
+		return err
+	}
+	digest, err := digestOpenFile(f)
+	if err != nil {
+		return err
+	}
+	if digest != expectedSHA {
+		return fmt.Errorf("file changed after approval; re-read it and retry")
+	}
+	return nil
+}
+
+func digestOpenFile(f *os.File) (string, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxEditBytes {
+		return "", fmt.Errorf("refusing to fingerprint a non-regular or oversized file")
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, io.NewSectionReader(f, 0, info.Size()))
+	if err != nil {
+		return "", err
+	}
+	if n != info.Size() {
+		return "", fmt.Errorf("file changed while fingerprinting")
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (r *Registry) editableSnapshot(rel string) (*os.File, string, os.FileInfo, error) {
+	f, content, _, err := r.openEditableFile(rel)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	digest := hashBytes(content)
+	if err := r.verifyApprovedFile(rel, f, digest); err != nil {
+		_ = f.Close()
+		return nil, "", nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, "", nil, err
+	}
+	return f, digest, info, nil
+}
+
+func prepareEdit(rel string, contentBytes []byte, oldText, newText string) ([]byte, error) {
+	if oldText == "" {
+		return nil, fmt.Errorf("old_text cannot be empty")
+	}
+	if oldText == newText {
+		return nil, fmt.Errorf("old_text and new_text are identical")
+	}
+
+	hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
+	content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
+	oldNorm := strings.ReplaceAll(oldText, "\r\n", "\n")
+	newNorm := strings.ReplaceAll(newText, "\r\n", "\n")
+	if oldNorm == newNorm {
+		return nil, fmt.Errorf("old_text and new_text are identical after line-ending normalization")
+	}
+
+	count := strings.Count(content, oldNorm)
+	if count == 0 {
+		return nil, fmt.Errorf("old_text not found in %s", rel)
+	}
+	if count != 1 {
+		return nil, fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
+	}
+
+	updatedBytes := []byte(strings.Replace(content, oldNorm, newNorm, 1))
+	if strings.HasSuffix(rel, ".go") {
+		formatted, err := format.Source(updatedBytes)
+		if err != nil {
+			return nil, fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
+		}
+		updatedBytes = formatted
+	}
+	if hasCRLF {
+		updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
+	}
+	if bytes.Equal(updatedBytes, contentBytes) {
+		return nil, fmt.Errorf("edit would not change %s", rel)
+	}
+	return updatedBytes, nil
+}
+
+func (r *Registry) readFile(rel string, offset, limit int64) (string, error) {
+	if offset < 0 || limit < 0 {
+		return "", fmt.Errorf("offset and limit must be non-negative")
+	}
+	if limit == 0 || limit > maxReadBytes {
+		limit = maxReadBytes
+	}
+	f, err := r.openSingleLinkFile(rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return "", err
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("%s is a directory", rel)
 	}
-	f, err := r.root.Open(rel)
-	if err != nil {
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return "", err
 	}
-	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, limit+utf8.UTFMax))
 	if err != nil {
 		return "", err
 	}
-	truncated := len(data) > maxReadBytes
-	if truncated {
-		data = data[:maxReadBytes]
+	data, truncated := completeUTF8Page(data, limit)
+	if err := ensureNoHardLinks(f); err != nil {
+		return "", err
 	}
-	out := string(data)
+	out := strings.ToValidUTF8(string(data), "\uFFFD")
 	if truncated {
-		out += fmt.Sprintf("\n...[truncated at %d bytes]", maxReadBytes)
+		out += fmt.Sprintf("\n...[truncated; continue at byte offset %d]", offset+int64(len(data)))
 	}
 	return out, nil
+}
+
+func completeUTF8Page(data []byte, limit int64) ([]byte, bool) {
+	end := int(limit)
+	if end > len(data) {
+		end = len(data)
+	}
+	if end < len(data) && end > 0 && !utf8.RuneStart(data[end]) {
+		start := end
+		for start > 0 && !utf8.RuneStart(data[start]) {
+			start--
+		}
+		if start == 0 && utf8.FullRune(data) {
+			_, runeSize := utf8.DecodeRune(data)
+			if runeSize > end {
+				end = runeSize
+			} else {
+				end = start
+			}
+		} else {
+			end = start
+		}
+	}
+	truncated := len(data) > end
+	return data[:end], truncated
 }
 
 func (r *Registry) listDir(rel string) (string, error) {
@@ -338,6 +626,9 @@ func (r *Registry) listDir(rel string) (string, error) {
 // most recent entry overall when relPath is empty). It refuses if the file
 // changed since the edit or if the shadow copy is corrupted.
 func (r *Registry) Undo(relPath string) (string, error) {
+	fileMutationMu.Lock()
+	defer fileMutationMu.Unlock()
+
 	var target string
 	if strings.TrimSpace(relPath) != "" {
 		var err error
@@ -365,9 +656,20 @@ func (r *Registry) Undo(relPath string) (string, error) {
 		return "", fmt.Errorf("refusing to undo a symlink: %s", entry.Path)
 	}
 
-	current, err := r.root.ReadFile(currentPath)
+	f, err := r.openSingleLinkFile(currentPath)
 	if err != nil {
 		return "", err
+	}
+	defer f.Close()
+	if err := r.checkOpenFilePath(currentPath, f); err != nil {
+		return "", err
+	}
+	current, readErr := io.ReadAll(io.LimitReader(f, maxEditBytes+1))
+	if readErr != nil {
+		return "", readErr
+	}
+	if int64(len(current)) > maxEditBytes {
+		return "", fmt.Errorf("refusing undo: %s is too large to restore safely", entry.Path)
 	}
 	currentHash := hashBytes(current)
 	if currentHash != entry.SHA256After {
@@ -378,15 +680,16 @@ func (r *Registry) Undo(relPath string) (string, error) {
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path}); err != nil {
 		return "", err
 	}
-	if err := r.atomicWrite(currentPath, backup, os.FileMode(entry.Mode)); err != nil {
+	if err := r.atomicWriteExpected(currentPath, backup, os.FileMode(entry.Mode), f, currentHash, nil, nil); err != nil {
 		_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path})
 		return "", err
 	}
+	resultHash := entry.SHA256Before
+	auditErr := r.auditLog.RecordApplied(audit.Event{Event: "applied", Tool: "undo", ArgsSHA256: currentHash, ResultSHA256: resultHash, Detail: entry.Path})
 	if err := r.shadow.MarkUndone(entry.ID); err != nil {
-		return "", fmt.Errorf("restored %s but could not update shadow metadata: %w", entry.Path, err)
+		return "", fmt.Errorf("restored %s but could not update shadow metadata: %w%s", entry.Path, err, auditWarning(auditErr))
 	}
-	_ = r.logEvent(audit.Event{Event: "applied", Tool: "undo", ArgsSHA256: currentHash, ResultSHA256: entry.SHA256Before, Detail: entry.Path})
-	return fmt.Sprintf("Restored %s from shadow %s", entry.Path, entry.ID), nil
+	return fmt.Sprintf("Restored %s from shadow %s%s", entry.Path, entry.ID, auditWarning(auditErr)), nil
 }
 
 // atomicWrite writes data to a temporary file in the target directory, syncs
@@ -408,6 +711,44 @@ func (r *Registry) atomicWrite(rel string, data []byte, mode os.FileMode) error 
 
 	if err := r.root.Rename(tmp, rel); err != nil {
 		_ = r.root.Remove(tmp)
+		return fmt.Errorf("replace %s: %w", rel, err)
+	}
+	return nil
+}
+
+// atomicWriteExpected stages and syncs the replacement, then verifies that
+// rel still names the same open inode with the approved bytes immediately
+// before rename. The optional callback creates a shadow backup between two
+// checks so failed validation cannot leave an active backup for the wrong file.
+func (r *Registry) atomicWriteExpected(rel string, data []byte, mode os.FileMode, source *os.File, expectedSHA string, beforeReplace func(), beforeRename func() error) error {
+	tmp := filepath.Join(filepath.Dir(rel), ".nabd-tmp-"+randomHex(8))
+	f, err := r.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+	defer func() { _ = r.root.Remove(tmp) }()
+
+	_, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+	if beforeReplace != nil {
+		beforeReplace()
+	}
+	if err := r.verifyApprovedFile(rel, source, expectedSHA); err != nil {
+		return err
+	}
+	if beforeRename != nil {
+		if err := beforeRename(); err != nil {
+			return err
+		}
+	}
+	if err := r.verifyApprovedFile(rel, source, expectedSHA); err != nil {
+		return err
+	}
+	if err := r.root.Rename(tmp, rel); err != nil {
 		return fmt.Errorf("replace %s: %w", rel, err)
 	}
 	return nil
@@ -450,12 +791,42 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "no approver configured"})
 		return fmt.Sprintf("Error: tool %q requires approval, but no approver is configured", name)
 	}
+	var guard approvedBase
+	if name == "edit_file" {
+		var p struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(rawArgs, &p); err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		rel, err := r.resolveSafePath(p.Path)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		baseFD, baseSHA, baseFile, err := r.editableSnapshot(rel)
+		if err != nil {
+			return fmt.Sprintf("Error: cannot obtain edit base fingerprint: %v", err)
+		}
+		defer baseFD.Close()
+		guard = approvedBase{path: rel, sha256: baseSHA, file: baseFile}
+	}
 	if !r.approve(name, string(rawArgs)) {
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "denied by approver"})
 		return "Action rejected by user."
 	}
 	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if guard.sha256 != "" {
+		currentFD, current, currentFile, err := r.editableSnapshot(guard.path)
+		if currentFD != nil {
+			defer currentFD.Close()
+		}
+		if err != nil || current != guard.sha256 || !os.SameFile(guard.file, currentFile) {
+			_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "file changed during approval"})
+			return "Error: file changed during approval; re-read it and retry"
+		}
+		ctx = context.WithValue(ctx, approvalBaseContextKey{}, guard)
 	}
 	return r.execute(ctx, spec, name, rawArgs, hash)
 }
@@ -464,6 +835,64 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 // this exact tool call. The audit write is mandatory: if it fails, no token is
 // issued and nothing can execute.
 func (r *Registry) Approve(name string, rawArgs json.RawMessage) (Approval, error) {
+	spec, ok := r.handlers[name]
+	if !ok {
+		return Approval{}, fmt.Errorf("unknown tool %q", name)
+	}
+	if spec.ReadOnly {
+		return Approval{}, fmt.Errorf("tool %q does not require approval", name)
+	}
+	if name == "edit_file" {
+		var p struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(rawArgs, &p); err != nil {
+			return Approval{}, err
+		}
+		baseSHA, err := r.FileDigest(p.Path)
+		if err != nil {
+			return Approval{}, fmt.Errorf("cannot approve edit without a base fingerprint: %w", err)
+		}
+		return r.ApproveWithBaseSHA256(name, rawArgs, baseSHA)
+	}
+	return r.approveWithGuard(name, rawArgs, "", "", nil, nil)
+}
+
+// ApproveWithBaseSHA256 records an edit approval only if the current file still
+// matches the exact fingerprint shown in the approval preview.
+func (r *Registry) ApproveWithBaseSHA256(name string, rawArgs json.RawMessage, expectedBaseSHA256 string) (Approval, error) {
+	if name != "edit_file" {
+		return Approval{}, fmt.Errorf("base fingerprint is only supported for edit_file")
+	}
+	if expectedBaseSHA256 == "" {
+		return Approval{}, fmt.Errorf("base fingerprint is required for edit_file approval")
+	}
+	var p struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(rawArgs, &p); err != nil {
+		return Approval{}, err
+	}
+	rel, err := r.resolveSafePath(p.Path)
+	if err != nil {
+		return Approval{}, err
+	}
+	baseFD, current, baseFile, err := r.editableSnapshot(rel)
+	if err != nil {
+		return Approval{}, fmt.Errorf("cannot verify edit base fingerprint: %w", err)
+	}
+	if current != expectedBaseSHA256 {
+		_ = baseFD.Close()
+		return Approval{}, fmt.Errorf("file changed after the approval preview; re-read it and retry")
+	}
+	approval, err := r.approveWithGuard(name, rawArgs, rel, expectedBaseSHA256, baseFile, baseFD)
+	if err != nil {
+		_ = baseFD.Close()
+	}
+	return approval, err
+}
+
+func (r *Registry) approveWithGuard(name string, rawArgs json.RawMessage, basePath, baseSHA256 string, baseFile os.FileInfo, baseFD *os.File) (Approval, error) {
 	spec, ok := r.handlers[name]
 	if !ok {
 		return Approval{}, fmt.Errorf("unknown tool %q", name)
@@ -484,10 +913,10 @@ func (r *Registry) Approve(name string, rawArgs json.RawMessage) (Approval, erro
 	token := randomHex(16)
 	r.mu.Lock()
 	r.pruneApprovalsLocked(now)
-	r.pending[token] = pendingApproval{tool: name, argsHash: hash, expires: now.Add(approvalTTL)}
+	r.pending[token] = pendingApproval{tool: name, argsHash: hash, basePath: basePath, baseSHA256: baseSHA256, baseFile: baseFile, baseFD: baseFD, expires: now.Add(approvalTTL)}
 	r.mu.Unlock()
 
-	return Approval{Token: token, Tool: name, ArgsSHA256: hash}, nil
+	return Approval{Token: token, Tool: name, ArgsSHA256: hash, BasePath: basePath, BaseSHA256: baseSHA256}, nil
 }
 
 // RunApproved executes a tool with a token issued by Approve. Tokens are bound
@@ -504,9 +933,19 @@ func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.Ra
 		return r.execute(ctx, spec, name, rawArgs, hash)
 	}
 
-	if !r.consumeApproval(name, hash, approval) {
+	pending, ok := r.consumeApproval(name, hash, approval)
+	if !ok {
+		if pending.baseFD != nil {
+			_ = pending.baseFD.Close()
+		}
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "invalid or expired approval token"})
 		return "Error: approval token is invalid or expired"
+	}
+	if pending.baseFD != nil {
+		defer pending.baseFD.Close()
+	}
+	if pending.baseSHA256 != "" {
+		ctx = context.WithValue(ctx, approvalBaseContextKey{}, approvedBase{path: pending.basePath, sha256: pending.baseSHA256, file: pending.baseFile})
 	}
 	return r.execute(ctx, spec, name, rawArgs, hash)
 }
@@ -519,30 +958,52 @@ func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawA
 		return result
 	}
 	result := truncateOutput(out)
-	if err := r.logEvent(audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))}); err != nil && !spec.ReadOnly {
-		result += "\nWarning: audit log write failed"
+	event := audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))}
+	if spec.ReadOnly {
+		_ = r.logEvent(event)
+	} else if err := r.auditLog.RecordApplied(event); err != nil {
+		result += auditWarning(err)
 	}
 	return result
 }
 
-func (r *Registry) consumeApproval(name, hash string, approval Approval) bool {
+func auditWarning(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "\nWarning: operation applied; audit event needs recovery (do not rerun): " + err.Error()
+}
+
+type approvalBaseContextKey struct{}
+
+type approvedBase struct {
+	path   string
+	sha256 string
+	file   os.FileInfo
+}
+
+func (r *Registry) consumeApproval(name, hash string, approval Approval) (pendingApproval, bool) {
 	if approval.Token == "" || approval.Tool != name || approval.ArgsSHA256 != hash {
-		return false
+		return pendingApproval{}, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	pending, ok := r.pending[approval.Token]
 	if !ok {
-		return false
+		return pendingApproval{}, false
 	}
 	delete(r.pending, approval.Token)
-	return pending.tool == name && pending.argsHash == hash && !r.now().After(pending.expires)
+	valid := pending.tool == name && pending.argsHash == hash && pending.basePath == approval.BasePath && pending.baseSHA256 == approval.BaseSHA256 && !r.now().After(pending.expires)
+	return pending, valid
 }
 
 func (r *Registry) pruneApprovalsLocked(now time.Time) {
 	for token, pending := range r.pending {
 		if now.After(pending.expires) {
+			if pending.baseFD != nil {
+				_ = pending.baseFD.Close()
+			}
 			delete(r.pending, token)
 		}
 	}
@@ -596,74 +1057,50 @@ func (r *Registry) registerDefaults() {
 			if err := json.Unmarshal(args, &p); err != nil {
 				return "", err
 			}
-			if p.OldText == "" {
-				return "", fmt.Errorf("old_text cannot be empty")
-			}
-			if p.OldText == p.NewText {
-				return "", fmt.Errorf("old_text and new_text are identical")
-			}
-
 			rel, err := r.resolveSafePath(p.Path)
 			if err != nil {
 				return "", err
 			}
-			info, err := r.root.Lstat(rel)
+			fileMutationMu.Lock()
+			defer fileMutationMu.Unlock()
+
+			base, ok := ctx.Value(approvalBaseContextKey{}).(approvedBase)
+			if !ok || base.path != rel || base.sha256 == "" {
+				return "", fmt.Errorf("edit_file requires an approval bound to the file's base fingerprint")
+			}
+			source, contentBytes, mode, err := r.openEditableFile(rel)
 			if err != nil {
 				return "", err
 			}
-			if info.IsDir() {
-				return "", fmt.Errorf("%s is a directory", p.Path)
+			defer source.Close()
+			approvedInfo, err := source.Stat()
+			if err != nil {
+				return "", err
 			}
-			if info.Mode()&os.ModeSymlink != 0 {
-				return "", fmt.Errorf("editing symlinks is not supported: %s", p.Path)
+			if base.file == nil || !os.SameFile(base.file, approvedInfo) {
+				return "", fmt.Errorf("file changed after approval; re-read it and retry")
 			}
-			if info.Size() > maxEditBytes {
-				return "", fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
+			if hashBytes(contentBytes) != base.sha256 {
+				return "", fmt.Errorf("file changed after approval; re-read it and retry")
 			}
-
-			contentBytes, err := r.root.ReadFile(rel)
+			if err := r.verifyApprovedFile(rel, source, base.sha256); err != nil {
+				return "", err
+			}
+			updatedBytes, err := prepareEdit(rel, contentBytes, p.OldText, p.NewText)
 			if err != nil {
 				return "", err
 			}
 
-			hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
-			content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
-			oldNorm := strings.ReplaceAll(p.OldText, "\r\n", "\n")
-			newNorm := strings.ReplaceAll(p.NewText, "\r\n", "\n")
-			if oldNorm == newNorm {
-				return "", fmt.Errorf("old_text and new_text are identical after line-ending normalization")
-			}
-
-			count := strings.Count(content, oldNorm)
-			if count == 0 {
-				return "", fmt.Errorf("old_text not found in %s", p.Path)
-			}
-			if count != 1 {
-				return "", fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
-			}
-
-			updatedBytes := []byte(strings.Replace(content, oldNorm, newNorm, 1))
-
-			if strings.HasSuffix(rel, ".go") {
-				formatted, err := format.Source(updatedBytes)
-				if err != nil {
-					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
+			var entry shadowstore.Entry
+			err = r.atomicWriteExpected(rel, updatedBytes, mode, source, base.sha256, r.beforeAtomicReplace, func() error {
+				var backupErr error
+				entry, backupErr = r.shadow.Backup(rel, contentBytes, mode, updatedBytes)
+				return backupErr
+			})
+			if err != nil {
+				if entry.ID != "" {
+					_ = r.shadow.MarkUndone(entry.ID)
 				}
-				updatedBytes = formatted
-			}
-			if hasCRLF {
-				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
-			}
-			if bytes.Equal(updatedBytes, contentBytes) {
-				return "", fmt.Errorf("edit would not change %s", p.Path)
-			}
-
-			entry, err := r.shadow.Backup(rel, contentBytes, info.Mode(), updatedBytes)
-			if err != nil {
-				return "", err
-			}
-			if err := r.atomicWrite(rel, updatedBytes, info.Mode()); err != nil {
-				_ = r.shadow.MarkUndone(entry.ID)
 				return "", err
 			}
 			return fmt.Sprintf("Successfully updated %s (shadow %s)", p.Path, entry.ID), nil
@@ -692,12 +1129,14 @@ func (r *Registry) registerDefaults() {
 
 	r.handlers["read_file"] = ToolSpec{
 		Name:        "read_file",
-		Description: "Read the contents of a file inside the workspace.",
+		Description: "Read a bounded UTF-8-safe byte range from a file inside the workspace. offset is zero-based; a page may exceed its limit by up to 3 bytes to keep a complete rune intact.",
 		ReadOnly:    true,
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"offset":{"type":"integer","minimum":0,"description":"Zero-based byte offset (default 0)"},"limit":{"type":"integer","minimum":1,"maximum":3584,"description":"Maximum bytes to read (default 3584); may extend by up to 3 bytes for UTF-8"}},"required":["path"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
-				Path string `json:"path"`
+				Path   string `json:"path"`
+				Offset int64  `json:"offset"`
+				Limit  int64  `json:"limit"`
 			}
 			if err := json.Unmarshal(args, &p); err != nil {
 				return "", err
@@ -706,7 +1145,7 @@ func (r *Registry) registerDefaults() {
 			if err != nil {
 				return "", err
 			}
-			return r.readFile(rel)
+			return r.readFile(rel, p.Offset, p.Limit)
 		},
 	}
 
@@ -736,7 +1175,7 @@ func (r *Registry) registerDefaults() {
 		Description: "Call a tool on an external MCP server via stdio. Starts the server process, calls the tool, then closes it.",
 		ReadOnly:    false,
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Command to start the MCP server (e.g. nabd-mcp)"},"tool":{"type":"string","description":"Name of the tool to call on the MCP server"},"arguments":{"type":"object","description":"Arguments to pass to the tool"}},"required":["command","tool"]}`),
-		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
+		Execute: func(ctx context.Context, args json.RawMessage) (output string, retErr error) {
 			var p struct {
 				Command   string                 `json:"command"`
 				Tool      string                 `json:"tool"`
@@ -752,12 +1191,39 @@ func (r *Registry) registerDefaults() {
 			tCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 
-			stdioTransport := transport.NewStdio(p.Command, nil)
+			var tree *processTree
+			stdioTransport := transport.NewStdioWithOptions(p.Command, nil, nil, transport.WithCommandFunc(
+				func(commandCtx context.Context, command string, _ []string, argv []string) (*exec.Cmd, error) {
+					cmd := exec.CommandContext(commandCtx, command, argv...)
+					cmd.Env = buildMCPEnv()
+					tree = configureProcessTree(cmd)
+					if err := tree.Prepare(); err != nil {
+						return nil, err
+					}
+					return cmd, nil
+				},
+			))
 			c := client.NewClient(stdioTransport)
+			defer func() {
+				_ = c.Close()
+				if tree != nil {
+					if cleanupErr := tree.Cleanup(); cleanupErr != nil {
+						retErr = errors.Join(retErr, cleanupErr)
+					}
+				}
+			}()
 			if err := c.Start(tCtx); err != nil {
 				return "", fmt.Errorf("failed to start MCP server: %w", err)
 			}
-			defer c.Close()
+
+			if _, err := c.Initialize(tCtx, mcp.InitializeRequest{
+				Params: mcp.InitializeParams{
+					ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+					ClientInfo:      mcp.Implementation{Name: "NabdCoder", Version: "1.0.0"},
+				},
+			}); err != nil {
+				return "", fmt.Errorf("failed to initialize MCP server: %w", err)
+			}
 
 			result, err := c.CallTool(tCtx, mcp.CallToolRequest{
 				Params: mcp.CallToolParams{
@@ -822,16 +1288,33 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	tCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(tCtx, "go", "test", "-p", "2", "-vet=all", pkg)
+	goBinary, err := exec.LookPath("go")
+	if err != nil {
+		return "", fmt.Errorf("locate go executable: %w", err)
+	}
+	goBinary, err = filepath.Abs(goBinary)
+	if err != nil {
+		return "", fmt.Errorf("resolve go executable: %w", err)
+	}
+	cmd := exec.CommandContext(tCtx, goBinary, "test", "-p", "2", "-vet=all", pkg)
 	cmd.Dir = r.workDir
 	cmd.Env = buildVerifyEnv()
-	cmd.WaitDelay = 2 * time.Second
-	configureProcessTree(cmd)
+	// The helper may spend up to two seconds killing/reaping owned descendants;
+	// allow that cleanup to finish before exec falls back to killing the helper.
+	cmd.WaitDelay = 5 * time.Second
+	tree := configureProcessTree(cmd)
+	if err := tree.Prepare(); err != nil {
+		return "", err
+	}
 
-	var out bytes.Buffer
+	var out cappedBuffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	err := cmd.Run()
+	err = cmd.Run()
+	cleanupErr := tree.Cleanup()
+	if cleanupErr != nil {
+		return "", cleanupErr
+	}
 
 	status := "PASS"
 	if err != nil {
@@ -852,6 +1335,37 @@ func isGoTestFailure(ctx context.Context, err error) bool {
 	}
 	var exitErr *exec.ExitError
 	return errors.As(err, &exitErr)
+}
+
+// cappedBuffer preserves only the first maxVerifyOutputBytes while allowing
+// the child to finish normally; noisy tests cannot exhaust memory via output.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := maxVerifyOutputBytes - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+			b.truncated = true
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return written, nil
+}
+
+func (b *cappedBuffer) String() string {
+	out := b.buf.String()
+	if b.truncated {
+		out += fmt.Sprintf("\n...[go test output capped at %d bytes]", maxVerifyOutputBytes)
+	}
+	return out
 }
 
 const (
@@ -922,39 +1436,66 @@ func clipSummary(s string, n int) string {
 	return s[:cut] + "..."
 }
 
-// verifyEnvAllowlist is the only set of parent variables forwarded to project
-// test code. Secrets such as API keys and proxy credentials are intentionally
-// omitted.
-var verifyEnvAllowlist = []string{
-	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
-	"TMPDIR", "TMP", "TEMP",
-	"GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE", "GOTOOLCHAIN",
-	"GOOS", "GOARCH", "GOARM", "GOAMD64", "GOEXPERIMENT",
-	"CGO_ENABLED", "CC", "CXX", "PKG_CONFIG",
-	"PREFIX", "ANDROID_ROOT", "ANDROID_DATA", "ANDROID_STORAGE",
-	"SSL_CERT_FILE", "SSL_CERT_DIR",
-	"SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
-	"USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+func buildMCPEnv() []string {
+	allow := []string{
+		"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+		"TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+		"USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+		"PREFIX", "ANDROID_ROOT", "ANDROID_DATA", "ANDROID_STORAGE",
+	}
+	values := make(map[string]string, len(allow))
+	for _, key := range allow {
+		if value, ok := os.LookupEnv(key); ok {
+			values[key] = value
+		}
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+values[key])
+	}
+	return env
 }
 
 func buildVerifyEnv() []string {
-	env := make([]string, 0, len(verifyEnvAllowlist)+4)
-	for _, key := range verifyEnvAllowlist {
+	// Forward only process identity, locale, temporary-directory, and OS
+	// essentials. In particular, do not pass PATH, Go overrides, CGO settings,
+	// or compiler/package-config variables to project code.
+	allow := []string{
+		"HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+		"TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+		"USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+		"PREFIX", "ANDROID_ROOT", "ANDROID_DATA", "ANDROID_STORAGE",
+	}
+	values := make(map[string]string, len(allow)+8)
+	for _, key := range allow {
 		if value, ok := os.LookupEnv(key); ok {
-			env = append(env, key+"="+value)
+			values[key] = value
 		}
 	}
-	env = append(env,
-		"GOMEMLIMIT=512MiB",
-		"GOGC=50",
-		"GOFLAGS=-mod=readonly",
-		"GOPROXY=off",
-		"GOTOOLCHAIN=local",
-	)
-	if os.Getenv("TMPDIR") == "" {
-		if prefix := os.Getenv("PREFIX"); prefix != "" {
-			env = append(env, "TMPDIR="+filepath.Join(prefix, "tmp"))
-		}
+	if values["TMPDIR"] == "" && values["PREFIX"] != "" {
+		values["TMPDIR"] = filepath.Join(values["PREFIX"], "tmp")
+	}
+	values["GOMEMLIMIT"] = "512MiB"
+	values["GOGC"] = "50"
+	values["GOFLAGS"] = "-mod=readonly"
+	values["GOPROXY"] = "off"
+	values["GOTOOLCHAIN"] = "local"
+	values["GOSUMDB"] = "off"
+	values["GOENV"] = "off"
+	values["CGO_ENABLED"] = "0"
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+values[key])
 	}
 	return env
 }

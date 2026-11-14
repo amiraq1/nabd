@@ -1,25 +1,20 @@
-//go:build unix
+//go:build unix && !linux
 
 package tools
 
 import (
-	"os"
+	"fmt"
 	"os/exec"
-	"syscall"
 )
 
-// configureProcessTree puts the child in its own process group and kills the
-// whole group when the context is canceled, so grandchildren cannot leak.
-func configureProcessTree(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if err == syscall.ESRCH {
-			return os.ErrProcessDone
-		}
-		return err
-	}
+type processTree struct{ cmd *exec.Cmd }
+
+func configureProcessTree(cmd *exec.Cmd) *processTree {
+	return &processTree{cmd: cmd}
 }
+
+func (t *processTree) Prepare() error {
+	return fmt.Errorf("external process execution is disabled: full descendant containment is unavailable on this platform")
+}
+
+func (t *processTree) Cleanup() error { return nil }

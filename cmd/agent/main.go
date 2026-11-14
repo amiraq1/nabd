@@ -95,6 +95,11 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			key := strings.ToLower(msg.String())
 			tc := m.pendingTools[0]
 			if key == "y" || key == "yes" {
+				if m.approval.Blocked {
+					m.status = "Approval blocked: preview is incomplete"
+					m.refresh()
+					return m, nil
+				}
 				m.awaitingApproval = false
 				if !m.approvalStillValid() {
 					m.pendingTools = m.pendingTools[1:]
@@ -108,7 +113,13 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.refresh()
 					return m.advance()
 				}
-				approval, err := m.registry.Approve(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+				var approval tools.Approval
+				var err error
+				if tc.Function.Name == "edit_file" {
+					approval, err = m.registry.ApproveWithBaseSHA256(tc.Function.Name, json.RawMessage(tc.Function.Arguments), m.approval.GuardSHA)
+				} else {
+					approval, err = m.registry.Approve(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+				}
 				if err != nil {
 					m.pendingTools = m.pendingTools[1:]
 					m.approval = approvalPreview{}
@@ -308,7 +319,11 @@ func (m uiModel) View() string {
 	b.WriteString(helpStyle.Render("────────────────────────────────") + "\n")
 	if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
-		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", sanitizeForDisplay(tc.Function.Name))) + "\n")
+		prompt := fmt.Sprintf("Approve %s? [Y/N]", sanitizeForDisplay(tc.Function.Name))
+		if m.approval.Blocked {
+			prompt = "Cannot approve: preview is incomplete. Press N to reject."
+		}
+		b.WriteString(approvalStyle.Render(prompt) + "\n")
 		if m.approval.Summary != "" {
 			b.WriteString(m.approval.Summary + "\n")
 		}

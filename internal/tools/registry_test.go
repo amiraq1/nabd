@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/amiraq1/nabd/internal/audit"
 )
@@ -54,9 +57,29 @@ func runToolApproved(t *testing.T, reg *Registry, name string, args map[string]a
 	}
 	approval, err := reg.Approve(name, raw)
 	if err != nil {
-		t.Fatalf("Approve(%s): %v", name, err)
+		return "Error: " + err.Error()
 	}
 	return reg.RunApproved(context.Background(), name, raw, approval)
+}
+
+func TestMCPEnvInheritanceProbe(t *testing.T) {
+	if os.Getenv("NABD_MCP_ENV_PROBE") == "1" {
+		_, _ = fmt.Fprint(os.Stdout, os.Getenv("NABD_API_KEY"))
+	}
+}
+
+func TestMCPProcessDoesNotInheritNabdAPIKey(t *testing.T) {
+	const secret = "test-secret-that-must-not-leak"
+	t.Setenv("NABD_API_KEY", secret)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMCPEnvInheritanceProbe$")
+	cmd.Env = append(buildMCPEnv(), "NABD_MCP_ENV_PROBE=1")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run MCP environment probe: %v; output=%s", err, output)
+	}
+	if strings.Contains(string(output), secret) {
+		t.Fatalf("MCP child process inherited NABD_API_KEY: %q", output)
+	}
 }
 
 func listedNames(t *testing.T, out string) []string {
@@ -373,9 +396,22 @@ func TestFileDigest(t *testing.T) {
 	}
 }
 
+func TestFileDigestRejectsOversizedFile(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	writeTestFile(t, filepath.Join(root, "large.txt"), strings.Repeat("x", maxEditBytes+1))
+	if _, err := reg.FileDigest("large.txt"); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("FileDigest oversized file error = %v, want size-limit refusal", err)
+	}
+}
+
 func TestGoVerifyEnvAllowlist(t *testing.T) {
 	root, reg := newTestRegistry(t)
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module auditenv\n\ngo 1.22\n")
+	goRootBytes, err := exec.Command("go", "env", "GOROOT").Output()
+	if err != nil {
+		t.Fatalf("locate Go toolchain root: %v", err)
+	}
+	goRoot := strings.TrimSpace(string(goRootBytes))
 	writeTestFile(t, filepath.Join(root, "env_test.go"), `package auditenv
 
 import (
@@ -389,6 +425,16 @@ func TestEnv(t *testing.T) {
 		"GOFLAGS=" + os.Getenv("GOFLAGS") + "\n" +
 		"GOPROXY=" + os.Getenv("GOPROXY") + "\n" +
 		"GOTOOLCHAIN=" + os.Getenv("GOTOOLCHAIN") + "\n" +
+		"GOENV=" + os.Getenv("GOENV") + "\n" +
+		"CGO_ENABLED=" + os.Getenv("CGO_ENABLED") + "\n" +
+		"PATH=" + os.Getenv("PATH") + "\n" +
+		"CC=" + os.Getenv("CC") + "\n" +
+		"CXX=" + os.Getenv("CXX") + "\n" +
+		"PKG_CONFIG=" + os.Getenv("PKG_CONFIG") + "\n" +
+		"GOROOT=" + os.Getenv("GOROOT") + "\n" +
+		"GOPATH=" + os.Getenv("GOPATH") + "\n" +
+		"GOOS=" + os.Getenv("GOOS") + "\n" +
+		"GOARCH=" + os.Getenv("GOARCH") + "\n" +
 		"AUDIT_SECRET=" + os.Getenv("AUDIT_SECRET") + "\n"
 	if err := os.WriteFile("env-dump.txt", []byte(env), 0o644); err != nil {
 		t.Fatal(err)
@@ -398,6 +444,18 @@ func TestEnv(t *testing.T) {
 
 	t.Setenv("AUDIT_SECRET", "sk-live-FAKE-SECRET")
 	t.Setenv("GOPROXY", "https://user:secret@proxy.invalid")
+	t.Setenv("PATH", os.Getenv("PATH")+string(os.PathListSeparator)+"/tmp/poison-path")
+	t.Setenv("CC", "/tmp/poison-cc")
+	t.Setenv("CXX", "/tmp/poison-cxx")
+	t.Setenv("PKG_CONFIG", "/tmp/poison-pkg-config")
+	t.Setenv("CGO_ENABLED", "1")
+	t.Setenv("GOROOT", "/tmp/poison-goroot")
+	t.Setenv("GOPATH", "/tmp/poison-gopath")
+	t.Setenv("GOOS", "plan9")
+	t.Setenv("GOARCH", "386")
+	t.Setenv("GOENV", "/tmp/poison-goenv")
+	t.Setenv("GOTOOLCHAIN", "auto")
+	t.Setenv("GOFLAGS", "-mod=mod")
 
 	out := runToolApproved(t, reg, "go_verify", map[string]any{"pkg": "./..."})
 	dump, err := os.ReadFile(filepath.Join(root, "env-dump.txt"))
@@ -406,12 +464,15 @@ func TestEnv(t *testing.T) {
 	}
 
 	env := string(dump)
-	for _, want := range []string{"GOMEMLIMIT=512MiB", "GOGC=50", "GOFLAGS=-mod=readonly", "GOPROXY=off", "GOTOOLCHAIN=local"} {
+	if !strings.Contains(env, "PATH="+filepath.Join(goRoot, "bin")) {
+		t.Errorf("test PATH did not come from the trusted Go toolchain:\n%s", env)
+	}
+	for _, want := range []string{"GOMEMLIMIT=512MiB", "GOGC=50", "GOFLAGS=-mod=readonly", "GOPROXY=off", "GOTOOLCHAIN=local", "GOENV=off", "CGO_ENABLED=0"} {
 		if !strings.Contains(env, want) {
 			t.Errorf("environment missing %q:\n%s", want, env)
 		}
 	}
-	for _, secret := range []string{"sk-live-FAKE-SECRET", "user:secret", "GOPROXY=https"} {
+	for _, secret := range []string{"sk-live-FAKE-SECRET", "user:secret", "GOPROXY=https", "CC=/", "CXX=/", "PKG_CONFIG=/", "GOROOT=/", "GOPATH=/", "GOOS=plan9", "GOARCH=386", "poison", "/tmp/poison-path"} {
 		if strings.Contains(env, secret) {
 			t.Errorf("environment leaked %q:\n%s", secret, env)
 		}
@@ -451,6 +512,24 @@ func TestLoud(t *testing.T) {
 	}
 	if repeated > maxSummaryTail {
 		t.Fatalf("raw output was not summarized: %d repeated lines", repeated)
+	}
+}
+
+func TestCappedBufferLimitsSubprocessOutput(t *testing.T) {
+	var out cappedBuffer
+	data := strings.Repeat("x", maxVerifyOutputBytes+17)
+	n, err := out.Write([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(data) {
+		t.Fatalf("Write returned %d, want %d", n, len(data))
+	}
+	if out.buf.Len() != maxVerifyOutputBytes || !out.truncated {
+		t.Fatalf("buffer length/truncated = %d/%v", out.buf.Len(), out.truncated)
+	}
+	if !strings.Contains(out.String(), "go test output capped") {
+		t.Fatal("output cap notice missing")
 	}
 }
 
@@ -550,15 +629,34 @@ func TestReadFileCap(t *testing.T) {
 	root, reg := newTestRegistry(t)
 	writeTestFile(t, filepath.Join(root, "big.txt"), strings.Repeat("A", maxReadBytes+100))
 
-	out, err := reg.readFile("big.txt")
+	out, err := reg.readFile("big.txt", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out) > maxReadBytes+64 {
 		t.Fatalf("read returned %d bytes", len(out))
 	}
-	if !strings.Contains(out, "truncated at") {
+	if !strings.Contains(out, "continue at byte offset") {
 		t.Fatal("truncation notice missing")
+	}
+}
+
+func TestReadFileSupportsByteRanges(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	content := strings.Repeat("0123456789", 1000)
+	writeTestFile(t, filepath.Join(root, "range.txt"), content)
+
+	out := runTool(t, reg, "read_file", map[string]any{
+		"path": "range.txt", "offset": 4321, "limit": 64,
+	})
+	if !strings.HasPrefix(out, content[4321:4321+64]) {
+		t.Fatalf("range read did not start at byte 4321: %q", out)
+	}
+	if !strings.Contains(out, "continue at byte offset 4385") {
+		t.Fatalf("range continuation offset missing: %q", out)
+	}
+	if got := runTool(t, reg, "read_file", map[string]any{"path": "range.txt", "offset": -1}); !strings.Contains(got, "non-negative") {
+		t.Fatalf("negative offset result = %q", got)
 	}
 }
 
@@ -883,6 +981,33 @@ func TestApprovalTokenRequiredAndSingleUse(t *testing.T) {
 	}
 }
 
+func TestApprovedEditRejectsFileChangedBeforeExecution(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	target := filepath.Join(root, "target.txt")
+	writeTestFile(t, target, "original\n")
+	raw, err := json.Marshal(map[string]any{
+		"path": "target.txt", "old_text": "original", "new_text": "changed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA, _, _, err := reg.PreviewEdit("target.txt", "original", "changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := reg.ApproveWithBaseSHA256("edit_file", raw, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, target, "original\nexternal change\n")
+	if out := reg.RunApproved(context.Background(), "edit_file", raw, approval); !strings.Contains(out, "file changed after approval") {
+		t.Fatalf("RunApproved after intervening change = %q", out)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "original\nexternal change\n" {
+		t.Fatalf("changed file was overwritten: %q", got)
+	}
+}
+
 func TestApprovalTokenExpires(t *testing.T) {
 	root, reg := newTestRegistry(t)
 	writeTestFile(t, filepath.Join(root, "target.txt"), "original\n")
@@ -941,5 +1066,335 @@ func TestUndoIsAudited(t *testing.T) {
 	}
 	if undoEvents[0].Detail != "target.txt" {
 		t.Fatalf("undo detail = %q", undoEvents[0].Detail)
+	}
+}
+
+func TestJailRejectsHardLinkToOutsideFile(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	outside := filepath.Join(filepath.Dir(root), "outside-hardlink-secret.txt")
+	writeTestFile(t, outside, "HARDLINK-SECRET")
+	alias := filepath.Join(root, "internal-alias.txt")
+	if err := os.Link(outside, alias); err != nil {
+		t.Skipf("hard-link creation unsupported: %v", err)
+	}
+
+	if out := runTool(t, reg, "read_file", map[string]any{"path": "internal-alias.txt"}); !strings.Contains(out, "linked file") || strings.Contains(out, "HARDLINK-SECRET") {
+		t.Fatalf("read_file hard-link result = %q", out)
+	}
+	if _, err := reg.FileDigest("internal-alias.txt"); err == nil {
+		t.Fatal("FileDigest accepted a hard link")
+	}
+	if out := runToolApproved(t, reg, "edit_file", map[string]any{
+		"path": "internal-alias.txt", "old_text": "HARDLINK-SECRET", "new_text": "changed",
+	}); !strings.Contains(out, "linked file") {
+		t.Fatalf("edit_file hard-link result = %q", out)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "HARDLINK-SECRET" {
+		t.Fatalf("outside secret changed or unreadable: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".nabd", "shadow")); err == nil {
+		t.Fatal("rejected hard-link edit created a shadow copy")
+	}
+}
+
+func TestReadFilePagesKeepUTF8RunesIntact(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	content := "مرحبا 👩‍💻 بالعالم € — 絵文字"
+	writeTestFile(t, filepath.Join(root, "utf8.txt"), content)
+
+	var got strings.Builder
+	var offset int64
+	for pages := 0; pages < 100; pages++ {
+		page := runTool(t, reg, "read_file", map[string]any{
+			"path": "utf8.txt", "offset": offset, "limit": 2,
+		})
+		marker := "\n...[truncated; continue at byte offset "
+		if i := strings.LastIndex(page, marker); i >= 0 {
+			text := page[:i]
+			if !utf8.ValidString(text) {
+				t.Fatalf("page at byte %d is invalid UTF-8: %q", offset, text)
+			}
+			got.WriteString(text)
+			nextText := strings.TrimSuffix(page[i+len(marker):], "]")
+			next, err := strconv.ParseInt(nextText, 10, 64)
+			if err != nil || next <= offset {
+				t.Fatalf("invalid continuation %q at offset %d: %v", nextText, offset, err)
+			}
+			offset = next
+			continue
+		}
+		if !utf8.ValidString(page) {
+			t.Fatalf("final page is invalid UTF-8: %q", page)
+		}
+		got.WriteString(page)
+		if got.String() != content {
+			t.Fatalf("paged UTF-8 = %q, want %q", got.String(), content)
+		}
+		if strings.Contains(got.String(), "\uFFFD") {
+			t.Fatalf("paged text contains replacement character: %q", got.String())
+		}
+		return
+	}
+	t.Fatal("pagination did not reach the end")
+}
+
+func TestAppliedAuditFailureQueuesDurableEvent(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	path := filepath.Join(root, "target.txt")
+	writeTestFile(t, path, "before")
+	raw, err := json.Marshal(map[string]any{
+		"path": "target.txt", "old_text": "before", "new_text": "after",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := reg.Approve("edit_file", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(root, ".nabd", "audit.log")
+	savedLogPath := logPath + ".saved"
+	if err := os.Rename(logPath, savedLogPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(logPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := reg.RunApproved(context.Background(), "edit_file", raw, approval)
+	if !strings.Contains(result, "Successfully updated") || !strings.Contains(result, "audit event needs recovery") {
+		t.Fatalf("result did not disclose applied/pending audit state: %q", result)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "after" {
+		t.Fatalf("edit result = %q, %v", got, err)
+	}
+	pending, err := os.ReadDir(filepath.Join(root, ".nabd", "audit-pending"))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending events = %v, err=%v", pending, err)
+	}
+
+	if err := os.Remove(logPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(savedLogPath, logPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.auditLog.RecoverPending(); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	events, _ := readAuditLog(t, root)
+	if len(events) != 3 || events[2].Event != "applied" || events[2].ResultSHA256 == "" {
+		t.Fatalf("recovered audit events = %+v", events)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".nabd", "audit-pending")); err == nil {
+		entries, readErr := os.ReadDir(filepath.Join(root, ".nabd", "audit-pending"))
+		if readErr == nil && len(entries) != 0 {
+			t.Fatalf("pending journal not drained: %v", entries)
+		}
+	}
+}
+
+func TestBuildVerifyEnvExcludesPathAndBuildOverrides(t *testing.T) {
+	for key, value := range map[string]string{
+		"PATH":        "/tmp/poison-path",
+		"CC":          "/tmp/poison-cc",
+		"CXX":         "/tmp/poison-cxx",
+		"PKG_CONFIG":  "/tmp/poison-pkg-config",
+		"CGO_ENABLED": "1",
+		"GOROOT":      "/tmp/poison-goroot",
+		"GOPATH":      "/tmp/poison-gopath",
+		"GOOS":        "plan9",
+		"GOARCH":      "386",
+		"GOTOOLCHAIN": "auto",
+		"GOFLAGS":     "-mod=mod",
+		"GOPROXY":     "https://user:password@proxy.invalid",
+	} {
+		t.Setenv(key, value)
+	}
+
+	env := buildVerifyEnv()
+	values := make(map[string]string)
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			t.Fatalf("malformed environment entry %q", item)
+		}
+		if _, exists := values[key]; exists {
+			t.Fatalf("duplicate environment key %q in %v", key, env)
+		}
+		values[key] = value
+	}
+	for _, key := range []string{"PATH", "CC", "CXX", "PKG_CONFIG", "GOROOT", "GOPATH", "GOOS", "GOARCH"} {
+		if _, ok := values[key]; ok {
+			t.Errorf("untrusted build variable %s was passed", key)
+		}
+	}
+	for key, want := range map[string]string{
+		"CGO_ENABLED": "0",
+		"GOMEMLIMIT":  "512MiB",
+		"GOGC":        "50",
+		"GOFLAGS":     "-mod=readonly",
+		"GOPROXY":     "off",
+		"GOSUMDB":     "off",
+		"GOTOOLCHAIN": "local",
+		"GOENV":       "off",
+	} {
+		if values[key] != want {
+			t.Errorf("%s = %q, want %q", key, values[key], want)
+		}
+	}
+	for _, value := range values {
+		if strings.Contains(value, "poison") || strings.Contains(value, "password@proxy") {
+			t.Errorf("untrusted environment value passed: %q", value)
+		}
+	}
+}
+
+func prepareApprovedTestEdit(t *testing.T) (string, *Registry, string, json.RawMessage, Approval) {
+	t.Helper()
+	root, reg := newTestRegistry(t)
+	target := filepath.Join(root, "target.txt")
+	writeTestFile(t, target, "approved original\n")
+	raw, err := json.Marshal(map[string]any{
+		"path": "target.txt", "old_text": "approved original", "new_text": "approved replacement",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA, _, _, err := reg.PreviewEdit("target.txt", "approved original", "approved replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := reg.ApproveWithBaseSHA256("edit_file", raw, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root, reg, target, raw, approval
+}
+
+func requireNoActiveShadow(t *testing.T, reg *Registry, relPath string) {
+	t.Helper()
+	if _, _, err := reg.shadow.Latest(relPath); err == nil {
+		t.Fatalf("failed edit left an active shadow backup for %s", relPath)
+	}
+}
+
+func TestApprovedEditRejectsSameContentFileReplacement(t *testing.T) {
+	root, reg, target, raw, approval := prepareApprovedTestEdit(t)
+	replacement := filepath.Join(root, "replacement.txt")
+	writeTestFile(t, replacement, "approved original\n")
+	if err := os.Rename(replacement, target); err != nil {
+		t.Fatal(err)
+	}
+
+	out := reg.RunApproved(context.Background(), "edit_file", raw, approval)
+	if !strings.Contains(out, "file changed after approval") {
+		t.Fatalf("same-content replacement result = %q, want identity-bound refusal", out)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "approved original\n" {
+		t.Fatalf("replacement file was modified: %q, %v", got, err)
+	}
+	requireNoActiveShadow(t, reg, "target.txt")
+}
+
+func TestApprovedEditDetectsReplacementDuringCommit(t *testing.T) {
+	root, reg, target, raw, approval := prepareApprovedTestEdit(t)
+	replacement := filepath.Join(root, "commit-replacement.txt")
+	writeTestFile(t, replacement, "external replacement\n")
+	reg.beforeAtomicReplace = func() {
+		if err := os.Rename(replacement, target); err != nil {
+			t.Errorf("replace approved file during commit: %v", err)
+		}
+	}
+
+	out := reg.RunApproved(context.Background(), "edit_file", raw, approval)
+	if !strings.Contains(out, "file changed after approval") {
+		t.Fatalf("commit-time replacement result = %q, want refusal", out)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "external replacement\n" {
+		t.Fatalf("external replacement was overwritten: %q, %v", got, err)
+	}
+	requireNoActiveShadow(t, reg, "target.txt")
+}
+
+func TestApprovedEditDetectsSymlinkSubstitutionDuringCommit(t *testing.T) {
+	root, reg, target, raw, approval := prepareApprovedTestEdit(t)
+	writeTestFile(t, filepath.Join(root, "other.txt"), "symlink target\n")
+	reg.beforeAtomicReplace = func() {
+		if err := os.Remove(target); err != nil {
+			t.Errorf("remove original before symlink substitution: %v", err)
+			return
+		}
+		if err := os.Symlink("other.txt", target); err != nil {
+			t.Errorf("substitute symlink during commit: %v", err)
+		}
+	}
+
+	out := reg.RunApproved(context.Background(), "edit_file", raw, approval)
+	if !strings.Contains(out, "file changed after approval") {
+		t.Fatalf("symlink substitution result = %q, want refusal", out)
+	}
+	info, err := os.Lstat(target)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink substitution was not preserved: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "other.txt")); err != nil || string(got) != "symlink target\n" {
+		t.Fatalf("symlink target was modified: %q, %v", got, err)
+	}
+	requireNoActiveShadow(t, reg, "target.txt")
+}
+
+func TestApprovedEditDetectsHardLinkAddedDuringCommit(t *testing.T) {
+	root, reg, target, raw, approval := prepareApprovedTestEdit(t)
+	hardLink := filepath.Join(filepath.Dir(root), "approved-hardlink-race.txt")
+	defer os.Remove(hardLink)
+	reg.beforeAtomicReplace = func() {
+		if err := os.Link(target, hardLink); err != nil {
+			t.Errorf("add hard link during commit: %v", err)
+		}
+	}
+
+	out := reg.RunApproved(context.Background(), "edit_file", raw, approval)
+	if !strings.Contains(out, "linked file") {
+		t.Fatalf("hard-link substitution result = %q, want refusal", out)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "approved original\n" {
+		t.Fatalf("hard-linked original was modified: %q, %v", got, err)
+	}
+	requireNoActiveShadow(t, reg, "target.txt")
+}
+
+func TestApprovedEditDetectsConcurrentModificationDuringCommit(t *testing.T) {
+	_, reg, target, raw, approval := prepareApprovedTestEdit(t)
+	reg.beforeAtomicReplace = func() {
+		if err := os.WriteFile(target, []byte("concurrent writer\n"), 0o644); err != nil {
+			t.Errorf("modify approved file during commit: %v", err)
+		}
+	}
+
+	out := reg.RunApproved(context.Background(), "edit_file", raw, approval)
+	if !strings.Contains(out, "file changed after approval") {
+		t.Fatalf("concurrent modification result = %q, want refusal", out)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "concurrent writer\n" {
+		t.Fatalf("concurrent modification was overwritten: %q, %v", got, err)
+	}
+	requireNoActiveShadow(t, reg, "target.txt")
+}
+
+func TestApprovedEditWritesExactResultAndUndoRestoresExactOriginal(t *testing.T) {
+	_, reg, target, raw, approval := prepareApprovedTestEdit(t)
+	out := reg.RunApproved(context.Background(), "edit_file", raw, approval)
+	if !strings.Contains(out, "Successfully updated target.txt") {
+		t.Fatalf("approved edit result = %q", out)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "approved replacement\n" {
+		t.Fatalf("edit result = %q, %v; want exact approved bytes", got, err)
+	}
+	if _, err := reg.Undo("target.txt"); err != nil {
+		t.Fatalf("Undo: %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "approved original\n" {
+		t.Fatalf("undo result = %q, %v; want exact original bytes", got, err)
 	}
 }

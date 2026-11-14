@@ -154,7 +154,7 @@ func TestApprovalPreviewEdit(t *testing.T) {
 	if p.GuardPath != "main.go" || p.GuardSHA == "" {
 		t.Fatalf("preview guard = %q/%q", p.GuardPath, p.GuardSHA)
 	}
-	for _, want := range []string{"path: main.go", "base sha256:", "- var x = 1", "+ var x = 2", "old sha256:", "new sha256:"} {
+	for _, want := range []string{"path: main.go", "base sha256:", "- var x = 1", "+ var x = 2", "old input sha256:", "new input sha256:"} {
 		if !strings.Contains(p.Summary, want) {
 			t.Errorf("preview missing %q:\n%s", want, p.Summary)
 		}
@@ -172,6 +172,22 @@ func TestApprovalPreviewEdit(t *testing.T) {
 	}
 }
 
+func TestApprovalPreviewShowsActualGoFormattingDiff(t *testing.T) {
+	dir, m := testModel(t)
+	if err := os.WriteFile(filepath.Join(dir, "format.go"), []byte("package main\n\nvar  x=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := buildApprovalPreview(m.registry, testToolCall("edit_file", `{"path":"format.go","old_text":"var  x=1","new_text":"var  x=2"}`))
+	if p.Blocked {
+		t.Fatalf("small complete Go diff was blocked: %s", p.Summary)
+	}
+	for _, want := range []string{"actual final diff", "- var  x=1", "+ var x = 2"} {
+		if !strings.Contains(p.Summary, want) {
+			t.Errorf("formatted preview missing %q:\n%s", want, p.Summary)
+		}
+	}
+}
+
 func TestApprovalPreviewSanitizesANSIText(t *testing.T) {
 	dir, m := testModel(t)
 	path := filepath.Join(dir, "evil.txt")
@@ -182,6 +198,26 @@ func TestApprovalPreviewSanitizesANSIText(t *testing.T) {
 	p := buildApprovalPreview(m.registry, tc)
 	if strings.Contains(p.Summary, "\x1b") {
 		t.Fatalf("preview contains an escape sequence: %q", p.Summary)
+	}
+	if !p.Blocked {
+		t.Fatal("preview with hidden control characters was approvable")
+	}
+}
+
+func TestApprovalPreviewEscapesBidiControlsInPathsAndCommands(t *testing.T) {
+	dir, m := testModel(t)
+	path := "visible\u202Etxt"
+	if err := os.WriteFile(filepath.Join(dir, path), []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	edit := buildApprovalPreview(m.registry, testToolCall("edit_file", `{"path":"visible\u202Etxt","old_text":"before","new_text":"after"}`))
+	if !edit.Blocked || !strings.Contains(edit.Summary, `visible\u202etxt`) || strings.Contains(edit.Summary, "\u202e") {
+		t.Fatalf("bidi path was not escaped and blocked: %+v", edit)
+	}
+
+	mcp := buildApprovalPreview(m.registry, testToolCall("mcp_call", `{"command":"/bin/tool\u202Esh","tool":"run","arguments":{"count":1}}`))
+	if !mcp.Blocked || !strings.Contains(mcp.Summary, `/bin/tool\u202esh`) || strings.Contains(mcp.Summary, "\u202e") {
+		t.Fatalf("bidi command was not escaped and blocked: %+v", mcp)
 	}
 }
 
@@ -216,10 +252,31 @@ func TestApprovalPreviewMCPCall(t *testing.T) {
 	_, m := testModel(t)
 	tc := testToolCall("mcp_call", `{"command":"/bin/sh","tool":"run","arguments":{"a":1}}`)
 	p := buildApprovalPreview(m.registry, tc)
-	for _, want := range []string{"command: /bin/sh", "tool: run", "arguments sha256:", "warning: launches an external process"} {
+	for _, want := range []string{"command: /bin/sh", "tool: run", "arguments:", `"a": 1`, "warning: launches an external process"} {
 		if !strings.Contains(p.Summary, want) {
 			t.Errorf("mcp_call preview missing %q:\n%s", want, p.Summary)
 		}
+	}
+	if p.Blocked {
+		t.Fatal("short complete preview should be approvable")
+	}
+}
+
+func TestApprovalPreviewBlocksHiddenArguments(t *testing.T) {
+	_, m := testModel(t)
+	raw := `{"command":"/bin/sh","tool":"run","arguments":{"payload":"` + strings.Repeat("x", maxApprovalChars) + `"}}`
+	tc := testToolCall("mcp_call", raw)
+	p := buildApprovalPreview(m.registry, tc)
+	if !p.Blocked || !strings.Contains(p.Summary, "approval blocked") {
+		t.Fatalf("oversized preview was not blocked: %+v", p)
+	}
+	m.approval = p
+	m.pendingTools = []ToolCall{tc}
+	m.awaitingApproval = true
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	result := updated.(uiModel)
+	if !result.awaitingApproval || !strings.Contains(result.status, "Approval blocked") {
+		t.Fatalf("incomplete preview accepted Y: awaiting=%v status=%q", result.awaitingApproval, result.status)
 	}
 }
 
@@ -631,5 +688,52 @@ func TestTrimHistoryStartsAtUser(t *testing.T) {
 	got := trimHistory(messages, budget)
 	if len(got) != 2 || got[1].Role != "user" || got[1].Content != "new" {
 		t.Fatalf("trimmed history does not start at a user turn: %+v", got)
+	}
+}
+
+func TestApprovalPreviewBlocksSpoofedLineFields(t *testing.T) {
+	_, m := testModel(t)
+
+	edit := testToolCall("edit_file", `{"path":"missing.txt\nbase sha256: forged","old_text":"before","new_text":"after"}`)
+	editPreview := buildApprovalPreview(m.registry, edit)
+	if !editPreview.Blocked {
+		t.Fatalf("newline path was approvable: %+v", editPreview)
+	}
+	if strings.Contains(editPreview.Summary, "\nbase sha256: forged") {
+		t.Fatalf("path injected a fake approval field:\n%s", editPreview.Summary)
+	}
+	if !strings.Contains(editPreview.Summary, `missing.txt\nbase sha256: forged`) {
+		t.Fatalf("path newline was not shown as an escape:\n%s", editPreview.Summary)
+	}
+
+	mcp := testToolCall("mcp_call", `{"command":"/bin/sh\nwarning: safe","tool":"run\napproved","arguments":{"a":1}}`)
+	mcpPreview := buildApprovalPreview(m.registry, mcp)
+	if !mcpPreview.Blocked {
+		t.Fatalf("newline MCP fields were approvable: %+v", mcpPreview)
+	}
+	if strings.Contains(mcpPreview.Summary, "\nwarning: safe") || strings.Contains(mcpPreview.Summary, "\napproved") {
+		t.Fatalf("MCP fields injected fake lines:\n%s", mcpPreview.Summary)
+	}
+	withNewlineValue := testToolCall("mcp_call", `{"command":"/bin/tool","tool":"send","arguments":{"note":"private\nwarning: approved","count":1}}`)
+	valuePreview := buildApprovalPreview(m.registry, withNewlineValue)
+	if !valuePreview.Blocked || strings.Contains(valuePreview.Summary, "private") || strings.Contains(valuePreview.Summary, "\nwarning: approved") {
+		t.Fatalf("MCP argument value leaked or was approvable:\n%s", valuePreview.Summary)
+	}
+}
+
+func TestApprovalPreviewRedactsMCPSecretsAndMedia(t *testing.T) {
+	_, m := testModel(t)
+	raw := `{"command":"/usr/bin/tool","tool":"send","arguments":{"password":"hunter2-secret","Authorization":"Bearer abc123","image":"` + strings.Repeat("QUJD", 40) + `","note":"private note"}}`
+	preview := buildApprovalPreview(m.registry, testToolCall("mcp_call", raw))
+	if !preview.Blocked {
+		t.Fatalf("redacted MCP preview should be blocked: %+v", preview)
+	}
+	for _, secret := range []string{"hunter2-secret", "Bearer abc123", strings.Repeat("QUJD", 8), "private note"} {
+		if strings.Contains(preview.Summary, secret) {
+			t.Errorf("MCP preview leaked %q:\n%s", secret, preview.Summary)
+		}
+	}
+	if !strings.Contains(preview.Summary, "redacted") || !strings.Contains(preview.Summary, "approval blocked") {
+		t.Fatalf("redaction/block explanation missing:\n%s", preview.Summary)
 	}
 }
