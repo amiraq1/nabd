@@ -88,6 +88,9 @@ func (r *Registry) NeedsApproval(name string) bool {
 }
 
 func (r *Registry) resolveSafePath(relPath string) (string, error) {
+	if strings.ContainsRune(relPath, 0) {
+		return "", fmt.Errorf("invalid path: contains NUL byte")
+	}
 	if strings.TrimSpace(relPath) == "" {
 		return "", fmt.Errorf("empty path is not allowed")
 	}
