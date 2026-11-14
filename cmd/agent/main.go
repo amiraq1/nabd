@@ -403,5 +403,4 @@ func main() {
 		fmt.Printf("TUI error: %v\n", err)
 		os.Exit(1)
 	}
-	_ = time.Second
 }
