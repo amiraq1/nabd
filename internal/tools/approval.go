@@ -65,7 +65,7 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 			return ApprovalPreview{}, fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
 		}
 	}
-	content, readErr := r.root.ReadFile(safePath)
+	content, readErr := readBounded(r.root, safePath, maxEditBytes)
 	if readErr != nil {
 		if errors.Is(readErr, fs.ErrNotExist) {
 			return ApprovalPreview{
@@ -112,10 +112,19 @@ var editBeforeRenameHook func()
 // applyEdit performs the in-memory transformation used by both the preview and
 // the write path.
 func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText string) ([]byte, error) {
+	if oldText == "" {
+		return nil, fmt.Errorf("old_text cannot be empty")
+	}
+	if oldText == newText {
+		return nil, fmt.Errorf("old_text and new_text are identical")
+	}
 	hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
 	content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
 	oldNorm := strings.ReplaceAll(oldText, "\r\n", "\n")
 	newNorm := strings.ReplaceAll(newText, "\r\n", "\n")
+	if oldNorm == newNorm {
+		return nil, fmt.Errorf("old_text and new_text are identical after line-ending normalization")
+	}
 
 	count := strings.Count(content, oldNorm)
 	if count == 0 {
@@ -135,6 +144,12 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	}
 	if hasCRLF {
 		updated = bytes.ReplaceAll(updated, []byte("\n"), []byte("\r\n"))
+	}
+	if len(updated) > maxEditBytes {
+		return nil, fmt.Errorf("edited file too large (limit %d bytes)", maxEditBytes)
+	}
+	if bytes.Equal(updated, contentBytes) {
+		return nil, fmt.Errorf("edit would not change %s", displayPath)
 	}
 	return updated, nil
 }
@@ -158,9 +173,9 @@ func (r *Registry) verifyEditState(p editParams, state ApprovalState) ([]byte, s
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, "", fmt.Errorf("editing symlinks is not supported: %s", p.Path)
 	}
-	content, err := r.root.ReadFile(safePath)
+	content, err := readBounded(r.root, safePath, maxEditBytes)
 	if err != nil {
-		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
+		return nil, "", fmt.Errorf("file changed since approval: %s: %w", p.Path, err)
 	}
 	if !state.Exists || hashBytes(content) != state.Hash {
 		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
@@ -172,7 +187,7 @@ func splitDiffLines(s string) []string {
 	if s == "" {
 		return nil
 	}
-	lines := strings.Split(s, "\n")
+	lines := strings.SplitAfter(s, "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
@@ -182,14 +197,12 @@ func splitDiffLines(s string) []string {
 // unifiedDiff renders a human-reviewable diff. It uses a common prefix/suffix
 // cut, so separated changes appear as one replaced block with 3 lines of context.
 func unifiedDiff(oldContent, newContent []byte, path string) string {
-	oldNorm := strings.ReplaceAll(string(oldContent), "\r\n", "\n")
-	newNorm := strings.ReplaceAll(string(newContent), "\r\n", "\n")
-	if oldNorm == newNorm {
+	if bytes.Equal(oldContent, newContent) {
 		return fmt.Sprintf("No changes to %s\n", path)
 	}
 
-	oldLines := splitDiffLines(oldNorm)
-	newLines := splitDiffLines(newNorm)
+	oldLines := splitDiffLines(string(oldContent))
+	newLines := splitDiffLines(string(newContent))
 
 	prefix := 0
 	for prefix < len(oldLines) && prefix < len(newLines) && oldLines[prefix] == newLines[prefix] {
@@ -222,17 +235,31 @@ func unifiedDiff(oldContent, newContent []byte, path string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "--- a/%s\n+++ b/%s\n", path, path)
 	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", startOld+1, endOld-startOld, startNew+1, endNew-startNew)
+	writeLine := func(prefix, line string) {
+		eol := "NONE"
+		if strings.HasSuffix(line, "\r\n") {
+			line = strings.TrimSuffix(line, "\r\n")
+			eol = "CRLF"
+		} else if strings.HasSuffix(line, "\n") {
+			line = strings.TrimSuffix(line, "\n")
+			eol = "LF"
+		}
+		fmt.Fprintf(&b, "%s%s [EOL=%s]\n", prefix, line, eol)
+		if eol == "NONE" {
+			b.WriteString("\\ No newline at end of file\n")
+		}
+	}
 	for _, line := range oldLines[startOld:prefix] {
-		b.WriteString(" " + line + "\n")
+		writeLine(" ", line)
 	}
 	for _, line := range oldLines[prefix : len(oldLines)-suffix] {
-		b.WriteString("-" + line + "\n")
+		writeLine("-", line)
 	}
 	for _, line := range newLines[prefix : len(newLines)-suffix] {
-		b.WriteString("+" + line + "\n")
+		writeLine("+", line)
 	}
 	for _, line := range oldLines[len(oldLines)-suffix : endOld] {
-		b.WriteString(" " + line + "\n")
+		writeLine(" ", line)
 	}
 	return b.String()
 }

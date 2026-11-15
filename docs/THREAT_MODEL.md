@@ -48,21 +48,23 @@
 ## 5. ما يضمنه النظام
 
 - **احتواء المسارات**: `os.Root` على جذر الـworkspace لكل عمليات الملفات، مع تحقق إضافي من `..` والمسارات المطلقة وvolume-relative وNUL. `edit_file` و`undo` يرفضان symlink. (اختبارات: `TestJailRejectsEscapes`, `TestJailRejectsSymlinkEscape`, `TestEditThroughSymlinkedParentRejected`.)
-- **سياسة المسارات الحساسة**: `.nabd/`, `.git/`, `.env*` (عدا القوالب), `id_*` (عدا `.pub`), وملفات المفاتيح مرفوضة لأدوات الملفات، ومخفية من `list_dir`. (اختبارات: `TestSensitivePathsDenied`, `TestShadowDeniedToFileTools`.)
+- **فتح القراءة على Linux/Android**: فتح نسبي إلى واصف الجذر، مع `O_NOFOLLOW` لكل مكوّن وفتح غير حاجب. هذا لا يجعل جميع عمليات الكتابة مقاومة لسباقات الروابط أو إعادة تسمية المجلدات؛ لا يُدّعى الضمان نفسه للمنصات الأخرى.
+- **سياسة المسارات الحساسة**: `.nabd/`, `.git/`, `.env*` في كل مكوّن (عدا ملفات `.env.example` و`.env.sample` و`.env.template` و`.env.dist` النهائية؛ لا يُفحص محتواها), `id_*` (عدا `.pub`), وملفات المفاتيح مرفوضة لأدوات الملفات، ومخفية من `list_dir`. (اختبارات: `TestSensitivePathsDenied`, `TestShadowDeniedToFileTools`.)
 - **بوابة الموافقة**: preview يعرض المسار وdiff وSHA-256، وإعادة فحص hash الأساس قبل التنفيذ. `RunApproved` يتطلب token أحادي الاستخدام مربوطاً بالأداة و`args_sha256`، صالح 5 دقائق. `Run` بدون approver يفشل مغلقاً. (اختبارات: `TestApprovalPreviewEdit`, `TestApprovalGuardDetectsFileChange`, `TestRunFailsClosedWithoutApprover`, `TestApprovalTokenRequiredAndSingleUse`, `TestApprovalTokenExpires`.)
 - **تدقيق إلزامي للكتابة**: `requested`/`approved` fail-closed قبل التنفيذ؛ تعذّر الكتابة يمنع التعديل/التنفيذ. القراءة تعمل بدون تدقيق. (اختبارات: `TestAuditLogFailClosedForWrites`, `TestReadOnlyToolsSurviveAuditFailure`, `TestAuditLogApprovalFlow`.)
 - **تعديل آمن**: كتابة ذرّية temp+fsync+rename مع حفظ mode، رفض no-op وsymlink والملفات >2MiB، CRLF محفوظ، ونسخة shadow قبل التعديل. (اختبارات: `TestEditAtomicPreservesModeAndLeavesNoTemp`, `TestEditPreservesCRLFInGo`, `TestEditRejectsSymlink`, `TestEditRejectsLargeFile`.)
 - **استعادة محكومة**: `undo` يستعيد فقط إذا طابق محتوى الملف `sha256_after`، ويرفض symlink، ويعلّم النسخة `undone`. (اختبارات: `TestUndoRestoresFile`, `TestUndoRefusesAfterDrift`, `TestUndoNoArgRestoresLatest`, `TestUndoIsAudited`.)
-- **go_verify محكوم**: بيئة allowlist بلا مفاتيح أو proxy، `GOFLAGS=-mod=readonly`, `GOPROXY=off`, `GOTOOLCHAIN=local`، أنماط حزم workspace-relative، مهلة 90s تقتل شجرة العمليات، ونتيجة منظمة. (اختبارات: `TestGoVerifyEnvAllowlist`, `TestValidatePkgPattern`, `TestGoVerifyTimeout`, `TestProcessGroupKill` على Unix.)
+- **go_verify محكوم**: بيئة allowlist بلا مفاتيح أو proxy، `GOFLAGS=-mod=readonly`, `GOPROXY=off`, `GOTOOLCHAIN=local`، أنماط حزم workspace-relative، مهلة 90s توقف مجموعة العمليات على Unix؛ قد تفلت العمليات المنفصلة ولا يضمن ذلك عزل الكود، ونتيجة منظمة. (اختبارات: `TestGoVerifyEnvAllowlist`, `TestValidatePkgPattern`, `TestGoVerifyTimeout`, `TestProcessGroupKill` على Unix.)
 - **LLM مضبوط**: إعداد من البيئة فقط، مهلة كلية، إلغاء عند Ctrl+C، retry محدود على 429/5xx/الشبكة فقط، وميزانية سياق تقديرية مع trim واعٍ للأزواج. (اختبارات: `TestAgentCancelsRequestOnCtrlC`, `TestChatRetriesOn429And5xx`, `TestChatDoesNotRetry400`, `TestTrimHistoryKeepsToolPairs`.)
 - **واجهة مقاومة للتزوير**: إزالة ANSI/C0/C1 قبل العرض، clamp للطرفية، وخروج عند non-TTY. (اختبارات: `TestSanitizeForDisplay`, `TestApprovalPreviewSanitizesANSIText`, `TestTinyWindowDoesNotPanic`, `TestEnsureInteractiveRejectsNonTTY`.)
+- **حماية MCP الخارجي**: الحارس المطلوب بجانب الوكيل يحجب `setsid` و`setpgid` على Linux/Android المدعومين، وتُحجب البيئة إلا قائمة محددة ويُحد النقل الوارد بـ1MiB. هذه ليست عزلة ملفات أو شبكة. (اختبارات: `TestF24RealMCPCallAndEnvironment`, `TestF24SeccompBlocksSetsid`, `TestF24SeccompBlocksSetpgid`, `TestF24WireLimit`.)
 - **mcp-server للقراءة فقط**: يرفض الأدوات غير read-only لغياب approver، و`mcp_call` معطّل. (اختبار: `TestServerIsReadOnlyAndDisablesMCPCall`.)
 
 ## 6. ما لا يضمنه النظام
 
 - **لا sandbox**: `go_verify` و`mcp_call` ينفّذان كوداً/عمليات بصلاحيات المستخدم. الموافقة خطوة بشرية، وليست عزلاً.
 - **شبكة كود الاختبار**: `GOPROXY=off` يمنع تنزيل وحدات Go فقط؛ كود الاختبار يستطيع فتح sockets مباشرة.
-- **`mcp_call`**: يشغّل binary موجوداً على النظام؛ لا allowlist ولا احتواء، و`cmd` لا يستقبل وسائط. الـpreview يعرض الأمر لكنه لا يمنع الضرر.
+- **`mcp_call`**: يشغّل binary بصلاحيات المستخدم، بلا sandbox للملفات أو الشبكة؛ `command` لا يدعم وسائط. seccomp يمنع syscallين فقط، ولا يضمن منع كل الانفصالات أو الهجمات عبر namespaces أو خدمات خارجية. لا يعتمد على `NABD_MCP_GUARD` لاستبدال الحارس. هوية الملف التنفيذي والحارس غير مرتبطة بالموافقة؛ يمكن تبديلهما بعد عرض الأمر وقبل التنفيذ.
 - **تسريب المحتوى إلى LLM**: `read_file` ومخرجات الأدوات تُرسل إلى endpoint الـLLM. إذا كان بعيداً، فمحتوى ملفات المشروع يخرج من الجهاز.
 - **سياسة الأسرار بالأسماء فقط**: سر داخل `config.yaml` أو ملف غير مطابق للأنماط يمكن قراءته.
 - **سلامة سجل التدقيق**: append-only بالبناء، لكنه ليس tamper-evident؛ مستخدم محلي يستطيع حذف/تفريغ `.nabd/audit.log`. لا hash chain ولا تدوير بعد.

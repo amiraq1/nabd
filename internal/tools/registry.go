@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/format"
 	"io"
 	"os"
 	"os/exec"
@@ -22,16 +20,16 @@ import (
 
 	"github.com/amiraq1/nabd/internal/audit"
 	shadowstore "github.com/amiraq1/nabd/internal/shadow"
-	"github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
-	"github.com/mark3labs/mcp-go/mcp"
 )
 
 const (
-	maxOutputBytes = 4096
-	maxReadBytes   = 512 << 10
-	maxEditBytes   = 2 << 20
-	maxListEntries = 1000
+	maxOutputBytes       = 4096
+	maxReadBytes         = 512 << 10
+	maxReadPageBytes     = 3584
+	maxEditBytes         = 2 << 20
+	maxListEntries       = 1000
+	maxListScan          = 4096
+	maxVerifyOutputBytes = 64 << 10
 )
 
 type ApprovalFunc func(toolName, summary string) bool
@@ -228,9 +226,13 @@ func (r *Registry) resolveSafePath(relPath string) (string, error) {
 // case-insensitive filesystems such as Android shared storage.
 func isSensitivePath(rel string) bool {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
-	for _, part := range parts {
-		switch strings.ToLower(part) {
+	for i, part := range parts {
+		lower := strings.ToLower(part)
+		switch lower {
 		case ".nabd", ".git":
+			return true
+		}
+		if strings.HasPrefix(lower, ".env") && (i != len(parts)-1 || !isEnvTemplate(lower)) {
 			return true
 		}
 	}
@@ -240,14 +242,6 @@ func isSensitivePath(rel string) bool {
 		return true
 	}
 	switch {
-	case base == ".env":
-		return true
-	case strings.HasPrefix(base, ".env."):
-		switch base {
-		case ".env.example", ".env.sample", ".env.template", ".env.dist":
-			return false
-		}
-		return true
 	case strings.HasPrefix(base, "id_") && !strings.HasSuffix(base, ".pub"):
 		return true
 	}
@@ -259,6 +253,16 @@ func isSensitivePath(rel string) bool {
 	return false
 }
 
+// Only these exact final names are exempt from .env* filtering.
+func isEnvTemplate(name string) bool {
+	switch strings.ToLower(name) {
+	case ".env.example", ".env.sample", ".env.template", ".env.dist":
+		return true
+	default:
+		return false
+	}
+}
+
 // FileDigest returns the SHA-256 of a file inside the workspace. The approval
 // UI uses it to confirm that the file did not change between the preview and
 // the approved edit.
@@ -267,28 +271,36 @@ func (r *Registry) FileDigest(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	f, err := r.root.Open(rel)
+	f, err := openRegularSingleLink(r.root, rel)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	digest, err := digestBounded(f, maxEditBytes)
+	if err != nil {
 		return "", err
+	}
+	if err := ensureNoHardLinks(f); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+func digestBounded(reader io.Reader, limit int64) (string, error) {
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(reader, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if n > limit {
+		return "", fmt.Errorf("file too large for digest (limit %d bytes)", limit)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (r *Registry) readFile(rel string) (string, error) {
-	info, err := r.root.Stat(rel)
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("%s is a directory", rel)
-	}
-	f, err := r.root.Open(rel)
+	f, err := openRegularSingleLink(r.root, rel)
 	if err != nil {
 		return "", err
 	}
@@ -296,6 +308,9 @@ func (r *Registry) readFile(rel string) (string, error) {
 
 	data, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
 	if err != nil {
+		return "", err
+	}
+	if err := ensureNoHardLinks(f); err != nil {
 		return "", err
 	}
 	truncated := len(data) > maxReadBytes
@@ -309,23 +324,128 @@ func (r *Registry) readFile(rel string) (string, error) {
 	return out, nil
 }
 
-func (r *Registry) listDir(rel string) (string, error) {
-	f, err := r.root.Open(rel)
+// readFilePage bounds both raw input and encoded output so the continuation
+// marker survives the registry's output cap, even with invalid UTF-8 bytes.
+func (r *Registry) readFilePage(rel string, offset, limit int64, structured bool) (string, error) {
+	if offset < 0 {
+		return "", fmt.Errorf("offset must be non-negative")
+	}
+	if limit < 1 || limit > maxReadPageBytes {
+		return "", fmt.Errorf("limit must be between 1 and %d", maxReadPageBytes)
+	}
+	f, err := openRegularSingleLink(r.root, rel)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-
-	entries, err := f.ReadDir(-1)
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit+utf8.UTFMax))
 	if err != nil {
 		return "", err
+	}
+	if err := ensureNoHardLinks(f); err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	consumed, encodedBytes := 0, 0
+	for consumed < len(data) {
+		r, size := utf8.DecodeRune(data[consumed:])
+		encodedSize := utf8.RuneLen(r)
+		if structured {
+			encoded, err := json.Marshal(string(r))
+			if err != nil {
+				return "", err
+			}
+			encodedSize = len(encoded) - 2 // exclude the JSON string quotes
+		}
+		budget := maxReadPageBytes
+		if structured {
+			budget = maxOutputBytes - 128
+		} // reserve object and offset metadata
+		if consumed > 0 && (int64(consumed+size) > limit || encodedBytes+encodedSize > budget) {
+			break
+		}
+		out.WriteRune(r)
+		encodedBytes += encodedSize
+		consumed += size
+	}
+	more := consumed < len(data)
+	if structured {
+		page := struct {
+			Content    string `json:"content"`
+			Truncated  bool   `json:"truncated"`
+			NextOffset *int64 `json:"next_offset,omitempty"`
+		}{Content: out.String(), Truncated: more}
+		if more {
+			next := offset + int64(consumed)
+			page.NextOffset = &next
+		}
+		encoded, err := json.Marshal(page)
+		if err != nil {
+			return "", err
+		}
+		if len(encoded) > maxOutputBytes {
+			return "", fmt.Errorf("structured page exceeds output limit")
+		}
+		return string(encoded), nil
+	}
+	if more {
+		fmt.Fprintf(&out, "\n...[truncated; continue at byte offset %d]", offset+int64(consumed))
+	}
+	return out.String(), nil
+}
+
+func (r *Registry) listDir(rel string) (string, error) {
+	if isEnvTemplate(filepath.Base(rel)) {
+		return "", fmt.Errorf("access to sensitive directory denied: %s", rel)
+	}
+	info, err := r.root.Stat(rel)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", rel)
+	}
+	f, err := openWorkspaceFile(r.root, rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", rel)
+	}
+
+	entries := make([]os.DirEntry, 0, maxListScan)
+	more := false
+	for len(entries) <= maxListScan {
+		batch, readErr := f.ReadDir(min(128, maxListScan+1-len(entries)))
+		entries = append(entries, batch...)
+		if readErr != nil && readErr != io.EOF {
+			return "", readErr
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if len(batch) == 0 {
+			break
+		}
+	}
+	if len(entries) > maxListScan {
+		more = true
+		entries = entries[:maxListScan]
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
 	var b strings.Builder
 	shown, hidden := 0, 0
 	for _, e := range entries {
-		if isSensitivePath(filepath.Join(rel, e.Name())) {
+		if isSensitivePath(filepath.Join(rel, e.Name())) || (isEnvTemplate(e.Name()) && (e.IsDir() || e.Type()&os.ModeSymlink != 0)) {
 			continue
 		}
 		if shown >= maxListEntries {
@@ -340,7 +460,10 @@ func (r *Registry) listDir(rel string) (string, error) {
 		shown++
 	}
 	if hidden > 0 {
-		b.WriteString(fmt.Sprintf("... [%d more entries]\n", hidden))
+		b.WriteString(fmt.Sprintf("... [%d more entries in scanned portion]\n", hidden))
+	}
+	if more {
+		b.WriteString("... [directory scan limit reached; more entries exist]\n")
 	}
 	return b.String(), nil
 }
@@ -376,7 +499,7 @@ func (r *Registry) Undo(relPath string) (string, error) {
 		return "", fmt.Errorf("refusing to undo a symlink: %s", entry.Path)
 	}
 
-	current, err := r.root.ReadFile(currentPath)
+	current, err := readBounded(r.root, currentPath, maxEditBytes)
 	if err != nil {
 		return "", err
 	}
@@ -389,7 +512,7 @@ func (r *Registry) Undo(relPath string) (string, error) {
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path}); err != nil {
 		return "", err
 	}
-	if err := r.atomicWrite(currentPath, backup, os.FileMode(entry.Mode)); err != nil {
+	if err := r.atomicWriteChecked(currentPath, backup, os.FileMode(entry.Mode), currentHash); err != nil {
 		_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path})
 		return "", err
 	}
@@ -402,9 +525,6 @@ func (r *Registry) Undo(relPath string) (string, error) {
 
 // atomicWrite writes data to a temporary file in the target directory, syncs
 // it, and renames it over the destination. All operations stay inside root.
-func (r *Registry) atomicWrite(rel string, data []byte, mode os.FileMode) error {
-	return r.atomicWriteChecked(rel, data, mode, "")
-}
 func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode, expectedHash string) error {
 	tmp := filepath.Join(filepath.Dir(rel), ".nabd-tmp-"+randomHex(8))
 	f, err := r.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
@@ -413,9 +533,10 @@ func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode,
 	}
 
 	_, writeErr := f.Write(data)
+	modeErr := f.Chmod(mode.Perm())
 	syncErr := f.Sync()
 	closeErr := f.Close()
-	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+	if err := errors.Join(writeErr, modeErr, syncErr, closeErr); err != nil {
 		_ = r.root.Remove(tmp)
 		return fmt.Errorf("write temporary file: %w", err)
 	}
@@ -425,7 +546,7 @@ func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode,
 			editBeforeRenameHook()
 		}
 		info, statErr := r.root.Lstat(rel)
-		current, readErr := r.root.ReadFile(rel)
+		current, readErr := readBounded(r.root, rel, maxEditBytes)
 		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != expectedHash {
 			_ = r.root.Remove(tmp)
 			return fmt.Errorf("file changed since approval: %s", rel)
@@ -449,6 +570,15 @@ func randomHex(n int) string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf)
+}
+
+// newApprovalToken fails closed if secure randomness is unavailable.
+func newApprovalToken() (string, error) {
+	var buf [16]byte
+	if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
+		return "", fmt.Errorf("cannot generate approval token: %w", err)
+	}
+	return hex.EncodeToString(buf[:]), nil
 }
 
 // Run executes a tool. Tools that are not read-only are refused unless an
@@ -507,6 +637,19 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 	return r.execute(ctx, spec, name, rawArgs, hash)
 }
 
+// RecordDenied records a user rejection without storing raw arguments.
+// A logging error never turns a rejection into an approval.
+func (r *Registry) RecordDenied(name string, rawArgs json.RawMessage) error {
+	if !r.Has(name) || !r.RequiresApproval(name) {
+		return fmt.Errorf("tool %q is not a registered approval tool", name)
+	}
+	hash := hashBytes(rawArgs)
+	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash}); err != nil {
+		return err
+	}
+	return r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "user rejected"})
+}
+
 // Approve records an explicit approval and returns a single-use token bound to
 // this exact tool call. The audit write is mandatory: if it fails, no token is
 // issued and nothing can execute.
@@ -543,16 +686,21 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)}); err != nil {
 		return Approval{}, err
 	}
+	token, err := newApprovalToken()
+	if err != nil {
+		return Approval{}, err
+	}
+	now := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneApprovalsLocked(now)
+	if _, exists := r.pending[token]; exists {
+		return Approval{}, fmt.Errorf("approval token collision")
+	}
 	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
 		return Approval{}, err
 	}
-
-	now := r.now()
-	token := randomHex(16)
-	r.mu.Lock()
-	r.pruneApprovalsLocked(now)
 	r.pending[token] = pendingApproval{state: state, preflightErr: preflightErr, tool: name, argsHash: hash, expires: now.Add(approvalTTL)}
-	r.mu.Unlock()
 
 	return Approval{Token: token, Tool: name, ArgsSHA256: hash}, nil
 }
@@ -713,7 +861,7 @@ func (r *Registry) registerDefaults() {
 				return "", fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
 			}
 
-			contentBytes, err := r.root.ReadFile(rel)
+			contentBytes, err := readBounded(r.root, rel, maxEditBytes)
 			if err != nil {
 				return "", err
 			}
@@ -723,40 +871,20 @@ func (r *Registry) registerDefaults() {
 				}
 			}
 
-			hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
-			content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
-			oldNorm := strings.ReplaceAll(p.OldText, "\r\n", "\n")
-			newNorm := strings.ReplaceAll(p.NewText, "\r\n", "\n")
-			if oldNorm == newNorm {
-				return "", fmt.Errorf("old_text and new_text are identical after line-ending normalization")
+			updatedBytes, err := applyEdit(contentBytes, p.Path, rel, p.OldText, p.NewText)
+			if err != nil {
+				return "", err
 			}
-
-			count := strings.Count(content, oldNorm)
-			if count == 0 {
-				return "", fmt.Errorf("old_text not found in %s", p.Path)
-			}
-			if count != 1 {
-				return "", fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
-			}
-
-			updatedBytes := []byte(strings.Replace(content, oldNorm, newNorm, 1))
-
-			if strings.HasSuffix(rel, ".go") {
-				formatted, err := format.Source(updatedBytes)
-				if err != nil {
-					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
-				}
-				updatedBytes = formatted
-			}
-			if hasCRLF {
-				updatedBytes = bytes.ReplaceAll(updatedBytes, []byte("\n"), []byte("\r\n"))
-			}
-			if bytes.Equal(updatedBytes, contentBytes) {
-				return "", fmt.Errorf("edit would not change %s", p.Path)
+			if err := ctx.Err(); err != nil {
+				return "", err
 			}
 
 			entry, err := r.shadow.Backup(rel, contentBytes, info.Mode(), updatedBytes)
 			if err != nil {
+				return "", err
+			}
+			if err := ctx.Err(); err != nil {
+				_ = r.shadow.MarkUndone(entry.ID)
 				return "", err
 			}
 			if err := r.atomicWriteChecked(rel, updatedBytes, info.Mode(), hashBytes(contentBytes)); err != nil {
@@ -789,12 +917,15 @@ func (r *Registry) registerDefaults() {
 
 	r.handlers["read_file"] = ToolSpec{
 		Name:        "read_file",
-		Description: "Read the contents of a file inside the workspace.",
+		Description: "Read a bounded UTF-8-safe byte range inside the workspace; follow the continuation offset when truncated.",
 		ReadOnly:    true,
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"offset":{"type":"integer","minimum":0,"description":"Zero-based byte offset, default 0"},"limit":{"type":"integer","minimum":1,"maximum":3584,"description":"Maximum input bytes per page, default 3584; a first UTF-8 rune may extend this by up to 3 bytes"},"format":{"type":"string","enum":["text","json"],"description":"text by default; json returns content, truncated, and next_offset"}},"required":["path"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
-				Path string `json:"path"`
+				Path   string `json:"path"`
+				Offset int64  `json:"offset"`
+				Limit  *int64 `json:"limit"`
+				Format string `json:"format"`
 			}
 			if err := json.Unmarshal(args, &p); err != nil {
 				return "", err
@@ -803,7 +934,14 @@ func (r *Registry) registerDefaults() {
 			if err != nil {
 				return "", err
 			}
-			return r.readFile(rel)
+			limit := int64(maxReadPageBytes)
+			if p.Limit != nil {
+				limit = *p.Limit
+			}
+			if p.Format != "" && p.Format != "text" && p.Format != "json" {
+				return "", fmt.Errorf("format must be text or json")
+			}
+			return r.readFilePage(rel, p.Offset, limit, p.Format == "json")
 		},
 	}
 
@@ -846,37 +984,7 @@ func (r *Registry) registerDefaults() {
 				return "", fmt.Errorf("command and tool are required")
 			}
 
-			tCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			defer cancel()
-
-			stdioTransport := transport.NewStdio(p.Command, nil)
-			c := client.NewClient(stdioTransport)
-			if err := c.Start(tCtx); err != nil {
-				return "", fmt.Errorf("failed to start MCP server: %w", err)
-			}
-			defer c.Close()
-
-			result, err := c.CallTool(tCtx, mcp.CallToolRequest{
-				Params: mcp.CallToolParams{
-					Name:      p.Tool,
-					Arguments: p.Arguments,
-				},
-			})
-			if err != nil {
-				return "", fmt.Errorf("mcp call failed: %w", err)
-			}
-
-			var out strings.Builder
-			for _, content := range result.Content {
-				if tc, ok := content.(mcp.TextContent); ok {
-					out.WriteString(tc.Text)
-					out.WriteString("\n")
-				}
-			}
-			if out.Len() == 0 {
-				return "(no text content returned)", nil
-			}
-			return out.String(), nil
+			return callExternalMCP(ctx, r.workDir, p.Command, p.Tool, p.Arguments)
 		},
 	}
 }
@@ -925,9 +1033,9 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	cmd.WaitDelay = 2 * time.Second
 	configureProcessTree(cmd)
 
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out := newBoundedOutput(maxVerifyOutputBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
 	err := cmd.Run()
 
 	status := "PASS"
@@ -936,6 +1044,8 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	}
 	if tCtx.Err() == context.DeadlineExceeded {
 		status = "FAIL (timeout)"
+	} else if tCtx.Err() == context.Canceled {
+		status = "CANCELLED (context canceled)"
 	}
 	if err != nil && !isGoTestFailure(tCtx, err) {
 		return "", err

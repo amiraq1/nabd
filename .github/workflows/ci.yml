@@ -38,9 +38,12 @@ jobs:
       - name: go test
         run: go test ./... -count=1
 
+      - name: go race test (short)
+        run: go test -race -short ./... -count=1 -p 2
+
       - name: staticcheck
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
           "$(go env GOPATH)/bin/staticcheck" ./...
 
       - name: cross build (linux amd64/arm64)
@@ -51,3 +54,10 @@ jobs:
             GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/nabdcoder-$arch" ./cmd/agent
             GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/mcp-server-$arch" ./cmd/mcp-server
           done
+
+      - name: cross build (android arm64)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: android
+          GOARCH: arm64
+        run: go build ./...

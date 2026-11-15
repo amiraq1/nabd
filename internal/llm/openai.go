@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	mrand "math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ const (
 	maxAttempts      = 4
 	maxRetryAfter    = 30 * time.Second
 	maxResponseBytes = 4 << 20
+	maxToolCalls     = 64
 )
 
 // OpenAIClient talks to an OpenAI-compatible /chat/completions endpoint.
@@ -51,7 +54,7 @@ func NewOpenAIClient(cfg Config) *OpenAIClient {
 	}
 	return &OpenAIClient{
 		cfg:         cfg,
-		httpClient:  &http.Client{Timeout: cfg.Timeout},
+		httpClient:  &http.Client{Timeout: cfg.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		sleep:       sleepContext,
 		backoffBase: 500 * time.Millisecond,
 	}
@@ -61,6 +64,9 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 
+	if err := validateBaseURL(c.cfg.BaseURL); err != nil {
+		return nil, err
+	}
 	body, err := c.encode(req)
 	if err != nil {
 		return nil, err
@@ -99,6 +105,25 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
+// validateBaseURL avoids sending credentials over insecure remote connections.
+func validateBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid model base URL")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback()) {
+			return nil
+		}
+	}
+	return fmt.Errorf("model base URL must use HTTPS or local loopback HTTP")
+}
+
 func (c *OpenAIClient) encode(req Request) ([]byte, error) {
 	payload := map[string]any{
 		"model":       c.cfg.Model,
@@ -133,9 +158,12 @@ func (c *OpenAIClient) attempt(ctx context.Context, endpoint string, body []byte
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, true, 0, fmt.Errorf("read response: %w", err)
+	}
+	if len(data) > maxResponseBytes {
+		return nil, false, 0, fmt.Errorf("response too large: exceeds %d bytes", maxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
@@ -170,12 +198,31 @@ func parseResponse(data []byte) (*Response, error) {
 	if msg.Role == "" {
 		msg.Role = "assistant"
 	}
+	if msg.Role != "assistant" {
+		return nil, fmt.Errorf("response message role must be assistant")
+	}
+	if len(msg.ToolCalls) > maxToolCalls {
+		return nil, fmt.Errorf("too many tool calls in one response (limit %d)", maxToolCalls)
+	}
+	ids := make(map[string]struct{}, len(msg.ToolCalls))
 	for i := range msg.ToolCalls {
-		if msg.ToolCalls[i].ID == "" {
-			msg.ToolCalls[i].ID = newCallID(i)
+		call := &msg.ToolCalls[i]
+		if call.ID == "" {
+			call.ID = newCallID(i)
 		}
-		if msg.ToolCalls[i].Type == "" {
-			msg.ToolCalls[i].Type = "function"
+		if _, exists := ids[call.ID]; exists {
+			return nil, fmt.Errorf("response contains duplicate tool call IDs")
+		}
+		ids[call.ID] = struct{}{}
+		if call.Type == "" {
+			call.Type = "function"
+		}
+		if call.Type != "function" || strings.TrimSpace(call.Function.Name) == "" {
+			return nil, fmt.Errorf("response contains invalid tool call")
+		}
+		var args map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || args == nil {
+			return nil, fmt.Errorf("tool call arguments must be a JSON object")
 		}
 	}
 	return &Response{Message: msg, FinishReason: choice.FinishReason, Usage: result.Usage}, nil

@@ -11,6 +11,32 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+// mcpToolFromOpenAIDef validates registry definitions instead of relying on
+// unchecked assertions; malformed definitions stop the server at startup.
+func mcpToolFromOpenAIDef(def map[string]any) (mcp.Tool, error) {
+	fn, ok := def["function"].(map[string]any)
+	if !ok {
+		return mcp.Tool{}, fmt.Errorf("invalid OpenAI tool definition")
+	}
+	name, ok := fn["name"].(string)
+	if !ok || name == "" {
+		return mcp.Tool{}, fmt.Errorf("tool name is missing")
+	}
+	desc, ok := fn["description"].(string)
+	if !ok {
+		return mcp.Tool{}, fmt.Errorf("description missing for tool %s", name)
+	}
+	params, ok := fn["parameters"].(map[string]any)
+	if !ok || params["type"] != "object" {
+		return mcp.Tool{}, fmt.Errorf("invalid input schema for tool %s", name)
+	}
+	schema, err := json.Marshal(params)
+	if err != nil {
+		return mcp.Tool{}, fmt.Errorf("encode input schema for tool %s: %w", name, err)
+	}
+	return mcp.NewToolWithRawSchema(name, desc, schema), nil
+}
+
 func main() {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -25,14 +51,18 @@ func main() {
 	}
 	defer reg.Close()
 
-	s := newServer(reg)
+	s, err := newServer(reg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to register MCP tool: %v\n", err)
+		os.Exit(1)
+	}
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func newServer(reg *tools.Registry) *server.MCPServer {
+func newServer(reg *tools.Registry) (*server.MCPServer, error) {
 	s := server.NewMCPServer(
 		"NabdCoder Tools",
 		"1.0.0",
@@ -41,19 +71,17 @@ func newServer(reg *tools.Registry) *server.MCPServer {
 
 	// Register tools from the registry
 	for _, toolDef := range reg.OpenAITools() {
-		fn := toolDef["function"].(map[string]any)
-		name := fn["name"].(string)
-		if reg.RequiresApproval(name) {
+		tool, err := mcpToolFromOpenAIDef(toolDef)
+		if err != nil {
+			return nil, err
+		}
+		if reg.RequiresApproval(tool.Name) {
 			continue
 		}
-		desc := fn["description"].(string)
-
-		schema, _ := json.Marshal(fn["parameters"])
-		tool := mcp.NewToolWithRawSchema(name, desc, schema)
-		s.AddTool(tool, makeHandler(reg, name))
+		s.AddTool(tool, makeHandler(reg, tool.Name))
 	}
 
-	return s
+	return s, nil
 }
 
 func makeHandler(reg *tools.Registry, name string) server.ToolHandlerFunc {
