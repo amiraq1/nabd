@@ -22,3 +22,25 @@ func TestReviewExecutionApprovalWarnings(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewMCPApprovalWarnsExecutableCanChange(t *testing.T) {
+	_, m := testModel(t)
+	p, err := prepareApprovalPreview(m.registry, testToolCall("mcp_call", `{"command":"example","tool":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ToLower(p.Summary), "executable identity is not bound") {
+		t.Fatal("missing executable identity warning")
+	}
+}
+
+func TestReviewMCPWarningNotClipped(t *testing.T) {
+	_, m := testModel(t)
+	for _, n := range []int{1000, 1300, 1500} {
+		args := `{"command":"` + strings.Repeat("x", n) + `","tool":"x"}`
+		p, err := prepareApprovalPreview(m.registry, testToolCall("mcp_call", args))
+		if err == nil && (!strings.Contains(p.Summary, mcpIdentityWarning) || !strings.Contains(p.Summary, "filesystem")) {
+			t.Fatal("approval allowed with clipped warnings")
+		}
+	}
+}
