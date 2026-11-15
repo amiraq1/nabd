@@ -22,6 +22,7 @@ const (
 	maxAttempts      = 4
 	maxRetryAfter    = 30 * time.Second
 	maxResponseBytes = 4 << 20
+	maxToolCalls     = 64
 )
 
 // OpenAIClient talks to an OpenAI-compatible /chat/completions endpoint.
@@ -199,6 +200,9 @@ func parseResponse(data []byte) (*Response, error) {
 	}
 	if msg.Role != "assistant" {
 		return nil, fmt.Errorf("response message role must be assistant")
+	}
+	if len(msg.ToolCalls) > maxToolCalls {
+		return nil, fmt.Errorf("too many tool calls in one response (limit %d)", maxToolCalls)
 	}
 	ids := make(map[string]struct{}, len(msg.ToolCalls))
 	for i := range msg.ToolCalls {
