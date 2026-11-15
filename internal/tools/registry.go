@@ -572,6 +572,15 @@ func randomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
+// newApprovalToken fails closed if secure randomness is unavailable.
+func newApprovalToken() (string, error) {
+	var buf [16]byte
+	if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
+		return "", fmt.Errorf("cannot generate approval token: %w", err)
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
 // Run executes a tool. Tools that are not read-only are refused unless an
 // approver is configured and grants the request, so callers without an
 // interactive approval path fail closed. Every action is appended to the
@@ -677,16 +686,21 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)}); err != nil {
 		return Approval{}, err
 	}
+	token, err := newApprovalToken()
+	if err != nil {
+		return Approval{}, err
+	}
+	now := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneApprovalsLocked(now)
+	if _, exists := r.pending[token]; exists {
+		return Approval{}, fmt.Errorf("approval token collision")
+	}
 	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
 		return Approval{}, err
 	}
-
-	now := r.now()
-	token := randomHex(16)
-	r.mu.Lock()
-	r.pruneApprovalsLocked(now)
 	r.pending[token] = pendingApproval{state: state, preflightErr: preflightErr, tool: name, argsHash: hash, expires: now.Add(approvalTTL)}
-	r.mu.Unlock()
 
 	return Approval{Token: token, Tool: name, ArgsSHA256: hash}, nil
 }
