@@ -75,7 +75,7 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		var b strings.Builder
 		fmt.Fprintf(&b, "command: %s\ntool: %s\narguments sha256: %s\n",
 			sanitizeForDisplay(p.Command), sanitizeForDisplay(p.Tool), sha256Hex(string(p.Arguments)))
-		b.WriteString("warning: launches an external process outside the workspace\n")
+		b.WriteString("warning: runs an external process with your user permissions; it may access the filesystem (including private files) and network; this is not a sandbox\n")
 		return approvalPreview{Summary: clip(sanitizeForDisplay(b.String()), maxApprovalChars)}
 
 	case "go_verify":
@@ -87,7 +87,7 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		if pkg == "" {
 			pkg = "./..."
 		}
-		summary := fmt.Sprintf("runs project tests via go test\npkg: %s\nwarning: executes project code; secrets are excluded from its environment", sanitizeForDisplay(pkg))
+		summary := fmt.Sprintf("runs project tests via go test\npkg: %s\nwarning: executes project code with your user permissions; it may access the filesystem (including private files) and network; the environment is restricted, but this is not a sandbox", sanitizeForDisplay(pkg))
 		return approvalPreview{Summary: clip(sanitizeForDisplay(summary), maxApprovalChars)}
 
 	default:
