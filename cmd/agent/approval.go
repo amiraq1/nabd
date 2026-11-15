@@ -74,7 +74,7 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		_ = json.Unmarshal([]byte(tc.Function.Arguments), &p)
 
 		var b strings.Builder
-		b.WriteString("warning: runs an external process with your user permissions; it may access the filesystem (including private files) and network; this is not a sandbox\n")
+		b.WriteString("warning: launches an external process with your user permissions; it may access the filesystem (including private files) and network; this is not a sandbox\n")
 		b.WriteString(mcpIdentityWarning + "\n")
 		fmt.Fprintf(&b, "command: %s\ntool: %s\narguments sha256: %s\n",
 			sanitizeForDisplay(p.Command), sanitizeForDisplay(p.Tool), sha256Hex(string(p.Arguments)))
