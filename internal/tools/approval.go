@@ -187,7 +187,7 @@ func splitDiffLines(s string) []string {
 	if s == "" {
 		return nil
 	}
-	lines := strings.Split(s, "\n")
+	lines := strings.SplitAfter(s, "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
@@ -197,14 +197,12 @@ func splitDiffLines(s string) []string {
 // unifiedDiff renders a human-reviewable diff. It uses a common prefix/suffix
 // cut, so separated changes appear as one replaced block with 3 lines of context.
 func unifiedDiff(oldContent, newContent []byte, path string) string {
-	oldNorm := strings.ReplaceAll(string(oldContent), "\r\n", "\n")
-	newNorm := strings.ReplaceAll(string(newContent), "\r\n", "\n")
-	if oldNorm == newNorm {
+	if bytes.Equal(oldContent, newContent) {
 		return fmt.Sprintf("No changes to %s\n", path)
 	}
 
-	oldLines := splitDiffLines(oldNorm)
-	newLines := splitDiffLines(newNorm)
+	oldLines := splitDiffLines(string(oldContent))
+	newLines := splitDiffLines(string(newContent))
 
 	prefix := 0
 	for prefix < len(oldLines) && prefix < len(newLines) && oldLines[prefix] == newLines[prefix] {
@@ -237,17 +235,31 @@ func unifiedDiff(oldContent, newContent []byte, path string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "--- a/%s\n+++ b/%s\n", path, path)
 	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", startOld+1, endOld-startOld, startNew+1, endNew-startNew)
+	writeLine := func(prefix, line string) {
+		eol := "NONE"
+		if strings.HasSuffix(line, "\r\n") {
+			line = strings.TrimSuffix(line, "\r\n")
+			eol = "CRLF"
+		} else if strings.HasSuffix(line, "\n") {
+			line = strings.TrimSuffix(line, "\n")
+			eol = "LF"
+		}
+		fmt.Fprintf(&b, "%s%s [EOL=%s]\n", prefix, line, eol)
+		if eol == "NONE" {
+			b.WriteString("\\ No newline at end of file\n")
+		}
+	}
 	for _, line := range oldLines[startOld:prefix] {
-		b.WriteString(" " + line + "\n")
+		writeLine(" ", line)
 	}
 	for _, line := range oldLines[prefix : len(oldLines)-suffix] {
-		b.WriteString("-" + line + "\n")
+		writeLine("-", line)
 	}
 	for _, line := range newLines[prefix : len(newLines)-suffix] {
-		b.WriteString("+" + line + "\n")
+		writeLine("+", line)
 	}
 	for _, line := range oldLines[len(oldLines)-suffix : endOld] {
-		b.WriteString(" " + line + "\n")
+		writeLine(" ", line)
 	}
 	return b.String()
 }
