@@ -129,7 +129,7 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	if strings.HasSuffix(safePath, ".go") {
 		formatted, err := format.Source(updated)
 		if err != nil {
-			return nil, fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
+			return nil, fmt.Errorf("edit rejected due to Go syntax error:\n%w", err)
 		}
 		updated = formatted
 	}

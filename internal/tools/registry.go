@@ -744,7 +744,7 @@ func (r *Registry) registerDefaults() {
 			if strings.HasSuffix(rel, ".go") {
 				formatted, err := format.Source(updatedBytes)
 				if err != nil {
-					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
+					return "", fmt.Errorf("edit rejected due to Go syntax error:\n%w", err)
 				}
 				updatedBytes = formatted
 			}
