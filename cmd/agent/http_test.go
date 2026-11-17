@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
-	"github.com/amiraq1/nabd/internal/llm"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/amiraq1/nabd/internal/llm"
 )
 
 func TestCallLLMReportsTruncatedBody(t *testing.T) {
