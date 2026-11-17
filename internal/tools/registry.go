@@ -934,7 +934,7 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	if err != nil {
 		status = "FAIL"
 	}
-	if tCtx.Err() == context.DeadlineExceeded {
+	if errors.Is(tCtx.Err(), context.DeadlineExceeded) {
 		status = "FAIL (timeout)"
 	}
 	if err != nil && !isGoTestFailure(tCtx, err) {
