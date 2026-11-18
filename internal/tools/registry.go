@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -259,23 +260,28 @@ func isSensitivePath(rel string) bool {
 	return false
 }
 
-// FileDigest returns the SHA-256 of a file inside the workspace. The approval
-// UI uses it to confirm that the file did not change between the preview and
-// the approved edit.
+// FileDigest returns the SHA-256 of a regular file inside the workspace. The
+// approval UI uses it to confirm that the file did not change between the
+// preview and the approved edit. Files above maxEditBytes cannot be edited, so
+// they are rejected before hashing.
 func (r *Registry) FileDigest(relPath string) (string, error) {
 	rel, err := r.resolveSafePath(relPath)
 	if err != nil {
 		return "", err
 	}
-	f, err := r.root.Open(rel)
+	f, _, err := r.openRegular(rel, int64(maxEditBytes))
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	n, err := io.Copy(h, io.LimitReader(f, int64(maxEditBytes)+1))
+	if err != nil {
 		return "", err
+	}
+	if n > int64(maxEditBytes) {
+		return "", fmt.Errorf("%s grew beyond the %d-byte read limit", rel, maxEditBytes)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -288,13 +294,13 @@ func (r *Registry) readFile(rel string) (string, error) {
 	if info.IsDir() {
 		return "", fmt.Errorf("%s is a directory", rel)
 	}
-	f, err := r.root.Open(rel)
+	f, _, err := r.openRegular(rel, 0)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxReadBytes)+1))
 	if err != nil {
 		return "", err
 	}
@@ -309,37 +315,75 @@ func (r *Registry) readFile(rel string) (string, error) {
 	return out, nil
 }
 
+// listDir rejects a static non-directory before opening it. A concurrent
+// replacement between Stat and Open can still block, as with file reads.
 func (r *Registry) listDir(rel string) (string, error) {
+	info, err := r.root.Stat(rel)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", rel)
+	}
+
 	f, err := r.root.Open(rel)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
-	entries, err := f.ReadDir(-1)
+	openInfo, err := f.Stat()
 	if err != nil {
 		return "", err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	if !openInfo.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", rel)
+	}
+
+	h := &dirHeap{}
+	heap.Init(h)
+	total := 0
+	for {
+		entries, readErr := f.ReadDir(listReadBatchSize)
+		for _, e := range entries {
+			if isSensitivePath(filepath.Join(rel, e.Name())) {
+				continue
+			}
+			total++
+			item := dirItem{name: e.Name(), isDir: e.IsDir()}
+			if h.Len() < maxListEntries {
+				heap.Push(h, item)
+				continue
+			}
+			if item.name < (*h)[0].name {
+				(*h)[0] = item
+				heap.Fix(h, 0)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return "", readErr
+		}
+		if len(entries) == 0 {
+			break
+		}
+	}
+
+	items := make([]dirItem, h.Len())
+	copy(items, *h)
+	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
 
 	var b strings.Builder
-	shown, hidden := 0, 0
-	for _, e := range entries {
-		if isSensitivePath(filepath.Join(rel, e.Name())) {
-			continue
-		}
-		if shown >= maxListEntries {
-			hidden++
-			continue
-		}
+	for _, item := range items {
 		typ := "F"
-		if e.IsDir() {
+		if item.isDir {
 			typ = "D"
 		}
-		b.WriteString(fmt.Sprintf("%s  %s\n", typ, e.Name()))
-		shown++
+		b.WriteString(fmt.Sprintf("%s  %s\n", typ, item.name))
 	}
-	if hidden > 0 {
+	if hidden := total - len(items); hidden > 0 {
 		b.WriteString(fmt.Sprintf("... [%d more entries]\n", hidden))
 	}
 	return b.String(), nil
@@ -375,8 +419,11 @@ func (r *Registry) Undo(relPath string) (string, error) {
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: "undo", Detail: entry.Path, Reason: "symlink"})
 		return "", fmt.Errorf("refusing to undo a symlink: %s", entry.Path)
 	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("refusing to undo a non-regular file: %s", entry.Path)
+	}
 
-	current, err := r.root.ReadFile(currentPath)
+	current, err := r.readFileLimited(currentPath, int64(maxEditBytes))
 	if err != nil {
 		return "", err
 	}
@@ -425,8 +472,12 @@ func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode,
 			editBeforeRenameHook()
 		}
 		info, statErr := r.root.Lstat(rel)
-		current, readErr := r.root.ReadFile(rel)
-		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != expectedHash {
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			_ = r.root.Remove(tmp)
+			return fmt.Errorf("file changed since approval: %s", rel)
+		}
+		current, readErr := r.readFileLimited(rel, int64(maxEditBytes))
+		if readErr != nil || hashBytes(current) != expectedHash {
 			_ = r.root.Remove(tmp)
 			return fmt.Errorf("file changed since approval: %s", rel)
 		}
@@ -709,11 +760,14 @@ func (r *Registry) registerDefaults() {
 			if info.Mode()&os.ModeSymlink != 0 {
 				return "", fmt.Errorf("editing symlinks is not supported: %s", p.Path)
 			}
+			if !info.Mode().IsRegular() {
+				return "", fmt.Errorf("editing special files is not supported: %s", p.Path)
+			}
 			if info.Size() > maxEditBytes {
 				return "", fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
 			}
 
-			contentBytes, err := r.root.ReadFile(rel)
+			contentBytes, err := r.readFileLimited(rel, int64(maxEditBytes))
 			if err != nil {
 				return "", err
 			}
@@ -925,9 +979,9 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	cmd.WaitDelay = 2 * time.Second
 	configureProcessTree(cmd)
 
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	capture := newBoundedCapture()
+	cmd.Stdout = capture
+	cmd.Stderr = capture
 	err := cmd.Run()
 
 	status := "PASS"
@@ -940,7 +994,7 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	if err != nil && !isGoTestFailure(tCtx, err) {
 		return "", err
 	}
-	return summarizeGoTest(status, out.String(), err), nil
+	return summarizeGoTestCapture(status, capture.String(), err, capture.Truncated()), nil
 }
 
 func isGoTestFailure(ctx context.Context, err error) bool {
