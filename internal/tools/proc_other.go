@@ -1,7 +1,7 @@
-//go:build !unix
+//go:build !unix && !windows
 
 package tools
 
 import "os/exec"
 
-func prepareProcess(cmd *exec.Cmd) {}
+func configureProcessTree(cmd *exec.Cmd) {}

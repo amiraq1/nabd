@@ -947,3 +947,71 @@ func TestUndoIsAudited(t *testing.T) {
 		t.Fatalf("undo detail = %q", undoEvents[0].Detail)
 	}
 }
+
+func TestReadFileLineRange(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	lines := "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n"
+	writeTestFile(t, filepath.Join(root, "numbers.txt"), lines)
+
+	// Range read
+	out := runTool(t, reg, "read_file", map[string]any{
+		"path":       "numbers.txt",
+		"start_line": 3,
+		"end_line":   5,
+	})
+	if !strings.Contains(out, "3: line 3") || !strings.Contains(out, "5: line 5") {
+		t.Fatalf("unexpected range output: %q", out)
+	}
+	if strings.Contains(out, "line 1") || strings.Contains(out, "line 6") {
+		t.Fatalf("range read leaked outside lines: %q", out)
+	}
+
+	// Full read (start_line=0, end_line=0)
+	full := runTool(t, reg, "read_file", map[string]any{
+		"path": "numbers.txt",
+	})
+	if full != lines {
+		t.Fatalf("full read output mismatch: got %q, want %q", full, lines)
+	}
+}
+
+func TestSearchFiles(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	writeTestFile(t, filepath.Join(root, "pkg", "alpha.go"), "package pkg\nfunc Alpha() string { return \"ok\" }\n")
+	writeTestFile(t, filepath.Join(root, "pkg", "beta.go"), "package pkg\nfunc Beta() int { return 42 }\n")
+	writeTestFile(t, filepath.Join(root, ".env"), "ALPHA_SECRET=12345\n")
+	writeTestFile(t, filepath.Join(root, "bin.dat"), string([]byte{0x00, 0x01, 'A', 'l', 'p', 'h', 'a', 0x00}))
+
+	// Search for Alpha
+	out := runTool(t, reg, "search_files", map[string]any{
+		"pattern": "Alpha",
+	})
+	if !strings.Contains(out, "alpha.go") {
+		t.Fatalf("search_files did not find alpha.go: %q", out)
+	}
+	// Sensitive file must not appear
+	if strings.Contains(out, ".env") {
+		t.Fatalf("search_files leaked sensitive file: %q", out)
+	}
+	// Binary file must not appear
+	if strings.Contains(out, "bin.dat") {
+		t.Fatalf("search_files included binary file: %q", out)
+	}
+
+	// Search with dir restriction
+	outDir := runTool(t, reg, "search_files", map[string]any{
+		"pattern": "func",
+		"dir":     "pkg",
+	})
+	if !strings.Contains(outDir, "alpha.go") || !strings.Contains(outDir, "beta.go") {
+		t.Fatalf("search_files with dir missed pkg files: %q", outDir)
+	}
+
+	// Empty pattern should fail
+	outEmpty := runTool(t, reg, "search_files", map[string]any{
+		"pattern": "",
+	})
+	if !strings.Contains(outEmpty, "Error") && !strings.Contains(outEmpty, "pattern") {
+		t.Fatalf("empty pattern did not return error: %q", outEmpty)
+	}
+}

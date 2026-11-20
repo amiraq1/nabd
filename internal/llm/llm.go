@@ -56,9 +56,32 @@ type Response struct {
 	Usage        Usage
 }
 
+// StreamDelta is one incremental piece of a streaming response.
+// Either Content is non-empty (a text token) or ToolCallDelta is set
+// (a partial tool_call fragment at the given Index).
+type StreamDelta struct {
+	Content       string
+	ToolCallDelta *ToolCallDelta
+}
+
+// ToolCallDelta is a partial tool call fragment delivered by the stream.
+type ToolCallDelta struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
+}
+
 // Client is the interface the agent loop depends on.
 type Client interface {
+	// Chat sends a blocking request and returns the full response.
 	Chat(ctx context.Context, req Request) (*Response, error)
+
+	// ChatStream sends a streaming request. onDelta is called for every
+	// incremental token or tool-call fragment in arrival order. The final
+	// assembled Response is returned when the stream ends. If onDelta is nil
+	// the method must still work (behaves like Chat with streaming).
+	ChatStream(ctx context.Context, req Request, onDelta func(StreamDelta)) (*Response, error)
 }
 
 // Config holds endpoint and generation settings. Values come from the

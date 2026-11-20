@@ -61,6 +61,18 @@ func (m *mockClient) Chat(ctx context.Context, req llm.Request) (*llm.Response, 
 	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "done"}}, nil
 }
 
+// ChatStream satisfies llm.Client; delegates to Chat so tests stay simple.
+func (m *mockClient) ChatStream(ctx context.Context, req llm.Request, onDelta func(llm.StreamDelta)) (*llm.Response, error) {
+	resp, err := m.Chat(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if onDelta != nil && resp.Message.Content != "" {
+		onDelta(llm.StreamDelta{Content: resp.Message.Content})
+	}
+	return resp, nil
+}
+
 func (m *mockClient) callCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -335,6 +347,18 @@ func (f funcClient) Chat(ctx context.Context, req llm.Request) (*llm.Response, e
 	return f(ctx, req)
 }
 
+// ChatStream satisfies llm.Client; delegates to Chat.
+func (f funcClient) ChatStream(ctx context.Context, req llm.Request, onDelta func(llm.StreamDelta)) (*llm.Response, error) {
+	resp, err := f(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if onDelta != nil && resp.Message.Content != "" {
+		onDelta(llm.StreamDelta{Content: resp.Message.Content})
+	}
+	return resp, nil
+}
+
 func llmToolCall(id, name, args string) ToolCall {
 	var tc ToolCall
 	tc.ID = id
@@ -359,6 +383,65 @@ func runTurn(t *testing.T, m uiModel, input string, maxSteps int) uiModel {
 		t.Fatalf("turn did not settle after %d steps", maxSteps)
 	}
 	return m
+}
+
+func TestParallelReadOnlyTools(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	if err := os.WriteFile(filepath.Join(dir, "f1.txt"), []byte("content 1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f2.txt"), []byte("content 2"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	turn := 0
+	client := funcClient(func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		turn++
+		if turn == 1 {
+			// First turn: model requests two read-only tools concurrently
+			return &llm.Response{
+				Message: Message{
+					Role: "assistant",
+					ToolCalls: []ToolCall{
+						llmToolCall("call_1", "read_file", `{"path":"f1.txt"}`),
+						llmToolCall("call_2", "read_file", `{"path":"f2.txt"}`),
+					},
+				},
+			}, nil
+		}
+		// Second turn: model answers with summary
+		return &llm.Response{
+			Message: Message{
+				Role:    "assistant",
+				Content: "Done reading both files.",
+			},
+		}, nil
+	})
+
+	m := initialModel(reg, client)
+	m = runTurn(t, m, "Read both files", 10)
+
+	var toolResponses []Message
+	for _, msg := range m.messages {
+		if msg.Role == "tool" {
+			toolResponses = append(toolResponses, msg)
+		}
+	}
+	if len(toolResponses) != 2 {
+		t.Fatalf("expected 2 tool responses, got %d: %+v", len(toolResponses), toolResponses)
+	}
+	if toolResponses[0].ToolCallID != "call_1" || !strings.Contains(toolResponses[0].Content, "content 1") {
+		t.Errorf("unexpected first tool response: %+v", toolResponses[0])
+	}
+	if toolResponses[1].ToolCallID != "call_2" || !strings.Contains(toolResponses[1].Content, "content 2") {
+		t.Errorf("unexpected second tool response: %+v", toolResponses[1])
+	}
 }
 
 func assertToolCallsAnswered(t *testing.T, messages []Message) {

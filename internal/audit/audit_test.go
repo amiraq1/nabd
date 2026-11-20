@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,5 +80,33 @@ func TestWriteAppendsJSONLines(t *testing.T) {
 		if !event.Time.Equal(now) {
 			t.Errorf("event %d time = %v, want %v", i, event.Time, now)
 		}
+	}
+}
+
+func TestWriteBestEffortAppends(t *testing.T) {
+	dirRoot := t.TempDir()
+	root, err := os.OpenRoot(dirRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+
+	log, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+
+	event := Event{Event: "requested", Tool: "read_file", ArgsSHA256: "abc", Detail: "f.txt"}
+	if err := log.WriteBestEffort(event); err != nil {
+		t.Fatalf("WriteBestEffort failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dirRoot, ".nabd", "audit.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"tool":"read_file"`) {
+		t.Fatalf("audit log missing best effort event: %s", data)
 	}
 }
