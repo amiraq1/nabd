@@ -17,6 +17,7 @@ func approvalRegistry(t *testing.T, dir string) *Registry {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	t.Cleanup(func() { _ = r.Close() })
 	return r
 }
 
@@ -24,7 +25,7 @@ func installProbeGo(t *testing.T, script string) {
 	t.Helper()
 	sh, err := exec.LookPath("sh")
 	if err != nil {
-		t.Fatalf("sh not found: %v", err)
+		t.Skipf("sh not found: %v", err)
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "go")

@@ -59,6 +59,7 @@ func TestPolicyMCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = reg.Close() })
 	s := newServer(reg)
 	c := testClient(t, s)
 	listed, err := c.ListTools(context.Background(), mcp.ListToolsRequest{})

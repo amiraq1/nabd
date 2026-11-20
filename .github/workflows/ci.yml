@@ -38,16 +38,28 @@ jobs:
       - name: go test
         run: go test ./... -count=1
 
+      - name: go test race detector
+        run: CGO_ENABLED=1 go test -race ./... -count=1
+
+      - name: go test stress count 10
+        run: go test ./... -count=10
+
       - name: staticcheck
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
           "$(go env GOPATH)/bin/staticcheck" ./...
 
-      - name: cross build (linux amd64/arm64)
+      - name: cross build (linux, android, windows)
         env:
           CGO_ENABLED: "0"
         run: |
           for arch in amd64 arm64; do
-            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/nabdcoder-$arch" ./cmd/agent
-            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/mcp-server-$arch" ./cmd/mcp-server
+            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/nabdcoder-linux-$arch" ./cmd/agent
+            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/mcp-server-linux-$arch" ./cmd/mcp-server
           done
+          # Android ARM64
+          GOOS=android GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "/tmp/nabdcoder-android-arm64" ./cmd/agent
+          GOOS=android GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "/tmp/mcp-server-android-arm64" ./cmd/mcp-server
+          # Windows AMD64
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "/tmp/nabdcoder-windows-amd64.exe" ./cmd/agent
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "/tmp/mcp-server-windows-amd64.exe" ./cmd/mcp-server

@@ -88,6 +88,7 @@ func TestF19RunDoesNotWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = r.Close() })
 
 	args := json.RawMessage(`{"path":"a.txt","old_text":"old","new_text":"new"}`)
 	out := r.Run(context.Background(), "edit_file", args)

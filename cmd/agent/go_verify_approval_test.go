@@ -12,6 +12,7 @@ func TestGoVerifyApprovalShowsPackage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	t.Cleanup(func() { _ = reg.Close() })
 	if !reg.NeedsApproval("go_verify") {
 		t.Fatal("go_verify must require approval")
 	}

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -28,10 +29,13 @@ import (
 )
 
 const (
-	maxOutputBytes = 4096
-	maxReadBytes   = 512 << 10
-	maxEditBytes   = 2 << 20
-	maxListEntries = 1000
+	maxOutputBytes   = 4096
+	maxReadBytes     = 512 << 10
+	maxEditBytes     = 2 << 20
+	maxListEntries   = 1000
+	maxSearchBytes   = 256 << 10 // per-file search read limit
+	maxSearchHits    = 50        // maximum result lines returned
+	maxSearchLineLen = 300       // characters shown per matching line
 )
 
 type ApprovalFunc func(toolName, summary string) bool
@@ -47,6 +51,26 @@ type ToolSpec struct {
 	Execute  func(ctx context.Context, args json.RawMessage) (string, error)
 }
 
+// mcpSession wraps a running MCP client so the registry can reuse it across calls.
+type mcpSession struct {
+	mu     sync.Mutex
+	c      *client.Client
+	closed bool
+}
+
+func (s *mcpSession) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeLocked()
+}
+
+func (s *mcpSession) closeLocked() {
+	if !s.closed && s.c != nil {
+		_ = s.c.Close()
+		s.closed = true
+	}
+}
+
 type Registry struct {
 	workDir  string
 	root     *os.Root
@@ -57,6 +81,16 @@ type Registry struct {
 	mu       sync.Mutex
 	pending  map[string]pendingApproval
 	now      func() time.Time
+
+	// mcpSessions pools live MCP stdio clients keyed by command string.
+	mcpSessionsMu sync.Mutex
+	mcpSessions   map[string]*mcpSession
+
+	// Lifecycle root context bound to Registry. Close() cancels this context,
+	// terminating all child processes and derived operations.
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+	closeOnce sync.Once
 }
 
 type pendingApproval struct {
@@ -106,27 +140,50 @@ func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
 		_ = root.Close()
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	r := &Registry{
-		workDir:  absRoot,
-		root:     root,
-		shadow:   store,
-		auditLog: auditLog,
-		approve:  approve,
-		handlers: make(map[string]ToolSpec),
-		pending:  make(map[string]pendingApproval),
-		now:      time.Now,
+		workDir:     absRoot,
+		root:        root,
+		shadow:      store,
+		auditLog:    auditLog,
+		approve:     approve,
+		handlers:    make(map[string]ToolSpec),
+		pending:     make(map[string]pendingApproval),
+		now:         time.Now,
+		mcpSessions: make(map[string]*mcpSession),
+		ctx:         ctx,
+		cancelCtx:   cancel,
 	}
 	r.registerDefaults()
 	return r, nil
 }
 
-// Close releases the workspace handle. The registry must not be used afterwards.
-func (r *Registry) Close() error {
-	if r.root == nil {
-		return nil
-	}
-	err := r.root.Close()
-	r.root = nil
+// Close releases the workspace handle and all pooled MCP sessions.
+// The registry must not be used afterwards.
+func (r *Registry) Close() (err error) {
+	r.closeOnce.Do(func() {
+		if r.cancelCtx != nil {
+			r.cancelCtx()
+		}
+		// Shut down MCP sessions first (they don't hold the main mutex).
+		r.mcpSessionsMu.Lock()
+		sessions := make([]*mcpSession, 0, len(r.mcpSessions))
+		for _, sess := range r.mcpSessions {
+			sessions = append(sessions, sess)
+		}
+		r.mcpSessions = nil
+		r.mcpSessionsMu.Unlock()
+
+		for _, sess := range sessions {
+			sess.close()
+		}
+
+		_ = r.auditLog.Close()
+
+		if r.root != nil {
+			err = r.root.Close()
+		}
+	})
 	return err
 }
 
@@ -184,6 +241,11 @@ func (r *Registry) Disable(names ...string) {
 	for _, name := range names {
 		delete(r.handlers, name)
 	}
+}
+
+// Register adds or overrides a tool specification in the registry.
+func (r *Registry) Register(spec ToolSpec) {
+	r.handlers[spec.Name] = spec
 }
 
 // resolveSafePath validates a workspace-relative path and returns it in the
@@ -259,6 +321,16 @@ func isSensitivePath(rel string) bool {
 	return false
 }
 
+// isBuildOrVendorDir returns true for well-known generated/vendor directories
+// that search_files should skip.
+func isBuildOrVendorDir(name string) bool {
+	switch name {
+	case "vendor", "node_modules", "dist", "build", "out", ".cache", "target":
+		return true
+	}
+	return false
+}
+
 // FileDigest returns the SHA-256 of a file inside the workspace. The approval
 // UI uses it to confirm that the file did not change between the preview and
 // the approved edit.
@@ -281,6 +353,16 @@ func (r *Registry) FileDigest(relPath string) (string, error) {
 }
 
 func (r *Registry) readFile(rel string) (string, error) {
+	return r.readFileRange(rel, 0, 0)
+}
+
+// readFileRange reads rel, optionally restricting to lines [startLine, endLine]
+// (1-based, inclusive). Zero values mean "no restriction".
+func (r *Registry) readFileRange(rel string, startLine, endLine int) (string, error) {
+	if startLine > 0 && endLine > 0 && startLine > endLine {
+		return "", fmt.Errorf("start_line (%d) cannot be greater than end_line (%d)", startLine, endLine)
+	}
+
 	info, err := r.root.Stat(rel)
 	if err != nil {
 		return "", err
@@ -294,19 +376,49 @@ func (r *Registry) readFile(rel string) (string, error) {
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
-	if err != nil {
+	// If no line range requested, use the original fast path.
+	if startLine <= 0 && endLine <= 0 {
+		data, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
+		if err != nil {
+			return "", err
+		}
+		truncated := len(data) > maxReadBytes
+		if truncated {
+			data = data[:maxReadBytes]
+		}
+		out := string(data)
+		if truncated {
+			out += fmt.Sprintf("\n...[truncated at %d bytes]", maxReadBytes)
+		}
+		return out, nil
+	}
+
+	// Line-range path: stream through the file.
+	scanner := bufio.NewScanner(io.LimitReader(f, maxReadBytes+1))
+	scanner.Buffer(make([]byte, 0, 64*1024), maxReadBytes)
+	var b strings.Builder
+	lineNo := 0
+	totalBytes := 0
+	for scanner.Scan() {
+		lineNo++
+		if startLine > 0 && lineNo < startLine {
+			continue
+		}
+		if endLine > 0 && lineNo > endLine {
+			break
+		}
+		line := scanner.Text()
+		fmt.Fprintf(&b, "%d: %s\n", lineNo, line)
+		totalBytes += len(line) + 10
+		if totalBytes > maxReadBytes {
+			b.WriteString(fmt.Sprintf("\n...[truncated at %d bytes]", maxReadBytes))
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
 		return "", err
 	}
-	truncated := len(data) > maxReadBytes
-	if truncated {
-		data = data[:maxReadBytes]
-	}
-	out := string(data)
-	if truncated {
-		out += fmt.Sprintf("\n...[truncated at %d bytes]", maxReadBytes)
-	}
-	return out, nil
+	return b.String(), nil
 }
 
 func (r *Registry) listDir(rel string) (string, error) {
@@ -343,6 +455,224 @@ func (r *Registry) listDir(rel string) (string, error) {
 		b.WriteString(fmt.Sprintf("... [%d more entries]\n", hidden))
 	}
 	return b.String(), nil
+}
+
+// bytesContainsFold returns true if s contains subLower (which must be lowercase)
+// using a case-insensitive match without allocating heap memory for ASCII text.
+func bytesContainsFold(s, subLower []byte, isASCII bool) bool {
+	if len(subLower) == 0 {
+		return true
+	}
+	if len(subLower) > len(s) {
+		return false
+	}
+	if isASCII {
+		first := subLower[0]
+		firstUpper := first
+		if first >= 'a' && first <= 'z' {
+			firstUpper = first - ('a' - 'A')
+		}
+		limit := len(s) - len(subLower)
+		for i := 0; i <= limit; i++ {
+			b := s[i]
+			if b == first || b == firstUpper {
+				match := true
+				for j := 1; j < len(subLower); j++ {
+					c := s[i+j]
+					if c >= 'A' && c <= 'Z' {
+						c += ('a' - 'A')
+					}
+					if c != subLower[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return unicodeContainsFold(s, subLower)
+}
+
+// unicodeContainsFold performs Unicode case-insensitive substring search.
+// Supports standard Unicode case folding (including Arabic text, Cyrillic, Greek,
+// accented Latin like café and über) and full-case Sharp S (ß <-> ss) equivalence.
+func unicodeContainsFold(s, subLower []byte) bool {
+	if len(subLower) == 0 {
+		return true
+	}
+	sLower := bytes.ToLower(s)
+	if bytes.Contains(sLower, subLower) {
+		return true
+	}
+	// Full case-folding for German sharp s (ß <-> ss):
+	if bytes.Contains(subLower, []byte("ß")) {
+		altSub := bytes.ReplaceAll(subLower, []byte("ß"), []byte("ss"))
+		if bytes.Contains(sLower, altSub) {
+			return true
+		}
+	}
+	if bytes.Contains(sLower, []byte("ß")) {
+		altS := bytes.ReplaceAll(sLower, []byte("ß"), []byte("ss"))
+		if bytes.Contains(altS, subLower) {
+			return true
+		}
+	}
+	return false
+}
+
+// searchFiles performs a case-insensitive text search across workspace files,
+// skipping sensitive paths, binary files, and build/vendor directories.
+func (r *Registry) searchFiles(pattern string, dir string) (string, error) {
+	if strings.TrimSpace(pattern) == "" {
+		return "", fmt.Errorf("pattern cannot be empty")
+	}
+	patternLower := strings.ToLower(pattern)
+	patternLowerBytes := []byte(patternLower)
+	isASCII := true
+	for _, b := range patternLowerBytes {
+		if b >= 0x80 {
+			isASCII = false
+			break
+		}
+	}
+	// German sharp s full fold: "ss" in query can match "ß" in source files
+	if isASCII && strings.Contains(patternLower, "ss") {
+		isASCII = false
+	}
+
+	startDir := "."
+	if strings.TrimSpace(dir) != "" {
+		rel, err := r.resolveSafePath(dir)
+		if err != nil {
+			return "", err
+		}
+		startDir = rel
+	}
+
+	var b strings.Builder
+	hits := 0
+
+	var walk func(relDir string) error
+	walk = func(relDir string) error {
+		f, err := r.root.Open(relDir)
+		if err != nil {
+			return nil // skip unreadable directories
+		}
+		defer f.Close()
+
+		entries, err := f.ReadDir(-1)
+		if err != nil {
+			return nil
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+		for _, entry := range entries {
+			if hits >= maxSearchHits {
+				return nil
+			}
+			name := entry.Name()
+			relPath := filepath.Join(relDir, name)
+			relSlash := filepath.ToSlash(relPath)
+
+			if isSensitivePath(relPath) {
+				continue
+			}
+			// Skip symlinks to prevent directory escape and infinite symlink cycles.
+			if entry.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if entry.IsDir() {
+				if isBuildOrVendorDir(name) {
+					continue
+				}
+				_ = walk(relPath)
+				continue
+			}
+
+			// Skip obviously binary files by extension.
+			ext := strings.ToLower(filepath.Ext(name))
+			switch ext {
+			case ".exe", ".bin", ".so", ".dll", ".dylib", ".o", ".a",
+				".jpg", ".jpeg", ".png", ".gif", ".webp", ".ico",
+				".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz",
+				".woff", ".woff2", ".ttf", ".eot":
+				continue
+			}
+
+			// Read up to maxSearchBytes.
+			fh, err := r.root.Open(relPath)
+			if err != nil {
+				continue
+			}
+			data, readErr := io.ReadAll(io.LimitReader(fh, maxSearchBytes))
+			_ = fh.Close()
+			if readErr != nil {
+				continue
+			}
+			// Heuristic: if more than 1% of the first 512 bytes are non-printable
+			// (excluding common whitespace), treat the file as binary.
+			probe := data
+			if len(probe) > 512 {
+				probe = probe[:512]
+			}
+			nonPrint := 0
+			for _, c := range probe {
+				if c < 0x09 || (c > 0x0d && c < 0x20) || c == 0x7f {
+					nonPrint++
+				}
+			}
+			if len(probe) > 0 && nonPrint*100/len(probe) > 1 {
+				continue
+			}
+
+			// Fast pre-filter: skip entire file if pattern is not present.
+			// Zero heap allocations for non-matching files.
+			if !bytesContainsFold(data, patternLowerBytes, isASCII) {
+				continue
+			}
+
+			// In-place line scanning: avoid strings.Split and per-line allocations.
+			lineNo := 1
+			remaining := data
+			for len(remaining) > 0 && hits < maxSearchHits {
+				idx := bytes.IndexByte(remaining, '\n')
+				var lineBytes []byte
+				if idx >= 0 {
+					lineBytes = remaining[:idx]
+					remaining = remaining[idx+1:]
+				} else {
+					lineBytes = remaining
+					remaining = nil
+				}
+				lineBytes = bytes.TrimSuffix(lineBytes, []byte("\r"))
+				if bytesContainsFold(lineBytes, patternLowerBytes, isASCII) {
+					lineStr := string(lineBytes)
+					if len(lineStr) > maxSearchLineLen {
+						lineStr = lineStr[:maxSearchLineLen] + "..."
+					}
+					fmt.Fprintf(&b, "%s:%d: %s\n", relSlash, lineNo, lineStr)
+					hits++
+				}
+				lineNo++
+			}
+		}
+		return nil
+	}
+
+	_ = walk(startDir)
+
+	if b.Len() == 0 {
+		return fmt.Sprintf("No matches found for %q", pattern), nil
+	}
+	out := b.String()
+	if hits >= maxSearchHits {
+		out += fmt.Sprintf("\n...[results capped at %d matches]\n", maxSearchHits)
+	}
+	return out, nil
 }
 
 // Undo restores the most recent non-undone shadow entry for relPath (or the
@@ -456,6 +786,9 @@ func randomHex(n int) string {
 // interactive approval path fail closed. Every action is appended to the
 // audit log.
 func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage) string {
+	if r.ctx != nil && r.ctx.Err() != nil {
+		return "Error: registry is closed"
+	}
 	spec, ok := r.handlers[name]
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", name)
@@ -464,7 +797,7 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 	detail := toolDetail(name, rawArgs)
 
 	if spec.ReadOnly {
-		_ = r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: detail})
+		_ = r.logEventReadOnly(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: detail})
 		return r.execute(ctx, spec, name, rawArgs, hash)
 	}
 
@@ -560,6 +893,9 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 // RunApproved executes a tool with a token issued by Approve. Tokens are bound
 // to the tool and argument hash, expire, and can be used once.
 func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.RawMessage, approval Approval) string {
+	if r.ctx != nil && r.ctx.Err() != nil {
+		return "Error: registry is closed"
+	}
 	spec, ok := r.handlers[name]
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", name)
@@ -567,7 +903,7 @@ func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.Ra
 	hash := hashBytes(rawArgs)
 
 	if spec.ReadOnly {
-		_ = r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)})
+		_ = r.logEventReadOnly(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)})
 		return r.execute(ctx, spec, name, rawArgs, hash)
 	}
 
@@ -612,7 +948,8 @@ func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawA
 		return result
 	}
 	result := truncateOutput(out)
-	if err := r.logEvent(audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))}); err != nil && !spec.ReadOnly {
+	logErr := r.logEventForSpec(spec, audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))})
+	if logErr != nil && !spec.ReadOnly {
 		result += "\nWarning: audit log write failed"
 	}
 	return result
@@ -640,7 +977,21 @@ func (r *Registry) pruneApprovalsLocked(now time.Time) {
 	}
 }
 
+// logEvent writes a mandatory (synced) audit event.
 func (r *Registry) logEvent(event audit.Event) error {
+	return r.auditLog.Write(event)
+}
+
+// logEventReadOnly writes a best-effort (non-synced) audit event for ReadOnly tools.
+func (r *Registry) logEventReadOnly(event audit.Event) error {
+	return r.auditLog.WriteBestEffort(event)
+}
+
+// logEventForSpec chooses sync vs best-effort based on the tool's ReadOnly flag.
+func (r *Registry) logEventForSpec(spec ToolSpec, event audit.Event) error {
+	if spec.ReadOnly {
+		return r.auditLog.WriteBestEffort(event)
+	}
 	return r.auditLog.Write(event)
 }
 
@@ -649,6 +1000,8 @@ func toolDetail(name string, rawArgs json.RawMessage) string {
 		Path    string `json:"path"`
 		Pkg     string `json:"pkg"`
 		Command string `json:"command"`
+		Pattern string `json:"pattern"`
+		Dir     string `json:"dir"`
 	}
 	_ = json.Unmarshal(rawArgs, &p)
 
@@ -656,6 +1009,11 @@ func toolDetail(name string, rawArgs json.RawMessage) string {
 	switch name {
 	case "edit_file", "read_file", "list_dir":
 		detail = p.Path
+	case "search_files":
+		detail = p.Pattern
+		if p.Dir != "" {
+			detail += " in " + p.Dir
+		}
 	case "go_verify":
 		detail = p.Pkg
 		if detail == "" {
@@ -671,6 +1029,75 @@ func toolDetail(name string, rawArgs json.RawMessage) string {
 		detail = detail[:200]
 	}
 	return strings.ToValidUTF8(detail, "\uFFFD")
+}
+
+// getOrStartMCPSession returns an existing live MCP session for the given
+// command, or starts a new one. The caller must NOT hold any registry mutex.
+func (r *Registry) getOrStartMCPSession(ctx context.Context, command string) (*client.Client, func(), error) {
+	for {
+		r.mcpSessionsMu.Lock()
+		if r.ctx != nil && r.ctx.Err() != nil {
+			r.mcpSessionsMu.Unlock()
+			return nil, nil, errors.New("registry is closed")
+		}
+		sess, ok := r.mcpSessions[command]
+		if ok {
+			r.mcpSessionsMu.Unlock()
+			sess.mu.Lock()
+			if sess.closed {
+				sess.mu.Unlock()
+				r.mcpSessionsMu.Lock()
+				if r.mcpSessions[command] == sess {
+					delete(r.mcpSessions, command)
+				}
+				r.mcpSessionsMu.Unlock()
+				continue
+			}
+			return sess.c, func() { sess.mu.Unlock() }, nil
+		}
+
+		// Start a new session while holding the outer map lock so only one goroutine
+		// races to start a session for the same command.
+		// Bind subprocess creation to registry root context with process tree supervision.
+		cmdFunc := func(cmdCtx context.Context, cmdName string, cmdEnv []string, cmdArgs []string) (*exec.Cmd, error) {
+			cmd := exec.CommandContext(r.ctx, cmdName, cmdArgs...)
+			if len(cmdEnv) > 0 {
+				cmd.Env = cmdEnv
+			}
+			configureProcessTree(cmd)
+			return cmd, nil
+		}
+		stdioTransport := transport.NewStdioWithOptions(command, nil, nil, transport.WithCommandFunc(cmdFunc))
+		c := client.NewClient(stdioTransport)
+		if err := c.Start(context.Background()); err != nil {
+			r.mcpSessionsMu.Unlock()
+			return nil, nil, fmt.Errorf("failed to start MCP server: %w", err)
+		}
+
+		initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		initReq := mcp.InitializeRequest{
+			Params: mcp.InitializeParams{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo: mcp.Implementation{
+					Name:    "nabd",
+					Version: "1.0.0",
+				},
+			},
+		}
+		_, err := c.Initialize(initCtx, initReq)
+		initCancel()
+		if err != nil {
+			_ = c.Close()
+			r.mcpSessionsMu.Unlock()
+			return nil, nil, fmt.Errorf("failed to initialize MCP server: %w", err)
+		}
+
+		sess = &mcpSession{c: c}
+		sess.mu.Lock()
+		r.mcpSessions[command] = sess
+		r.mcpSessionsMu.Unlock()
+		return c, func() { sess.mu.Unlock() }, nil
+	}
 }
 
 func (r *Registry) registerDefaults() {
@@ -789,12 +1216,14 @@ func (r *Registry) registerDefaults() {
 
 	r.handlers["read_file"] = ToolSpec{
 		Name:        "read_file",
-		Description: "Read the contents of a file inside the workspace.",
+		Description: "Read the contents of a file inside the workspace. Optionally specify start_line and end_line (1-based, inclusive) to read only a range, which reduces context size sent to the model.",
 		ReadOnly:    true,
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"start_line":{"type":"integer","description":"First line to read (1-based, optional)"},"end_line":{"type":"integer","description":"Last line to read (1-based, inclusive, optional)"}},"required":["path"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var p struct {
-				Path string `json:"path"`
+				Path      string `json:"path"`
+				StartLine int    `json:"start_line"`
+				EndLine   int    `json:"end_line"`
 			}
 			if err := json.Unmarshal(args, &p); err != nil {
 				return "", err
@@ -803,7 +1232,24 @@ func (r *Registry) registerDefaults() {
 			if err != nil {
 				return "", err
 			}
-			return r.readFile(rel)
+			return r.readFileRange(rel, p.StartLine, p.EndLine)
+		},
+	}
+
+	r.handlers["search_files"] = ToolSpec{
+		Name:        "search_files",
+		Description: "Search for a text pattern across all workspace files. Use this before read_file to quickly locate relevant files and line numbers. Skips sensitive paths, binary files, and build/vendor directories. Returns at most 50 matching lines.",
+		ReadOnly:    true,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Text to search for (case-insensitive)"},"dir":{"type":"string","description":"Subdirectory to restrict the search to (optional, defaults to workspace root)"}},"required":["pattern"]}`),
+		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
+			var p struct {
+				Pattern string `json:"pattern"`
+				Dir     string `json:"dir"`
+			}
+			if err := json.Unmarshal(args, &p); err != nil {
+				return "", err
+			}
+			return r.searchFiles(p.Pattern, p.Dir)
 		},
 	}
 
@@ -830,7 +1276,7 @@ func (r *Registry) registerDefaults() {
 
 	r.handlers["mcp_call"] = ToolSpec{
 		Name:        "mcp_call",
-		Description: "Call a tool on an external MCP server via stdio. Starts the server process, calls the tool, then closes it.",
+		Description: "Call a tool on an external MCP server via stdio. Reuses a pooled server process for the same command to avoid per-call startup overhead.",
 		ReadOnly:    false,
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Command to start the MCP server (e.g. nabd-mcp)"},"tool":{"type":"string","description":"Name of the tool to call on the MCP server"},"arguments":{"type":"object","description":"Arguments to pass to the tool"}},"required":["command","tool"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
@@ -849,12 +1295,11 @@ func (r *Registry) registerDefaults() {
 			tCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 
-			stdioTransport := transport.NewStdio(p.Command, nil)
-			c := client.NewClient(stdioTransport)
-			if err := c.Start(tCtx); err != nil {
-				return "", fmt.Errorf("failed to start MCP server: %w", err)
+			c, cleanup, err := r.getOrStartMCPSession(tCtx, p.Command)
+			if err != nil {
+				return "", err
 			}
-			defer c.Close()
+			defer cleanup()
 
 			result, err := c.CallTool(tCtx, mcp.CallToolRequest{
 				Params: mcp.CallToolParams{
@@ -863,6 +1308,13 @@ func (r *Registry) registerDefaults() {
 				},
 			})
 			if err != nil {
+				// Mark the session as dead so the next call restarts it.
+				r.mcpSessionsMu.Lock()
+				if sess, ok := r.mcpSessions[p.Command]; ok {
+					sess.closeLocked()
+					delete(r.mcpSessions, p.Command)
+				}
+				r.mcpSessionsMu.Unlock()
 				return "", fmt.Errorf("mcp call failed: %w", err)
 			}
 

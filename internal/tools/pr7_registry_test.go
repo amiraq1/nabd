@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,6 +26,7 @@ func mustRegistry(t *testing.T, dir string) *Registry {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	t.Cleanup(func() { _ = r.Close() })
 	return r
 }
 
@@ -140,7 +142,12 @@ func TestEditFileUsesAtomicRename(t *testing.T) {
 	p := filepath.Join(dir, "a.txt")
 	mustWrite(t, p, "old\n", 0600)
 
-	before, err := os.Stat(p)
+	f1, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := f1.Stat()
+	_ = f1.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,14 +155,19 @@ func TestEditFileUsesAtomicRename(t *testing.T) {
 	if !strings.HasPrefix(out, "Successfully") {
 		t.Fatalf("edit failed: %q", out)
 	}
-	after, err := os.Stat(p)
+	f2, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := f2.Stat()
+	_ = f2.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if os.SameFile(before, after) {
 		t.Fatal("edit_file wrote in place; expected atomic temp+rename")
 	}
-	if after.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && after.Mode().Perm() != 0600 {
 		t.Fatalf("mode changed: got %o want 0600", after.Mode().Perm())
 	}
 	got, err := os.ReadFile(p)
@@ -196,7 +208,7 @@ func fakeGo(t *testing.T, script string) {
 	t.Helper()
 	sh, err := exec.LookPath("sh")
 	if err != nil {
-		t.Fatalf("sh not found: %v", err)
+		t.Skipf("sh not found: %v", err)
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "go")
