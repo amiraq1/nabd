@@ -59,6 +59,17 @@ func main(){
  }
 }`
 
+func buildStaticHelper(t *testing.T, dest, pkg string) string {
+	t.Helper()
+	path := filepath.Join(dest, filepath.Base(pkg))
+	cmd := exec.Command("go", "build", "-trimpath", "-o", path, "../../cmd/"+pkg)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build %s: %v\n%s", pkg, err, out)
+	}
+	return path
+}
+
 func f24Probe(t *testing.T, mode string) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -68,6 +79,8 @@ func f24Probe(t *testing.T, mode string) (string, string) {
 	}
 	bin := filepath.Join(dir, mode+" ; literal")
 	cmd := exec.Command("go", "build", "-o", bin, src)
+	// The sandbox root has no dynamic loader; all binaries run inside it are static.
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build probe: %v\n%s", err, out)
 	}

@@ -32,6 +32,10 @@ var (
 	bwrapOverride   string
 )
 
+func setHelpersForTesting(limiter, probe string) {
+	limiterOverride, probeOverride = limiter, probe
+}
+
 type linuxBackend struct {
 	bwrap string
 }

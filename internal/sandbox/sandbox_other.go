@@ -9,6 +9,8 @@ import (
 
 func current() Backend { return unavailableBackend{} }
 
+func setHelpersForTesting(string, string) {}
+
 type unavailableBackend struct{}
 
 func (unavailableBackend) Name() string                { return "unavailable" }

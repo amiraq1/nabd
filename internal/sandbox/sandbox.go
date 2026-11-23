@@ -51,6 +51,11 @@ type Backend interface {
 // check Available and Prove before using it.
 func Current() Backend { return current() }
 
+// SetHelpersForTesting supplies the helper binaries to integration tests in
+// other packages. It is deliberately not configurable through the environment:
+// a user-controlled helper path would let a child replace its own verifier.
+func SetHelpersForTesting(limiter, probe string) { setHelpersForTesting(limiter, probe) }
+
 // Enabled reports whether untrusted execution may be started. It requires an
 // explicit opt-in, a backend, and a successful proof run. Any error fails
 // closed. The returned backend is nil when execution must stay disabled.
