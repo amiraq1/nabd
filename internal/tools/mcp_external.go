@@ -28,6 +28,7 @@ const (
 var errMCPResponseTooLarge = errors.New("MCP response exceeded the 1 MiB wire limit")
 
 // Only tests set this; no environment variable can substitute the guard.
+//
 //lint:ignore U1000 exercised by platform-specific integration tests
 var mcpGuardOverride string
 
