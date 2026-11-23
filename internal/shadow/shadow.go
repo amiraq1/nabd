@@ -4,6 +4,7 @@
 package shadow
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -47,9 +48,11 @@ type Entry struct {
 
 // Store persists backups inside an already-jailed workspace root.
 type Store struct {
-	root *os.Root
-	mu   sync.Mutex
-	now  func() time.Time
+	root            *os.Root
+	mu              sync.Mutex
+	now             func() time.Time
+	retentionCancel context.CancelFunc
+	retentionDone   chan struct{}
 }
 
 // Open creates a store bound to root. It does not write anything until the
@@ -59,6 +62,49 @@ func Open(root *os.Root) (*Store, error) {
 		return nil, errors.New("shadow: nil root")
 	}
 	return &Store{root: root, now: time.Now}, nil
+}
+
+// StartRetention runs cleanup immediately and then on the supplied interval.
+// With the 7-day retention rule this gives a bounded deletion deadline while
+// the process is running, instead of cleanup only on the next backup.
+func (s *Store) StartRetention(ctx context.Context, interval time.Duration) {
+	if s == nil || interval <= 0 {
+		return
+	}
+	s.StopRetention()
+	runCtx, cancel := context.WithCancel(ctx)
+	s.retentionCancel = cancel
+	s.retentionDone = make(chan struct{})
+	done := s.retentionDone
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			_ = s.Cleanup(s.now())
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+// StopRetention stops the background cleanup loop.
+func (s *Store) StopRetention() {
+	if s == nil || s.retentionCancel == nil {
+		return
+	}
+	s.retentionCancel()
+	s.retentionCancel = nil
+}
+
+// Cleanup applies the retention quota now and reports removal failures.
+func (s *Store) Cleanup(now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pruneLocked(now)
 }
 
 // Backup saves the original bytes before an edit and records both hashes.
@@ -312,6 +358,7 @@ func (s *Store) pruneLocked(now time.Time) error {
 	if err != nil {
 		return err
 	}
+	var cleanupErr error
 
 	byPath := make(map[string][]Entry)
 	for _, entry := range entries {
@@ -329,11 +376,17 @@ func (s *Store) pruneLocked(now time.Time) error {
 			if i < maxPerPath && now.Sub(entry.CreatedAt) <= retention {
 				continue
 			}
-			_ = s.root.Remove(backupName(entry.ID))
-			_ = s.root.Remove(metaName(entry.ID))
+			// Remove metadata first so a later Latest never sees an entry
+			// whose backup has already been deleted.
+			if err := s.root.Remove(metaName(entry.ID)); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+			if err := s.root.Remove(backupName(entry.ID)); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
 		}
 	}
-	return nil
+	return cleanupErr
 }
 
 func backupName(id string) string { return baseDir + "/" + id + backupExt }

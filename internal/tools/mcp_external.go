@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/amiraq1/nabd/internal/sandbox"
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -27,6 +28,7 @@ const (
 var errMCPResponseTooLarge = errors.New("MCP response exceeded the 1 MiB wire limit")
 
 // Only tests set this; no environment variable can substitute the guard.
+//lint:ignore U1000 exercised by platform-specific integration tests
 var mcpGuardOverride string
 
 type wireLimitReader struct {
@@ -58,6 +60,8 @@ func (l *wireLimitReader) Read(p []byte) (int, error) {
 	l.remaining -= int64(n)
 	return n, err
 }
+
+//lint:ignore U1000 exercised by platform-specific integration tests
 func mcpEnvironment() []string {
 	allowed := map[string]bool{"PATH": true, "HOME": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "PREFIX": true}
 	env := []string{}
@@ -69,6 +73,8 @@ func mcpEnvironment() []string {
 	}
 	return env
 }
+
+//lint:ignore U1000 exercised by platform-specific integration tests
 func mcpGuardPath() (string, error) {
 	path := mcpGuardOverride
 	if path == "" {
@@ -84,6 +90,8 @@ func mcpGuardPath() (string, error) {
 	}
 	return path, nil
 }
+
+//lint:ignore U1000 exercised by platform-specific integration tests
 func callExternalMCP(ctx context.Context, dir, command, tool string, args map[string]any) (output string, retErr error) {
 	if (runtime.GOOS != "linux" && runtime.GOOS != "android") || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
 		return "", fmt.Errorf("MCP process isolation unsupported on %s/%s", runtime.GOOS, runtime.GOARCH)
@@ -101,6 +109,52 @@ func callExternalMCP(ctx context.Context, dir, command, tool string, args map[st
 	if err != nil {
 		return "", err
 	}
+	return runMCPProtocol(callCtx, process, stdin, stdout, tool, args)
+}
+
+// callExternalMCPServer launches a user-preconfigured server inside the proven
+// sandbox. The model cannot choose an executable or an environment variable.
+func callExternalMCPServer(ctx context.Context, dir string, b sandbox.Backend, server MCPServer, tool string, args map[string]any) (output string, retErr error) {
+	if b == nil {
+		return "", fmt.Errorf("mcp_call is disabled: no proven execution sandbox is active")
+	}
+	guard := server.Config.Guard
+	targetArgs := append([]string{server.Config.Executable}, server.Config.Args...)
+	outer := guard
+	if server.Config.UserGuard != "" {
+		// A user guard is an outer wrapper: it receives the built-in guard
+		// command and its arguments, then the configured server command.
+		outer = server.Config.UserGuard
+		targetArgs = append([]string{guard}, append(targetArgs, server.Config.UserGuardArgs...)...)
+	}
+	profile := sandbox.Profile{
+		WorkDir:            dir,
+		WritableWorkspace:  false,
+		Env:                MCPEnvironment(server.Config),
+		MemoryLimitBytes:   512 << 20,
+		ProcessLimit:       32,
+		ExtraReadonlyBinds: []string{guard, server.Config.Executable},
+	}
+	if server.Config.UserGuard != "" {
+		profile.ExtraReadonlyBinds = append(profile.ExtraReadonlyBinds, server.Config.UserGuard)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
+	defer cancel()
+	if err := callCtx.Err(); err != nil {
+		return "", err
+	}
+	cmd, err := b.Wrap(callCtx, profile, outer, targetArgs...)
+	if err != nil {
+		return "", err
+	}
+	process, stdin, stdout, err := startMCPProcessWithCmd(callCtx, cmd)
+	if err != nil {
+		return "", err
+	}
+	return runMCPProtocol(callCtx, process, stdin, stdout, tool, args)
+}
+
+func runMCPProtocol(callCtx context.Context, process *mcpProcess, stdin, stdout *os.File, tool string, args map[string]any) (output string, retErr error) {
 	limited := &wireLimitReader{r: stdout, remaining: maxMCPWireBytes}
 	c := client.NewClient(transport.NewIO(limited, stdin, nil))
 	defer func() {

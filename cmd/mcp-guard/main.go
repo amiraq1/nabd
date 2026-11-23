@@ -17,7 +17,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "mcp-guard: %v\n", err)
 		os.Exit(1)
 	}
-	if err := execTarget(target); err != nil {
+	if err := execTarget(target, os.Args[2:]); err != nil {
 		fmt.Fprintf(os.Stderr, "mcp-guard: %v\n", err)
 		os.Exit(1)
 	}

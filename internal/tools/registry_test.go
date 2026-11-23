@@ -765,10 +765,10 @@ func TestAuditLogApprovalFlow(t *testing.T) {
 	}
 
 	events, rawLog := readAuditLog(t, root)
-	if len(events) != 3 {
-		t.Fatalf("audit events = %d, want 3: %+v", len(events), events)
+	if len(events) != 4 {
+		t.Fatalf("audit events = %d, want 4: %+v", len(events), events)
 	}
-	want := []string{"requested", "approved", "applied"}
+	want := []string{"requested", "approved", "executing", "applied"}
 	for i, event := range events {
 		if event.Event != want[i] {
 			t.Errorf("event %d = %q, want %q", i, event.Event, want[i])
@@ -780,7 +780,7 @@ func TestAuditLogApprovalFlow(t *testing.T) {
 	if events[0].Detail != "target.txt" {
 		t.Errorf("requested detail = %q", events[0].Detail)
 	}
-	if events[2].ResultSHA256 == "" {
+	if events[3].ResultSHA256 == "" {
 		t.Errorf("applied event has no result hash")
 	}
 	for _, secret := range []string{"original", "changed", "Successfully"} {

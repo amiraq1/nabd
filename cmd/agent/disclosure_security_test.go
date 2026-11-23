@@ -89,3 +89,75 @@ func TestUnsandboxedToolsDisabled(t *testing.T) {
 		}
 	}
 }
+
+func TestAllToolOutputsRequireDisclosure(t *testing.T) {
+	for _, tool := range []string{"list_dir", "edit_file", "go_verify", "mcp_call", "unknown_tool"} {
+		t.Run(tool, func(t *testing.T) {
+			_, m := testModel(t)
+			tc := testToolCall(tool, `{}`)
+			tc.ID = tool + "-id"
+			m.pendingTools = []ToolCall{tc}
+			payload := "project-secret-" + tool
+			updated, _ := m.Update(toolExecutedMsg{toolMsg: Message{Role: "tool", ToolCallID: tc.ID, Content: payload}})
+			m = updated.(uiModel)
+			if m.pendingDisclosure == nil {
+				t.Fatal("tool output was sent without disclosure consent")
+			}
+			for _, msg := range m.messages {
+				if strings.Contains(msg.Content, payload) {
+					t.Fatal("payload entered history before approval")
+				}
+			}
+			m.viewport.GotoBottom()
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+			m = updated.(uiModel)
+			last := m.messages[len(m.messages)-1]
+			if last.Content != payload || last.ToolCallID != tc.ID {
+				t.Fatalf("approved payload changed: %+v", last)
+			}
+		})
+	}
+}
+
+func TestDisclosureFailsClosedOnDeceptiveCharacters(t *testing.T) {
+	_, m := testModel(t)
+	tc := testToolCall("list_dir", `{}`)
+	m.pendingTools = []ToolCall{tc}
+	payload := "safe\u202E" + "danger"
+	updated, _ := m.Update(toolExecutedMsg{toolMsg: Message{Role: "tool", ToolCallID: tc.ID, Content: payload}})
+	m = updated.(uiModel)
+	if m.pendingDisclosure != nil {
+		t.Fatal("deceptive output was offered for undisclosed sending")
+	}
+	for _, msg := range m.messages {
+		if strings.Contains(msg.Content, payload) {
+			t.Fatal("deceptive payload entered history")
+		}
+	}
+}
+
+func TestDisclosureOfLongOutputRequiresScrollToEnd(t *testing.T) {
+	_, m := testModel(t)
+	m.viewport.Width, m.viewport.Height = 40, 5
+	tc := testToolCall("go_verify", `{}`)
+	m.pendingTools = []ToolCall{tc}
+	updated, _ := m.Update(toolExecutedMsg{toolMsg: Message{Role: "tool", ToolCallID: tc.ID, Content: strings.Repeat("long-line\n", 500)}})
+	m = updated.(uiModel)
+	if m.pendingDisclosure == nil || m.viewport.TotalLineCount() <= m.viewport.Height {
+		t.Fatal("long output was not rendered as a scrollable review")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = updated.(uiModel)
+	if m.pendingDisclosure == nil {
+		t.Fatal("approval accepted before scrolling to the end")
+	}
+}
+
+func TestAdvisorySecretDetectionIsExplicitlyLimited(t *testing.T) {
+	if len(advisorySecretWarnings("sk-"+strings.Repeat("A", 30))) == 0 {
+		t.Fatal("advisory detector missed a common key format")
+	}
+	if len(advisorySecretWarnings("my novel credential format: zz-1234567890123456")) != 0 {
+		t.Fatal("advisory detector falsely claimed comprehensive detection")
+	}
+}

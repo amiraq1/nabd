@@ -38,7 +38,7 @@ func installFilter() error {
 	return nil
 }
 
-func execTarget(target string) error {
+func execTarget(target string, targetArgs []string) error {
 	path := target
 	if !strings.ContainsRune(target, '/') {
 		var err error
@@ -47,5 +47,6 @@ func execTarget(target string) error {
 			return err
 		}
 	}
-	return syscall.Exec(path, []string{target}, os.Environ())
+	argv := append([]string{target}, targetArgs...)
+	return syscall.Exec(path, argv, os.Environ())
 }

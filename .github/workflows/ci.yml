@@ -26,6 +26,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The sandbox proof test is skipped when bubblewrap is absent. Install it
+      # so CI actually proves the isolation instead of only compiling it.
+      - name: install bubblewrap for sandbox proof
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          bwrap --version
+
       - name: gofmt
         run: test -z "$(gofmt -l .)"
 
@@ -58,6 +66,9 @@ jobs:
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/nabdcoder-$arch" ./cmd/agent
             GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/mcp-server-$arch" ./cmd/mcp-server
+            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/nabd-mcp-guard-$arch" ./cmd/mcp-guard
+            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/nabd-limit-$arch" ./cmd/nabd-limit
+            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "/tmp/nabd-sandbox-probe-$arch" ./cmd/nabd-sandbox-probe
           done
 
       - name: cross build (android arm64)
@@ -66,3 +77,12 @@ jobs:
           GOOS: android
           GOARCH: arm64
         run: go build ./...
+
+      - name: cross build (windows amd64)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build ./...
+          go build -trimpath -ldflags="-s -w" -o /tmp/nabdcoder-windows-amd64.exe ./cmd/agent

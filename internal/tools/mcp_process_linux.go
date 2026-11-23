@@ -29,7 +29,16 @@ func startMCPProcess(ctx context.Context, guard, dir, target string) (*mcpProces
 	cmd := exec.Command(guard, target)
 	cmd.Dir = dir
 	cmd.Env = mcpEnvironment()
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return startMCPProcessWithCmd(ctx, cmd)
+}
+
+// startMCPProcessWithCmd starts a caller-supplied command (for example one
+// built by the sandbox backend) with the same bounded, killable stdio wiring.
+func startMCPProcessWithCmd(ctx context.Context, cmd *exec.Cmd) (*mcpProcess, *os.File, *os.File, error) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
 	inR, inW, err := os.Pipe()
 	if err != nil {
 		return nil, nil, nil, err

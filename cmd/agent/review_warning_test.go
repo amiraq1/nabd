@@ -29,8 +29,9 @@ func TestReviewMCPApprovalWarnsExecutableCanChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.ToLower(p.Summary), "executable identity is not bound") {
-		t.Fatal("missing executable identity warning")
+	if !strings.Contains(strings.ToLower(p.Summary), "configured server") ||
+		!strings.Contains(strings.ToLower(p.Summary), "verification window") {
+		t.Fatal("missing identity-bound or residual-TOCTOU warning")
 	}
 }
 

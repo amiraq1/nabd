@@ -78,15 +78,9 @@ func TestF24IntegrationRealMCPAndEnvironment(t *testing.T) {
 	dir, bin := f24Probe(t, "env")
 	t.Setenv("NABD_API_KEY", "synthetic-only")
 	t.Setenv("F24_PRIVATE_TOKEN", "synthetic-only")
-	r := mustRegistry(t, dir)
-	args, _ := json.Marshal(map[string]any{"command": bin, "tool": "probe"})
-	approval, err := r.Approve("mcp_call", args)
+	out, err := callExternalMCP(context.Background(), dir, bin, "probe", nil)
 	if err != nil {
-		t.Fatal(err)
-	}
-	out := r.RunApproved(context.Background(), "mcp_call", args, approval)
-	if strings.Contains(out, "Error:") {
-		t.Fatalf("real MCP request failed: %s", out)
+		t.Fatalf("real MCP request failed: %v", err)
 	}
 	if !strings.Contains(out, "PATH") {
 		t.Fatal("probe did not return environment names")
@@ -104,13 +98,11 @@ func TestF24IntegrationRealMCPAndEnvironment(t *testing.T) {
 
 func f24Run(t *testing.T, dir, bin string, ctx context.Context) string {
 	t.Helper()
-	r := mustRegistry(t, dir)
-	args, _ := json.Marshal(map[string]any{"command": bin, "tool": "probe"})
-	a, err := r.Approve("mcp_call", args)
+	out, err := callExternalMCP(ctx, dir, bin, "probe", nil)
 	if err != nil {
-		t.Fatal(err)
+		return "Error: " + err.Error()
 	}
-	return r.RunApproved(ctx, "mcp_call", args, a)
+	return out
 }
 func f24PIDs(t *testing.T, dir string) []int {
 	t.Helper()
@@ -325,14 +317,15 @@ func TestF24CanceledContextKillsTree(t *testing.T) {
 	dir, bin := f24Probe(t, "hang")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r := mustRegistry(t, dir)
-	args, _ := json.Marshal(map[string]any{"command": bin, "tool": "probe"})
-	approval, err := r.Approve("mcp_call", args)
-	if err != nil {
-		t.Fatal(err)
-	}
 	done := make(chan string, 1)
-	go func() { done <- r.RunApproved(ctx, "mcp_call", args, approval) }()
+	go func() {
+		out, err := callExternalMCP(ctx, dir, bin, "probe", nil)
+		if err != nil {
+			done <- "Error: " + err.Error()
+			return
+		}
+		done <- out
+	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "pids")); err == nil {
@@ -434,5 +427,52 @@ func TestF24GuardRejectsX32ABI(t *testing.T) {
 	_ = f24Run(t, dir, bin, context.Background())
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatal("x32 ABI bypassed the guard")
+	}
+}
+
+func TestMCPApprovalIsBoundToConfiguredServerIdentity(t *testing.T) {
+	dir, bin := f24Probe(t, "env")
+	guard, err := mcpGuardPath()
+	if err != nil {
+		t.Skipf("guard is not installed for integration tests: %v", err)
+	}
+	guardSum, err := digestFile(guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exeSum, err := digestFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := json.Marshal(mcpConfigFile{Servers: map[string]MCPServerConfig{
+		"probe": {Executable: bin, SHA256: exeSum, Guard: guard, GuardSHA256: guardSum},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "allowlist.json")
+	if err := os.WriteFile(cfgPath, cfg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(MCPConfigEnv, cfgPath)
+	r := mustRegistry(t, dir)
+	defer r.Close()
+	args, _ := json.Marshal(map[string]any{"command": "probe", "tool": "probe"})
+	identity, err := r.MCPIdentity("probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := r.ApproveWithIdentity("mcp_call", args, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := approval
+	wrong.IdentitySHA256 = strings.Repeat("0", 64)
+	if out := r.RunApproved(context.Background(), "mcp_call", args, wrong); !strings.Contains(out, "invalid or expired") {
+		t.Fatalf("approval with a different identity was accepted: %s", out)
+	}
+	// With no proven sandbox the correctly bound token still cannot execute.
+	if out := r.RunApproved(context.Background(), "mcp_call", args, approval); !strings.Contains(out, "disabled") {
+		t.Fatalf("MCP call ran without a sandbox proof: %s", out)
 	}
 }

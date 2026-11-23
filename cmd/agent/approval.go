@@ -13,7 +13,7 @@ import (
 
 const maxApprovalChars = 1600
 const maxApprovalArgs = 4000
-const mcpIdentityWarning = "warning: executable identity is not bound to approval; the command or guard may change before execution"
+const mcpIdentityWarning = "approval is bound to the configured server, guard and environment digests; a local user may still replace a file in the short verification window; filesystem and network bounds come from the proven sandbox, not from this prompt"
 
 type approvalPreview struct {
 	Summary   string
@@ -74,7 +74,7 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		_ = json.Unmarshal([]byte(tc.Function.Arguments), &p)
 
 		var b strings.Builder
-		b.WriteString("warning: launches an external process with your user permissions; it may access the filesystem (including private files) and network; this is not a sandbox\n")
+		b.WriteString("runs with your user permissions only after an isolation backend proved filesystem, network, memory and process limits; only user-preconfigured servers are accepted\n")
 		b.WriteString(mcpIdentityWarning + "\n")
 		fmt.Fprintf(&b, "command: %s\ntool: %s\narguments sha256: %s\n",
 			sanitizeForDisplay(p.Command), sanitizeForDisplay(p.Tool), sha256Hex(string(p.Arguments)))
@@ -89,7 +89,7 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		if pkg == "" {
 			pkg = "./..."
 		}
-		summary := fmt.Sprintf("warning: executes project code with your user permissions; it may access the filesystem (including private files) and network; the environment is restricted, but this is not a sandbox\nruns project tests via go test\npkg: %s", sanitizeForDisplay(pkg))
+		summary := fmt.Sprintf("runs project tests via go test with your user permissions inside the proven sandbox when enabled; otherwise the tool is disabled\nfilesystem and network access are bounded, with memory and process limits\npkg: %s", sanitizeForDisplay(pkg))
 		return approvalPreview{Summary: clip(sanitizeForDisplay(summary), maxApprovalChars)}
 
 	default:

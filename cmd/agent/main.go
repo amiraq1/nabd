@@ -119,7 +119,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				id := m.pendingDisclosure.ToolCallID
 				m.pendingDisclosure = nil
 				m.pendingTools = m.pendingTools[1:]
-				m.messages = append(m.messages, Message{Role: "tool", ToolCallID: id, Content: "File disclosure rejected by user.", Display: "File disclosure rejected"})
+				m.messages = append(m.messages, Message{Role: "tool", ToolCallID: id, Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"})
 				m.refresh()
 				return m.advance()
 			}
@@ -150,6 +150,19 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				var err error
 				if tc.Function.Name == "edit_file" {
 					approval, err = m.registry.ApprovePreview(tc.Function.Name, json.RawMessage(tc.Function.Arguments), m.approval.State)
+				} else if tc.Function.Name == "mcp_call" {
+					var p struct {
+						Command string `json:"command"`
+					}
+					if jsonErr := json.Unmarshal([]byte(tc.Function.Arguments), &p); jsonErr != nil {
+						err = jsonErr
+					} else {
+						var identity string
+						identity, err = m.registry.MCPIdentity(p.Command)
+						if err == nil {
+							approval, err = m.registry.ApproveWithIdentity(tc.Function.Name, json.RawMessage(tc.Function.Arguments), identity)
+						}
+					}
 				} else {
 					approval, err = m.registry.Approve(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 				}
@@ -290,26 +303,19 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.advance()
 	case toolExecutedMsg:
-		if len(m.pendingTools) > 0 && m.pendingTools[0].Function.Name == "read_file" {
-			// Do not add file bytes to history until the user permits transmission.
-			// Fail closed if the terminal cannot faithfully display the payload.
-			if sanitizeForDisplay(msg.toolMsg.Content) != msg.toolMsg.Content || sanitizeForDisplay(m.destination) != m.destination {
-				m.pendingTools = m.pendingTools[1:]
-				m.messages = append(m.messages, Message{Role: "tool", ToolCallID: msg.toolMsg.ToolCallID, Content: "File disclosure blocked: output cannot be displayed safely.", Display: "File disclosure blocked"})
-				m.refresh()
-				return m.advance()
-			}
-			m.pendingDisclosure = &msg.toolMsg
-			m.status = "Review file output; scroll to end, then approve [y/n]"
-			m.refreshDisclosure()
-			return m, nil
-		}
-		if len(m.pendingTools) > 0 {
+		// Every tool result is project-derived data. Hold it locally until the
+		// user has reviewed the exact bytes and the destination that will
+		// receive them. Fail closed if the terminal cannot display them.
+		if sanitizeForDisplay(msg.toolMsg.Content) != msg.toolMsg.Content || sanitizeForDisplay(m.destination) != m.destination {
 			m.pendingTools = m.pendingTools[1:]
+			m.messages = append(m.messages, Message{Role: "tool", ToolCallID: msg.toolMsg.ToolCallID, Content: "Tool disclosure blocked: output cannot be displayed safely.", Display: "Tool disclosure blocked"})
+			m.refresh()
+			return m.advance()
 		}
-		m.messages = append(m.messages, msg.toolMsg)
-		m.refresh()
-		return m.advance()
+		m.pendingDisclosure = &msg.toolMsg
+		m.status = "Review tool output; scroll to end, then approve [y/n]"
+		m.refreshDisclosure()
+		return m, nil
 	case errorMsg:
 		m.finishRequest()
 		m.busy = false
@@ -381,7 +387,7 @@ func (m uiModel) View() string {
 	b.WriteString(m.viewport.View() + "\n")
 	b.WriteString(helpStyle.Render("────────────────────────────────") + "\n")
 	if m.pendingDisclosure != nil {
-		b.WriteString(approvalStyle.Render("Send the displayed file output to the model? [Y/N]") + "\n")
+		b.WriteString(approvalStyle.Render("Send the displayed tool output to the model? [Y/N]") + "\n")
 	} else if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
 		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", sanitizeForDisplay(tc.Function.Name))) + "\n")
@@ -409,8 +415,9 @@ func (m *uiModel) refreshDisclosure() {
 	var b strings.Builder
 	for _, field := range []struct{ label, value string }{
 		{"Destination (quoted):", m.destination},
+		{"Tool (quoted):", m.pendingTools[0].Function.Name},
 		{"Source arguments (quoted):", m.pendingTools[0].Function.Arguments},
-		{"File output (quoted):", m.pendingDisclosure.Content},
+		{"Tool output (quoted):", disclosureReviewText(m.pendingDisclosure.Content)},
 	} {
 		b.WriteString(field.label + "\n")
 		q := strconv.QuoteToASCII(field.value)
@@ -612,9 +619,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Failed to init tools: %v\n", err)
 		os.Exit(1)
 	}
-	// Neither external execution tool currently provides a filesystem/network
-	// sandbox. Do not expose them to the model until one is implemented.
-	disableUnsandboxedTools(reg)
+	// External execution stays disabled unless a user-configured MCP allowlist
+	// exists and the isolation backend proves its restrictions at startup.
+	if err := reg.EnableExecution(context.Background()); err != nil {
+		disableUnsandboxedTools(reg)
+	}
 	client := llm.NewOpenAIClient(llm.ConfigFromEnv())
 	model := initialModel(reg, client)
 	p := tea.NewProgram(model, tea.WithAltScreen())
