@@ -60,7 +60,7 @@ func TestLinuxSandboxProof(t *testing.T) {
 }
 
 func TestLinuxSandboxOptInPath(t *testing.T) {
-	b := requireBwrap(t)
+	requireBwrap(t)
 	setupHelpers(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
