@@ -350,9 +350,14 @@ func runTurn(t *testing.T, m uiModel, input string, maxSteps int) uiModel {
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(uiModel)
 
-	for step := 0; cmd != nil && step < maxSteps; step++ {
-		msg := cmd()
-		updated, cmd = m.Update(msg)
+	for step := 0; (cmd != nil || m.pendingDisclosure != nil) && step < maxSteps; step++ {
+		if m.pendingDisclosure != nil {
+			m.viewport.GotoBottom()
+			updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+		} else {
+			msg := cmd()
+			updated, cmd = m.Update(msg)
+		}
 		m = updated.(uiModel)
 	}
 	if cmd != nil {

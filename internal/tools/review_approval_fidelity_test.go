@@ -37,7 +37,7 @@ func TestReviewApprovalShowsFinalNewlineChange(t *testing.T) {
 		})
 	}
 }
-func TestReviewApprovalShowsMixedEOLNormalization(t *testing.T) {
+func TestReviewApprovalPreservesMixedEOL(t *testing.T) {
 	root, r := newTestRegistry(t)
 	before := "a\r\nb\nc\n"
 	writeTestFile(t, filepath.Join(root, "f.txt"), before)
@@ -46,7 +46,7 @@ func TestReviewApprovalShowsMixedEOLNormalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, part := range []string{"-b [EOL=LF]", "-c [EOL=LF]", "+B [EOL=CRLF]", "+c [EOL=CRLF]"} {
+	for _, part := range []string{"-b [EOL=LF]", "+B [EOL=LF]", " c [EOL=LF]"} {
 		if !strings.Contains(p.Display, part) {
 			t.Errorf("missing EOL change %q in %q", part, p.Display)
 		}
@@ -60,7 +60,7 @@ func TestReviewApprovalShowsMixedEOLNormalization(t *testing.T) {
 		t.Fatalf("edit failed: %s", out)
 	}
 	actual, err := os.ReadFile(filepath.Join(root, "f.txt"))
-	if err != nil || string(actual) != "a\r\nB\r\nc\r\n" {
+	if err != nil || string(actual) != "a\r\nB\nc\n" {
 		t.Fatal("unexpected output bytes")
 	}
 }

@@ -1,6 +1,6 @@
 module github.com/amiraq1/nabd
 
-go 1.25.5
+go 1.26.11
 
 require (
 	github.com/charmbracelet/bubbles v0.18.0

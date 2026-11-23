@@ -60,6 +60,9 @@ func NewOpenAIClient(cfg Config) *OpenAIClient {
 	}
 }
 
+// BaseURL identifies the model endpoint for disclosure prompts.
+func (c *OpenAIClient) BaseURL() string { return c.cfg.BaseURL }
+
 func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()

@@ -16,9 +16,10 @@ import (
 // ApprovalState binds an approval decision to the file bytes the user saw.
 // Hash is the hex-encoded SHA-256 of those bytes and is empty when Exists is false.
 type ApprovalState struct {
-	Path   string
-	Exists bool
-	Hash   string
+	Path       string
+	Exists     bool
+	Hash       string
+	OutputHash string
 }
 
 // ApprovalPreview is what the interface should render for an approval prompt,
@@ -84,6 +85,7 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 	if err != nil {
 		return ApprovalPreview{}, err
 	}
+	state.OutputHash = hashBytes(updated)
 	return ApprovalPreview{Display: unifiedDiff(content, updated, p.Path), State: state}, nil
 }
 
@@ -118,14 +120,26 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	if oldText == newText {
 		return nil, fmt.Errorf("old_text and new_text are identical")
 	}
-	hasCRLF := bytes.Contains(contentBytes, []byte("\r\n"))
-	content := strings.ReplaceAll(string(contentBytes), "\r\n", "\n")
+	// Normalize only for matching; map normalized positions back to original
+	// offsets so bytes outside the requested edit are never rewritten.
+	var normalized bytes.Buffer
+	offsets := make([]int, 0, len(contentBytes)+1)
+	for i := 0; i < len(contentBytes); i++ {
+		offsets = append(offsets, i)
+		if contentBytes[i] == '\r' && i+1 < len(contentBytes) && contentBytes[i+1] == '\n' {
+			i++
+			normalized.WriteByte('\n')
+		} else {
+			normalized.WriteByte(contentBytes[i])
+		}
+	}
+	offsets = append(offsets, len(contentBytes))
+	content := normalized.String()
 	oldNorm := strings.ReplaceAll(oldText, "\r\n", "\n")
 	newNorm := strings.ReplaceAll(newText, "\r\n", "\n")
 	if oldNorm == newNorm {
 		return nil, fmt.Errorf("old_text and new_text are identical after line-ending normalization")
 	}
-
 	count := strings.Count(content, oldNorm)
 	if count == 0 {
 		return nil, fmt.Errorf("old_text not found in %s", displayPath)
@@ -133,17 +147,24 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	if count != 1 {
 		return nil, fmt.Errorf("old_text appears %d times; include more surrounding lines to make it unique", count)
 	}
-
-	updated := []byte(strings.Replace(content, oldNorm, newNorm, 1))
+	pos := strings.Index(content, oldNorm)
+	start, end := offsets[pos], offsets[pos+len(oldNorm)]
+	replacement := []byte(newNorm)
+	// Preserve the line-ending convention for uniformly CRLF files; mixed
+	// files retain all existing bytes outside the match.
+	if bytes.Contains(contentBytes, []byte("\r\n")) && !bytes.Contains(bytes.ReplaceAll(contentBytes, []byte("\r\n"), nil), []byte("\n")) {
+		replacement = bytes.ReplaceAll(replacement, []byte("\n"), []byte("\r\n"))
+	}
+	updated := make([]byte, 0, len(contentBytes)-(end-start)+len(replacement))
+	updated = append(updated, contentBytes[:start]...)
+	updated = append(updated, replacement...)
+	updated = append(updated, contentBytes[end:]...)
 	if strings.HasSuffix(safePath, ".go") {
-		formatted, err := format.Source(updated)
-		if err != nil {
+		// Parse and validate without gofmt: automatic formatting could alter
+		// unrelated bytes outside the approved replacement.
+		if _, err := format.Source(updated); err != nil {
 			return nil, fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
 		}
-		updated = formatted
-	}
-	if hasCRLF {
-		updated = bytes.ReplaceAll(updated, []byte("\n"), []byte("\r\n"))
 	}
 	if len(updated) > maxEditBytes {
 		return nil, fmt.Errorf("edited file too large (limit %d bytes)", maxEditBytes)

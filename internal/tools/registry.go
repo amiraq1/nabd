@@ -53,6 +53,7 @@ type Registry struct {
 	approve  ApprovalFunc
 	handlers map[string]ToolSpec
 	mu       sync.Mutex
+	writeMu  sync.Mutex
 	pending  map[string]pendingApproval
 	now      func() time.Time
 }
@@ -472,6 +473,8 @@ func (r *Registry) listDir(rel string) (string, error) {
 // most recent entry overall when relPath is empty). It refuses if the file
 // changed since the edit or if the shadow copy is corrupted.
 func (r *Registry) Undo(relPath string) (string, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	var target string
 	if strings.TrimSpace(relPath) != "" {
 		var err error
@@ -512,49 +515,75 @@ func (r *Registry) Undo(relPath string) (string, error) {
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path}); err != nil {
 		return "", err
 	}
+	var syncWarning string
 	if err := r.atomicWriteChecked(currentPath, backup, os.FileMode(entry.Mode), currentHash); err != nil {
-		_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path})
-		return "", err
+		var uncertain *commitUncertainError
+		if !errors.As(err, &uncertain) {
+			_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path})
+			return "", err
+		}
+		syncWarning = "; warning: " + err.Error()
 	}
 	if err := r.shadow.MarkUndone(entry.ID); err != nil {
 		return "", fmt.Errorf("restored %s but could not update shadow metadata: %w", entry.Path, err)
 	}
 	_ = r.logEvent(audit.Event{Event: "applied", Tool: "undo", ArgsSHA256: currentHash, ResultSHA256: entry.SHA256Before, Detail: entry.Path})
-	return fmt.Sprintf("Restored %s from shadow %s", entry.Path, entry.ID), nil
+	return fmt.Sprintf("Restored %s from shadow %s%s", entry.Path, entry.ID, syncWarning), nil
 }
 
 // atomicWrite writes data to a temporary file in the target directory, syncs
 // it, and renames it over the destination. All operations stay inside root.
+// commitUncertainError means rename succeeded but durability could not be confirmed.
+type commitUncertainError struct{ err error }
+
+func (e *commitUncertainError) Error() string {
+	return "replacement succeeded but parent directory sync failed: " + e.err.Error()
+}
+func (e *commitUncertainError) Unwrap() error { return e.err }
+
 func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode, expectedHash string) error {
-	tmp := filepath.Join(filepath.Dir(rel), ".nabd-tmp-"+randomHex(8))
-	f, err := r.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
+	// Keep a handle to the same parent for staging, checking, rename and sync.
+	parent, err := r.root.OpenRoot(filepath.Dir(rel))
+	if err != nil {
+		return fmt.Errorf("open parent: %w", err)
+	}
+	defer parent.Close()
+	dir, err := parent.Open(".")
+	if err != nil {
+		return fmt.Errorf("open parent for sync: %w", err)
+	}
+	defer dir.Close()
+	base := filepath.Base(rel)
+	tmp := ".nabd-tmp-" + randomHex(8)
+	f, err := parent.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
 	if err != nil {
 		return fmt.Errorf("create temporary file: %w", err)
 	}
-
 	_, writeErr := f.Write(data)
 	modeErr := f.Chmod(mode.Perm())
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := errors.Join(writeErr, modeErr, syncErr, closeErr); err != nil {
-		_ = r.root.Remove(tmp)
+		_ = parent.Remove(tmp)
 		return fmt.Errorf("write temporary file: %w", err)
 	}
-
 	if expectedHash != "" {
 		if editBeforeRenameHook != nil {
 			editBeforeRenameHook()
 		}
-		info, statErr := r.root.Lstat(rel)
-		current, readErr := readBounded(r.root, rel, maxEditBytes)
+		info, statErr := parent.Lstat(base)
+		current, readErr := readBounded(parent, base, maxEditBytes)
 		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != expectedHash {
-			_ = r.root.Remove(tmp)
+			_ = parent.Remove(tmp)
 			return fmt.Errorf("file changed since approval: %s", rel)
 		}
 	}
-	if err := r.root.Rename(tmp, rel); err != nil {
-		_ = r.root.Remove(tmp)
+	if err := parent.Rename(tmp, base); err != nil {
+		_ = parent.Remove(tmp)
 		return fmt.Errorf("replace %s: %w", rel, err)
+	}
+	if err := syncParentDirectory(dir); err != nil {
+		return &commitUncertainError{err: err}
 	}
 	return nil
 }
@@ -824,10 +853,12 @@ func toolDetail(name string, rawArgs json.RawMessage) string {
 func (r *Registry) registerDefaults() {
 	r.handlers["edit_file"] = ToolSpec{
 		Name:        "edit_file",
-		Description: "Replace an exact block of text in a file. Validates and formats Go code before saving.",
+		Description: "Replace an exact block of text in a file. Validates Go syntax before saving without reformatting unrelated bytes.",
 		ReadOnly:    false,
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"old_text":{"type":"string","description":"Exact existing block to replace"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
+			r.writeMu.Lock()
+			defer r.writeMu.Unlock()
 			var p struct {
 				Path    string `json:"path"`
 				OldText string `json:"old_text"`
@@ -875,6 +906,9 @@ func (r *Registry) registerDefaults() {
 			if err != nil {
 				return "", err
 			}
+			if state, ok := ctx.Value(editApprovalKey{}).(ApprovalState); ok && (state.OutputHash == "" || hashBytes(updatedBytes) != state.OutputHash) {
+				return "", fmt.Errorf("output differs from approved preview")
+			}
 			if err := ctx.Err(); err != nil {
 				return "", err
 			}
@@ -888,6 +922,10 @@ func (r *Registry) registerDefaults() {
 				return "", err
 			}
 			if err := r.atomicWriteChecked(rel, updatedBytes, info.Mode(), hashBytes(contentBytes)); err != nil {
+				var uncertain *commitUncertainError
+				if errors.As(err, &uncertain) {
+					return fmt.Sprintf("Successfully updated %s (shadow %s); warning: %s", p.Path, entry.ID, err), nil
+				}
 				_ = r.shadow.MarkUndone(entry.ID)
 				return "", err
 			}
