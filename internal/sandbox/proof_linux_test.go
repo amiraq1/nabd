@@ -16,6 +16,8 @@ func buildHelper(t *testing.T, dest, pkg string) string {
 	t.Helper()
 	path := filepath.Join(dest, filepath.Base(pkg))
 	cmd := exec.Command("go", "build", "-trimpath", "-o", path, "../../cmd/"+pkg)
+	// The sandbox root has no dynamic loader; helpers must be static.
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build %s: %v: %s", pkg, err, out)
 	}

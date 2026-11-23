@@ -31,6 +31,9 @@ type MCPServerConfig struct {
 	UserGuard       string            `json:"user_guard,omitempty"`
 	UserGuardSHA256 string            `json:"user_guard_sha256,omitempty"`
 	UserGuardArgs   []string          `json:"user_guard_args,omitempty"`
+	// ExtraReadonlyBinds exposes additional host paths (for example a dynamic
+	// loader or CA bundle) read-only inside the sandbox at the same path.
+	ExtraReadonlyBinds []string `json:"extra_readonly_binds,omitempty"`
 }
 
 type mcpConfigFile struct {
@@ -151,6 +154,11 @@ func validateServer(name string, spec MCPServerConfig) (MCPServer, error) {
 			return MCPServer{}, fmt.Errorf("arguments cannot contain NUL")
 		}
 	}
+	for _, bind := range spec.ExtraReadonlyBinds {
+		if !filepath.IsAbs(bind) || strings.ContainsRune(bind, 0) {
+			return MCPServer{}, fmt.Errorf("extra bind must be an absolute path")
+		}
+	}
 	for key, value := range spec.Env {
 		if !mcpAllowedEnvKeys[key] {
 			return MCPServer{}, fmt.Errorf("environment key %q is not allowlisted", key)
@@ -171,10 +179,12 @@ func validateServer(name string, spec MCPServerConfig) (MCPServer, error) {
 		UserGuard       string
 		UserGuardSHA256 string
 		UserGuardArgs   []string
+		ExtraBinds      []string
 	}{
 		Name: name, Executable: spec.Executable, Args: spec.Args, SHA256: spec.SHA256,
 		Env: sortedEnv(spec.Env), Guard: spec.Guard, GuardSHA256: spec.GuardSHA256,
 		UserGuard: spec.UserGuard, UserGuardSHA256: spec.UserGuardSHA256, UserGuardArgs: spec.UserGuardArgs,
+		ExtraBinds: spec.ExtraReadonlyBinds,
 	})
 	if err != nil {
 		return MCPServer{}, err

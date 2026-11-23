@@ -134,7 +134,7 @@ func callExternalMCPServer(ctx context.Context, dir string, b sandbox.Backend, s
 		Env:                MCPEnvironment(server.Config),
 		MemoryLimitBytes:   512 << 20,
 		ProcessLimit:       32,
-		ExtraReadonlyBinds: []string{guard, server.Config.Executable},
+		ExtraReadonlyBinds: append([]string{guard, server.Config.Executable}, server.Config.ExtraReadonlyBinds...),
 	}
 	if server.Config.UserGuard != "" {
 		profile.ExtraReadonlyBinds = append(profile.ExtraReadonlyBinds, server.Config.UserGuard)
