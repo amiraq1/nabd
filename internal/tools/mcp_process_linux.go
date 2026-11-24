@@ -25,6 +25,10 @@ type mcpProcess struct {
 	stopCancel func() bool
 }
 
+// mcpProcessStderrHook is a test-only seam. Production discards child stderr
+// because it may contain sensitive data.
+var mcpProcessStderrHook func(*exec.Cmd)
+
 func startMCPProcess(ctx context.Context, guard, dir, target string) (*mcpProcess, *os.File, *os.File, error) {
 	cmd := exec.Command(guard, target)
 	cmd.Dir = dir
@@ -51,7 +55,11 @@ func startMCPProcessWithCmd(ctx context.Context, cmd *exec.Cmd) (*mcpProcess, *o
 	}
 	cmd.Stdin = inR
 	cmd.Stdout = outW
-	cmd.Stderr = nil
+	if mcpProcessStderrHook != nil {
+		mcpProcessStderrHook(cmd)
+	} else {
+		cmd.Stderr = nil
+	}
 	if err = cmd.Start(); err != nil {
 		inR.Close()
 		inW.Close()
