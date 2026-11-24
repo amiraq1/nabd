@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !android
 
 package sandbox
 
@@ -164,11 +164,12 @@ func (b *linuxBackend) Prove(ctx context.Context) error {
 	proveCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
+	mem := DefaultMemoryLimit()
 	cmd, err := b.Wrap(proveCtx, Profile{
 		WorkDir:           tmp,
 		WritableWorkspace: false,
-		Env:               []string{"EXPECT_MEM=" + strconv.FormatInt(proofMemory, 10), "EXPECT_PROCS=" + strconv.Itoa(proofProcesses)},
-		MemoryLimitBytes:  proofMemory,
+		Env:               []string{"EXPECT_MEM=" + strconv.FormatInt(mem, 10), "EXPECT_PROCS=" + strconv.Itoa(proofProcesses)},
+		MemoryLimitBytes:  mem,
 		ProcessLimit:      proofProcesses,
 	}, probe)
 	if err != nil {

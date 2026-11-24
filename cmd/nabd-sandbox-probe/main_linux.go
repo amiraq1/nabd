@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !android
 
 // nabd-sandbox-probe runs only inside the sandbox and exits successfully only
 // if every promised restriction is actually enforced. It is shipped next to
