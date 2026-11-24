@@ -3,12 +3,14 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,7 +71,50 @@ func sandboxMCPSetup(t *testing.T, mode string) (*Registry, json.RawMessage, str
 	return r, args, server
 }
 
+// childStderrLimit bounds how much child stderr a diagnostic capture keeps, so
+// a chatty or hostile server cannot exhaust memory and drown the real failure.
+const childStderrLimit = 8 << 10
+
+// boundedBuffer is a concurrency-safe io.Writer that keeps at most
+// childStderrLimit bytes and reports whether it dropped the rest.
+type boundedBuffer struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := childStderrLimit - b.buf.Len(); room > 0 {
+		if len(p) <= room {
+			b.buf.Write(p)
+			return len(p), nil
+		}
+		b.buf.Write(p[:room])
+	}
+	b.truncated = true
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.truncated {
+		return b.buf.String() + "\n...[child stderr truncated at 8 KiB]..."
+	}
+	return b.buf.String()
+}
+
 func TestSandboxMCPInitializeCallAndClose(t *testing.T) {
+	// The sandboxed server's stderr is normally discarded; capture it here so a
+	// handshake failure reports why the child died instead of only "transport
+	// closed".
+	childStderr := &boundedBuffer{}
+	oldHook := mcpProcessStderrHook
+	mcpProcessStderrHook = func(cmd *exec.Cmd) { cmd.Stderr = childStderr }
+	t.Cleanup(func() { mcpProcessStderrHook = oldHook })
+
 	r, args, _ := sandboxMCPSetup(t, "env")
 	identity, err := r.MCPIdentity("probe")
 	if err != nil {
@@ -83,7 +128,7 @@ func TestSandboxMCPInitializeCallAndClose(t *testing.T) {
 	defer cancel()
 	out := r.RunApproved(ctx, "mcp_call", args, approval)
 	if strings.Contains(out, "Error:") {
-		t.Fatalf("sandboxed MCP call failed: %s", out)
+		t.Fatalf("sandboxed MCP call failed: %s\nchild stderr: %q", out, childStderr.String())
 	}
 	if !strings.Contains(out, "PATH") || !strings.Contains(out, "HOME") {
 		t.Fatalf("sandboxed server did not return its allowlisted environment: %s", out)
