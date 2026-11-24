@@ -30,7 +30,7 @@
 
 ```bash
 pkg install golang git
-go version  # يجب أن يكون 1.25.5 أو أحدث
+go version  # يجب أن يكون 1.26.11 أو أحدث
 git clone https://github.com/amiraq1/nabd.git
 cd nabd
 go mod download
@@ -79,6 +79,25 @@ nabdcoder
 - **CLI/TUI**: `process-group kill` على Unix/Termux، و`taskkill /T` كأفضل جهد على Windows.
 
 راجع [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) لما يضمنه النظام وما لا يضمنه.
+
+## دعم linux/arm64
+
+تُعتبر معمارية `linux/arm64` (AArch64) منصة كاملة الدعم ومُتحقَّقاً منها وقت التشغيل على عتاد أصلي في الـ CI (`ubuntu-26.04-arm`)، وليست مجرد هدف بناء متقاطع:
+
+- **المتطلبات الدنيا**:
+  - نواة Linux ≥ 3.8 (لجدول استدعاءات `asm-generic/unistd.h`)، ويُفضَّل ≥ 4.18 لدعم namespaces المستقرة لـ bubblewrap.
+  - المعمارية الدنيا المدعومة: `ARMv8.0-A` (مثل Cortex-A53 وما فوقها عبر `GOARM64=v8.0`).
+  - حزم `bubblewrap` (bwrap) ومساحات أسماء المستخدمين غير المميزة (`unprivileged user namespaces`).
+- **ما تم التحقق منه وقت التشغيل (Runtime Verified)**:
+  - حارس `cmd/mcp-guard`: التحقق الصارم من معمارية `AUDIT_ARCH_AARCH64`، وقتل العملية فوراً عند عدم التطابق (`SECCOMP_RET_KILL_PROCESS`).
+  - حظر استدعاءات `setsid` (رقم 157) و `setpgid` (رقم 154) بـ `EPERM`.
+  - حظر البت 30 بـ `SECCOMP_RET_KILL_PROCESS`.
+  - إثبات عزل الـ sandbox بـ bubblewrap (`sandbox.Prove`) على عتاد AArch64 حقيقي.
+  - حل مكتبات ELF المحملة ديناميكياً عبر مسارات multiarch الخاصة بـ arm64 (`/lib/aarch64-linux-gnu` و `/usr/lib/aarch64-linux-gnu`).
+- **الفروق المعروفة عن amd64**:
+  - غياب استدعاءات النظام القديمة (`open`, `stat`, `fork`, `pipe`, `dup2`) واستبدالها بنظيراتها الحديثة (`openat`, `newfstatat`, `clone`, `pipe2`, `dup3`). راجع [docs/SECCOMP_ARCH.md](docs/SECCOMP_ARCH.md) لجدول التكافؤ الكامل.
+  - **الذاكرة الافتراضية (RLIMIT_AS)**: مضبوطة افتراضياً على 2 GiB لجميع المعماريات، مع إمكانية الضبط الصريح عبر `NABD_SANDBOX_MEMORY_LIMIT` بين حد أدنى 512 MiB (لمنع انهيار وقت تشغيل Go) وحد أقصى 64 GiB، ويتم توثيق القيمة في سجل التدقيق عند تفعيل العزل.
+  - **منصة Android / Termux**: رغم أن `GOOS=android` يطابق `linux` في Go، إلا أن عزل bubblewrap معطّل صراحة على Android (`!android`) وتفشل `sandbox.Prove` بشكل مغلق (`ErrUnavailable`).
 
 ## الاختبارات و CI
 
