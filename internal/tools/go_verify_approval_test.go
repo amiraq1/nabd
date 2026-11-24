@@ -36,7 +36,7 @@ func installProbeGo(t *testing.T, script string) {
 
 func TestGoVerifyNeedsApproval(t *testing.T) {
 	r := approvalRegistry(t, t.TempDir())
-	if !r.NeedsApproval("go_verify") {
+	if !r.RequiresApproval("go_verify") {
 		t.Fatal("go_verify must require approval")
 	}
 }

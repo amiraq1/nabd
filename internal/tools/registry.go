@@ -215,8 +215,6 @@ func (r *Registry) RequiresApproval(name string) bool {
 }
 
 // Has reports whether a tool is registered.
-func (r *Registry) NeedsApproval(name string) bool { return r.RequiresApproval(name) }
-
 func (r *Registry) Has(name string) bool {
 	_, ok := r.handlers[name]
 	return ok

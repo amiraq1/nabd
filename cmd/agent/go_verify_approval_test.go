@@ -12,7 +12,7 @@ func TestGoVerifyApprovalShowsPackage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
-	if !reg.NeedsApproval("go_verify") {
+	if !reg.RequiresApproval("go_verify") {
 		t.Fatal("go_verify must require approval")
 	}
 	m := initialModel(reg, &mockClient{})
