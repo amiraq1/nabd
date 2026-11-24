@@ -53,3 +53,53 @@ func TestCurrentFailsClosedWhenUnavailable(t *testing.T) {
 		t.Fatalf("unavailable backend proof must fail, got %v", err)
 	}
 }
+
+func TestDefaultMemoryLimitConfigurableAndPageSizeAware(t *testing.T) {
+	// 1. Explicit override via NABD_SANDBOX_MEMORY_LIMIT within bounds
+	t.Setenv(MemoryLimitEnv, "3221225472") // 3 GiB
+	if got := DefaultMemoryLimit(); got != 3221225472 {
+		t.Fatalf("DefaultMemoryLimit() = %d, want 3221225472", got)
+	}
+
+	// 2. Values below MinMemoryLimitBytes (512 MiB) are clamped to MinMemoryLimitBytes
+	t.Setenv(MemoryLimitEnv, "104857600") // 100 MiB
+	if got := DefaultMemoryLimit(); got != MinMemoryLimitBytes {
+		t.Fatalf("DefaultMemoryLimit() with sub-minimum env = %d, want MinMemoryLimitBytes (%d)", got, MinMemoryLimitBytes)
+	}
+
+	// 3. Values above MaxMemoryLimitBytes (64 GiB) are clamped to MaxMemoryLimitBytes
+	t.Setenv(MemoryLimitEnv, "137438953472") // 128 GiB
+	if got := DefaultMemoryLimit(); got != MaxMemoryLimitBytes {
+		t.Fatalf("DefaultMemoryLimit() with excessive env = %d, want MaxMemoryLimitBytes (%d)", got, MaxMemoryLimitBytes)
+	}
+
+	// 4. Invalid or non-positive value falls back to default 2 GiB
+	t.Setenv(MemoryLimitEnv, "invalid")
+	if got := DefaultMemoryLimit(); got != DefaultMemoryLimitBytes {
+		t.Fatalf("DefaultMemoryLimit() with invalid env = %d, want %d", got, DefaultMemoryLimitBytes)
+	}
+
+	t.Setenv(MemoryLimitEnv, "0")
+	if got := DefaultMemoryLimit(); got != DefaultMemoryLimitBytes {
+		t.Fatalf("DefaultMemoryLimit() with zero env = %d, want %d", got, DefaultMemoryLimitBytes)
+	}
+
+	t.Setenv(MemoryLimitEnv, "-1024")
+	if got := DefaultMemoryLimit(); got != DefaultMemoryLimitBytes {
+		t.Fatalf("DefaultMemoryLimit() with negative env = %d, want %d", got, DefaultMemoryLimitBytes)
+	}
+
+	// 5. Unset env defaults to 2 GiB
+	t.Setenv(MemoryLimitEnv, "")
+	if got := DefaultMemoryLimit(); got != DefaultMemoryLimitBytes {
+		t.Fatalf("DefaultMemoryLimit() with empty env = %d, want %d", got, DefaultMemoryLimitBytes)
+	}
+
+	// 6. Test pageSizeFunc injectability
+	origPageSize := pageSizeFunc
+	t.Cleanup(func() { pageSizeFunc = origPageSize })
+	pageSizeFunc = func() int { return 65536 }
+	if pageSizeFunc() != 65536 {
+		t.Fatalf("pageSizeFunc stubbing failed, got %d", pageSizeFunc())
+	}
+}

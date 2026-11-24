@@ -138,7 +138,7 @@ func callExternalMCPServer(ctx context.Context, dir string, b sandbox.Backend, s
 		WorkDir:            dir,
 		WritableWorkspace:  false,
 		Env:                MCPEnvironment(server.Config),
-		MemoryLimitBytes:   mcpServerMemoryLimit,
+		MemoryLimitBytes:   sandbox.DefaultMemoryLimit(),
 		ProcessLimit:       32,
 		ExtraReadonlyBinds: append([]string{guard, server.Config.Executable}, server.Config.ExtraReadonlyBinds...),
 	}
