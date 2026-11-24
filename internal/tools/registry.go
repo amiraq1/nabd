@@ -1284,6 +1284,13 @@ func (r *Registry) goVerifyCommand(ctx context.Context, pkg string) (*exec.Cmd, 
 		return nil, fmt.Errorf("empty GOROOT")
 	}
 	binds := []string{gorootPath}
+	// A dynamically linked Go toolchain needs its ELF interpreter and shared
+	// libraries; only those individual files are bound, never /lib or /usr/lib.
+	loaderBinds, err := sandbox.LoaderBinds(goTool)
+	if err != nil {
+		return nil, fmt.Errorf("resolve dynamic loader for the Go toolchain: %w", err)
+	}
+	binds = appendUniquePaths(binds, loaderBinds...)
 	sandboxEnv := []string{
 		"HOME=/tmp", "TMPDIR=/tmp", "PATH=/usr/bin:/bin",
 		"GOROOT=" + gorootPath, "GOCACHE=/tmp/gocache", "GOPATH=/tmp/gopath",
@@ -1293,7 +1300,7 @@ func (r *Registry) goVerifyCommand(ctx context.Context, pkg string) (*exec.Cmd, 
 	}
 	if modcache := os.Getenv("GOMODCACHE"); modcache != "" {
 		// The module cache is read-only; the build cache remains on tmpfs.
-		binds = append(binds, modcache)
+		binds = appendUniquePaths(binds, modcache)
 		sandboxEnv = append(sandboxEnv, "GOMODCACHE="+modcache)
 	}
 	profile := sandbox.Profile{
@@ -1310,6 +1317,23 @@ func (r *Registry) goVerifyCommand(ctx context.Context, pkg string) (*exec.Cmd, 
 	}
 	configureProcessTree(cmd)
 	return cmd, nil
+}
+
+// appendUniquePaths appends only paths that are not already bound, so
+// bubblewrap never receives two binds for the same target.
+func appendUniquePaths(binds []string, extra ...string) []string {
+	seen := make(map[string]struct{}, len(binds))
+	for _, bind := range binds {
+		seen[bind] = struct{}{}
+	}
+	for _, path := range extra {
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		binds = append(binds, path)
+	}
+	return binds
 }
 
 func isGoTestFailure(ctx context.Context, err error) bool {
