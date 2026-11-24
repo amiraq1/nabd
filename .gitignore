@@ -1,9 +1,28 @@
 .commandcode/
 nabd-agent-audit
 .nabd/
+
+# Local binaries (go build output at the repository root)
+/nabd
+/nabd.exe
+/nabd-*
 /nabdcoder
 /nabdcoder.exe
-/nabdcoder-arm64
+/nabdcoder-*
 /mcp-server
 /mcp-server.exe
+/mcp-guard
+/mcp-guard.exe
+/nabd-mcp-guard
+/nabd-mcp-guard.exe
+*.exe
+
+# Test, coverage and profiling artifacts
 *.test
+*.out
+*.prof
+*.pprof
+coverage.*
+
+# Local runtime state and logs
+*.log
