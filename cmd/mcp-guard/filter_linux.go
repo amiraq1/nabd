@@ -13,11 +13,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func installFilter() error {
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return fmt.Errorf("no_new_privs: %w", err)
-	}
-	filter := []unix.SockFilter{
+func seccompFilter() []unix.SockFilter {
+	return []unix.SockFilter{
 		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 4},
 		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 1, Jf: 0, K: guardAuditArch},
 		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_KILL_PROCESS},
@@ -31,6 +28,13 @@ func installFilter() error {
 		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
 		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)},
 	}
+}
+
+func installFilter() error {
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("no_new_privs: %w", err)
+	}
+	filter := seccompFilter()
 	prog := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
 	if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&prog)), 0, 0); err != nil {
 		return fmt.Errorf("seccomp: %w", err)
