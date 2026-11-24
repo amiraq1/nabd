@@ -7,8 +7,8 @@ require (
 	github.com/charmbracelet/bubbletea v0.26.6
 	github.com/charmbracelet/lipgloss v0.11.0
 	github.com/mark3labs/mcp-go v1.5.0
-	golang.org/x/sys v0.21.0
-	golang.org/x/term v0.6.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/term v0.48.0
 )
 
 require (

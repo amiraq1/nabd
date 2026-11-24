@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !android
 
 // nabd-limit is the in-sandbox resource limiter. It is started by the sandbox
 // backend after all filesystem and namespace restrictions are in place, sets

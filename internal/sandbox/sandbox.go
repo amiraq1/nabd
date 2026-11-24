@@ -12,13 +12,49 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
 // ErrUnavailable is returned when no proven isolation backend exists on the
 // current platform. Callers must keep untrusted execution disabled.
 var ErrUnavailable = errors.New("no proven execution sandbox is available")
+
+const (
+	// DefaultMemoryLimitBytes is the baseline virtual address space limit (2 GiB).
+	DefaultMemoryLimitBytes = int64(2) << 30
+	// MinMemoryLimitBytes is the lowest permissible virtual memory ceiling (512 MiB).
+	// The Go runtime fails at startup under a lower cap.
+	MinMemoryLimitBytes = int64(512) << 20
+	// MaxMemoryLimitBytes is the highest permissible virtual memory ceiling (64 GiB).
+	MaxMemoryLimitBytes = int64(64) << 30
+	// MemoryLimitEnv is the environment variable used to tune the sandbox memory ceiling.
+	MemoryLimitEnv = "NABD_SANDBOX_MEMORY_LIMIT"
+)
+
+// pageSizeFunc is injectable in unit tests to simulate different kernel page sizes.
+var pageSizeFunc = os.Getpagesize
+
+// DefaultMemoryLimit returns the memory ceiling in bytes for the sandbox (RLIMIT_AS).
+// If NABD_SANDBOX_MEMORY_LIMIT is set in the environment, it is clamped to
+// [MinMemoryLimitBytes, MaxMemoryLimitBytes] (512 MiB to 64 GiB).
+// If unset or invalid, it returns DefaultMemoryLimitBytes (2 GiB).
+func DefaultMemoryLimit() int64 {
+	if v := os.Getenv(MemoryLimitEnv); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			if n < MinMemoryLimitBytes {
+				return MinMemoryLimitBytes
+			}
+			if n > MaxMemoryLimitBytes {
+				return MaxMemoryLimitBytes
+			}
+			return n
+		}
+	}
+	return DefaultMemoryLimitBytes
+}
 
 // Profile describes the isolation requested for one child process.
 // No parent environment variable is inherited unless it appears in Env.

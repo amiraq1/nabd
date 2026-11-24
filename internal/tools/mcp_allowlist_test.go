@@ -1,13 +1,17 @@
 package tools
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/amiraq1/nabd/internal/sandbox"
 )
 
 func writeAllowlist(t *testing.T, spec MCPServerConfig) string {
@@ -123,5 +127,46 @@ func TestMCPEnvironmentIsAllowlistOnly(t *testing.T) {
 	joined := strings.Join(env, "\n")
 	if strings.Contains(joined, "NABD_API_KEY") || len(env) != 2 {
 		t.Fatalf("unexpected child environment: %q", env)
+	}
+}
+
+func TestEnableExecutionRecordsMemoryLimitInAuditLog(t *testing.T) {
+	exe, exeSum := fakeExecutable(t)
+	guard, guardSum := fakeExecutable(t)
+	cfgPath := writeAllowlist(t, MCPServerConfig{
+		Executable: exe, SHA256: exeSum, Guard: guard, GuardSHA256: guardSum,
+	})
+	dir := t.TempDir()
+	t.Setenv(MCPConfigEnv, cfgPath)
+	t.Setenv("NABD_EXEC_SANDBOX", "1")
+	t.Setenv(sandbox.MemoryLimitEnv, "2147483648")
+
+	r, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	err = r.EnableExecution(context.Background())
+	if err != nil {
+		if !errors.Is(err, sandbox.ErrUnavailable) {
+			t.Fatalf("unexpected error from EnableExecution: %v", err)
+		}
+		return
+	}
+
+	events, _ := readAuditLog(t, dir)
+	found := false
+	for _, ev := range events {
+		if ev.Event == "configured" && ev.Tool == "sandbox" && strings.Contains(ev.Detail, "memory_limit=") {
+			found = true
+			if !strings.Contains(ev.Detail, "2147483648") {
+				t.Errorf("expected memory_limit=2147483648 in audit detail, got %s", ev.Detail)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("configured sandbox memory limit was not found in audit log: %+v", events)
 	}
 }

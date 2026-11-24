@@ -152,6 +152,11 @@ func (r *Registry) EnableExecution(ctx context.Context) error {
 		return err
 	}
 	r.sandbox = b
+	_ = r.logEvent(audit.Event{
+		Event:  "configured",
+		Tool:   "sandbox",
+		Detail: fmt.Sprintf("memory_limit=%d", sandbox.DefaultMemoryLimit()),
+	})
 	return nil
 }
 
@@ -1308,7 +1313,7 @@ func (r *Registry) goVerifyCommand(ctx context.Context, pkg string) (*exec.Cmd, 
 		WritableWorkspace:  true,
 		ExtraReadonlyBinds: binds,
 		Env:                sandboxEnv,
-		MemoryLimitBytes:   2 << 30,
+		MemoryLimitBytes:   sandbox.DefaultMemoryLimit(),
 		ProcessLimit:       64,
 	}
 	cmd, err := r.sandbox.Wrap(ctx, profile, goTool, "test", "-p", "2", "-vet=all", pkg)

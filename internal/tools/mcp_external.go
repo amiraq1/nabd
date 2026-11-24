@@ -23,12 +23,6 @@ const (
 	maxMCPWireBytes     = 1 << 20
 	maxMCPResponseBytes = 8192
 	mcpCallTimeout      = 60 * time.Second
-	// mcpServerMemoryLimit is the RLIMIT_AS ceiling for a sandboxed server.
-	// RLIMIT_AS caps address space, not resident memory, so it must stay well
-	// above a runtime's virtual reservations: a Go child dies at startup with
-	// "fatal error: failed to reserve page summary memory" under a 512 MiB
-	// cap. The shipped proof probe and go_verify already run at this ceiling.
-	mcpServerMemoryLimit = int64(2) << 30
 )
 
 var errMCPResponseTooLarge = errors.New("MCP response exceeded the 1 MiB wire limit")
@@ -138,7 +132,7 @@ func callExternalMCPServer(ctx context.Context, dir string, b sandbox.Backend, s
 		WorkDir:            dir,
 		WritableWorkspace:  false,
 		Env:                MCPEnvironment(server.Config),
-		MemoryLimitBytes:   mcpServerMemoryLimit,
+		MemoryLimitBytes:   sandbox.DefaultMemoryLimit(),
 		ProcessLimit:       32,
 		ExtraReadonlyBinds: append([]string{guard, server.Config.Executable}, server.Config.ExtraReadonlyBinds...),
 	}
