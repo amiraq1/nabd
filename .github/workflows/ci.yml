@@ -18,8 +18,10 @@ jobs:
   test:
     name: test (${{ matrix.arch }})
     # arm64 is a first-class target, not only a cross-build: the isolation and
-    # seccomp proofs must run on AArch64 hardware too. ubuntu-24.04-arm is a
-    # free native arm64 runner for public repositories.
+    # seccomp proofs must run on AArch64 hardware too. Both legs are pinned to
+    # 26.04 (the image ubuntu-latest resolves to) and to the free native arm64
+    # runner: the 24.04 image denies bwrap its loopback RTM_NEWADDR, which
+    # fails the sandbox proof on either architecture.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -27,9 +29,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v4
 
