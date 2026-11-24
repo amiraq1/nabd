@@ -59,7 +59,10 @@ func TestPolicyMCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := newServer(reg)
+	s, err := newServer(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	c := testClient(t, s)
 	listed, err := c.ListTools(context.Background(), mcp.ListToolsRequest{})
 	if err != nil {

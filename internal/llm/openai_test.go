@@ -182,7 +182,7 @@ func TestChatDoesNotRetry400(t *testing.T) {
 
 func TestChatRetriesNetworkErrors(t *testing.T) {
 	transport := &countingTransport{}
-	client := NewOpenAIClient(Config{BaseURL: "http://example.invalid", Model: "m", APIKey: "k", Timeout: time.Second})
+	client := NewOpenAIClient(Config{BaseURL: "https://example.invalid", Model: "m", APIKey: "k", Timeout: time.Second})
 	client.httpClient.Transport = transport
 	client.sleep = func(context.Context, time.Duration) error { return nil }
 
@@ -201,11 +201,11 @@ type countingTransport struct {
 
 func (c *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	c.calls++
-	return nil, &url.Error{Op: "Post", URL: "http://example.invalid", Err: errors.New("boom")}
+	return nil, &url.Error{Op: "Post", URL: "https://example.invalid", Err: errors.New("boom")}
 }
 
 func TestChatContextCancellation(t *testing.T) {
-	client := NewOpenAIClient(Config{BaseURL: "http://example.invalid", Model: "m", APIKey: "k"})
+	client := NewOpenAIClient(Config{BaseURL: "https://example.invalid", Model: "m", APIKey: "k"})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 

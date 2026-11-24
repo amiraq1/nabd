@@ -13,6 +13,7 @@ import (
 
 const maxApprovalChars = 1600
 const maxApprovalArgs = 4000
+const mcpIdentityWarning = "approval is bound to the configured server, guard and environment digests; a local user may still replace a file in the short verification window; filesystem and network bounds come from the proven sandbox, not from this prompt"
 
 type approvalPreview struct {
 	Summary   string
@@ -73,9 +74,10 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		_ = json.Unmarshal([]byte(tc.Function.Arguments), &p)
 
 		var b strings.Builder
+		b.WriteString("runs with your user permissions only after an isolation backend proved filesystem, network, memory and process limits; only user-preconfigured servers are accepted\n")
+		b.WriteString(mcpIdentityWarning + "\n")
 		fmt.Fprintf(&b, "command: %s\ntool: %s\narguments sha256: %s\n",
 			sanitizeForDisplay(p.Command), sanitizeForDisplay(p.Tool), sha256Hex(string(p.Arguments)))
-		b.WriteString("warning: launches an external process outside the workspace\n")
 		return approvalPreview{Summary: clip(sanitizeForDisplay(b.String()), maxApprovalChars)}
 
 	case "go_verify":
@@ -87,7 +89,7 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		if pkg == "" {
 			pkg = "./..."
 		}
-		summary := fmt.Sprintf("runs project tests via go test\npkg: %s\nwarning: executes project code; secrets are excluded from its environment", sanitizeForDisplay(pkg))
+		summary := fmt.Sprintf("runs project tests via go test with your user permissions inside the proven sandbox when enabled; otherwise the tool is disabled\nfilesystem and network access are bounded, with memory and process limits\npkg: %s", sanitizeForDisplay(pkg))
 		return approvalPreview{Summary: clip(sanitizeForDisplay(summary), maxApprovalChars)}
 
 	default:
@@ -160,7 +162,7 @@ func prefixBlock(text, prefix string) string {
 
 // sanitizeForDisplay removes ANSI escape sequences and control characters so
 // model- or file-controlled text cannot repaint the terminal or spoof the
-// approval prompt.
+// approval prompt. Unicode bidirectional controls are rendered visibly.
 func sanitizeForDisplay(s string) string {
 	s = strings.ToValidUTF8(s, "\uFFFD")
 
@@ -186,6 +188,14 @@ func sanitizeForDisplay(s string) string {
 		if c == 0xc2 && i+1 < len(s) && s[i+1] >= 0x80 && s[i+1] <= 0x9f {
 			i += 2
 			continue
+		}
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == '\u061c' || r == '\u200e' || r == '\u200f' || (r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u206f') {
+				fmt.Fprintf(&b, "\\u%04X", r)
+				i += size
+				continue
+			}
 		}
 		b.WriteByte(c)
 		i++

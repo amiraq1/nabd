@@ -216,7 +216,7 @@ func TestApprovalPreviewMCPCall(t *testing.T) {
 	_, m := testModel(t)
 	tc := testToolCall("mcp_call", `{"command":"/bin/sh","tool":"run","arguments":{"a":1}}`)
 	p := buildApprovalPreview(m.registry, tc)
-	for _, want := range []string{"command: /bin/sh", "tool: run", "arguments sha256:", "warning: launches an external process"} {
+	for _, want := range []string{"command: /bin/sh", "tool: run", "arguments sha256:", "only user-preconfigured servers are accepted", "proven sandbox"} {
 		if !strings.Contains(p.Summary, want) {
 			t.Errorf("mcp_call preview missing %q:\n%s", want, p.Summary)
 		}
@@ -229,7 +229,7 @@ func TestApprovalPreviewGoVerify(t *testing.T) {
 	if !strings.Contains(p.Summary, "pkg: ./...") {
 		t.Errorf("go_verify preview missing default package:\n%s", p.Summary)
 	}
-	if !strings.Contains(p.Summary, "executes project code") {
+	if !strings.Contains(p.Summary, "runs project tests via go test with your user permissions") {
 		t.Errorf("go_verify preview missing warning:\n%s", p.Summary)
 	}
 }
@@ -350,9 +350,14 @@ func runTurn(t *testing.T, m uiModel, input string, maxSteps int) uiModel {
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(uiModel)
 
-	for step := 0; cmd != nil && step < maxSteps; step++ {
-		msg := cmd()
-		updated, cmd = m.Update(msg)
+	for step := 0; (cmd != nil || m.pendingDisclosure != nil) && step < maxSteps; step++ {
+		if m.pendingDisclosure != nil {
+			m.viewport.GotoBottom()
+			updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+		} else {
+			msg := cmd()
+			updated, cmd = m.Update(msg)
+		}
 		m = updated.(uiModel)
 	}
 	if cmd != nil {

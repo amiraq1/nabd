@@ -1,12 +1,13 @@
 module github.com/amiraq1/nabd
 
-go 1.25.5
+go 1.26.11
 
 require (
 	github.com/charmbracelet/bubbles v0.18.0
 	github.com/charmbracelet/bubbletea v0.26.6
 	github.com/charmbracelet/lipgloss v0.11.0
 	github.com/mark3labs/mcp-go v1.5.0
+	golang.org/x/sys v0.21.0
 	golang.org/x/term v0.6.0
 )
 
@@ -33,6 +34,5 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.21.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 )

@@ -58,6 +58,10 @@ func f18Approve(t *testing.T, m uiModel) uiModel {
 }
 
 func f18Reply(m uiModel, id string) string {
+	// Tool results are held for disclosure consent before entering history.
+	if m.pendingDisclosure != nil && m.pendingDisclosure.ToolCallID == id {
+		return m.pendingDisclosure.Content
+	}
 	for _, msg := range m.messages {
 		if msg.Role == "tool" && msg.ToolCallID == id {
 			return msg.Content
