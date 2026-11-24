@@ -154,6 +154,91 @@ func runHelperSubprocess(t *testing.T, mode string) (*exec.Cmd, []byte, error) {
 	return cmd, out, err
 }
 
+func TestSeccompArchitectureParity(t *testing.T) {
+	// 1. Architecture Audit Constant Verification
+	switch runtime.GOARCH {
+	case "amd64":
+		if guardAuditArch != unix.AUDIT_ARCH_X86_64 {
+			t.Fatalf("amd64 guardAuditArch = 0x%x, want AUDIT_ARCH_X86_64 (0x%x)", guardAuditArch, unix.AUDIT_ARCH_X86_64)
+		}
+		if unix.SYS_SETSID != 112 {
+			t.Fatalf("amd64 SYS_SETSID = %d, want 112", unix.SYS_SETSID)
+		}
+		if unix.SYS_SETPGID != 109 {
+			t.Fatalf("amd64 SYS_SETPGID = %d, want 109", unix.SYS_SETPGID)
+		}
+	case "arm64":
+		if guardAuditArch != unix.AUDIT_ARCH_AARCH64 {
+			t.Fatalf("arm64 guardAuditArch = 0x%x, want AUDIT_ARCH_AARCH64 (0x%x)", guardAuditArch, unix.AUDIT_ARCH_AARCH64)
+		}
+		if unix.SYS_SETSID != 157 {
+			t.Fatalf("arm64 SYS_SETSID = %d, want 157", unix.SYS_SETSID)
+		}
+		if unix.SYS_SETPGID != 154 {
+			t.Fatalf("arm64 SYS_SETPGID = %d, want 154", unix.SYS_SETPGID)
+		}
+	default:
+		t.Fatalf("unsupported architecture under test: %s", runtime.GOARCH)
+	}
+
+	// 2. Program Structure and Instruction Parity
+	filter := seccompFilter()
+	if len(filter) != 10 {
+		t.Fatalf("expected filter length 10 on %s, got %d", runtime.GOARCH, len(filter))
+	}
+
+	// Instruction 0: load arch at offset 4
+	if filter[0].Code != (unix.BPF_LD|unix.BPF_W|unix.BPF_ABS) || filter[0].K != 4 {
+		t.Errorf("inst 0: want load arch (offset 4), got code=0x%x K=%d", filter[0].Code, filter[0].K)
+	}
+
+	// Instruction 1: branch on guardAuditArch
+	if filter[1].Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || filter[1].K != guardAuditArch || filter[1].Jt != 1 || filter[1].Jf != 0 {
+		t.Errorf("inst 1: want JEQ guardAuditArch (0x%x) Jt=1 Jf=0, got K=0x%x Jt=%d Jf=%d", guardAuditArch, filter[1].K, filter[1].Jt, filter[1].Jf)
+	}
+
+	// Instruction 2: KILL on arch mismatch (fail-closed)
+	if filter[2].Code != (unix.BPF_RET|unix.BPF_K) || filter[2].K != unix.SECCOMP_RET_KILL_PROCESS {
+		t.Errorf("inst 2: want SECCOMP_RET_KILL_PROCESS, got code=0x%x K=0x%x", filter[2].Code, filter[2].K)
+	}
+
+	// Instruction 3: load syscall nr at offset 0
+	if filter[3].Code != (unix.BPF_LD|unix.BPF_W|unix.BPF_ABS) || filter[3].K != 0 {
+		t.Errorf("inst 3: want load nr (offset 0), got code=0x%x K=%d", filter[3].Code, filter[3].K)
+	}
+
+	// Instruction 4: branch on bit 30 (0x40000000)
+	if filter[4].Code != (unix.BPF_JMP|unix.BPF_JSET|unix.BPF_K) || filter[4].K != 0x40000000 || filter[4].Jt != 0 || filter[4].Jf != 1 {
+		t.Errorf("inst 4: want JSET 0x40000000 Jt=0 Jf=1, got K=0x%x Jt=%d Jf=%d", filter[4].K, filter[4].Jt, filter[4].Jf)
+	}
+
+	// Instruction 5: KILL on bit 30
+	if filter[5].Code != (unix.BPF_RET|unix.BPF_K) || filter[5].K != unix.SECCOMP_RET_KILL_PROCESS {
+		t.Errorf("inst 5: want SECCOMP_RET_KILL_PROCESS, got code=0x%x K=0x%x", filter[5].Code, filter[5].K)
+	}
+
+	// Instruction 6: branch on SYS_SETSID
+	if filter[6].Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || filter[6].K != uint32(unix.SYS_SETSID) || filter[6].Jt != 2 || filter[6].Jf != 0 {
+		t.Errorf("inst 6: want JEQ SYS_SETSID (%d) Jt=2 Jf=0, got K=%d Jt=%d Jf=%d", unix.SYS_SETSID, filter[6].K, filter[6].Jt, filter[6].Jf)
+	}
+
+	// Instruction 7: branch on SYS_SETPGID
+	if filter[7].Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || filter[7].K != uint32(unix.SYS_SETPGID) || filter[7].Jt != 1 || filter[7].Jf != 0 {
+		t.Errorf("inst 7: want JEQ SYS_SETPGID (%d) Jt=1 Jf=0, got K=%d Jt=%d Jf=%d", unix.SYS_SETPGID, filter[7].K, filter[7].Jt, filter[7].Jf)
+	}
+
+	// Instruction 8: default ALLOW
+	if filter[8].Code != (unix.BPF_RET|unix.BPF_K) || filter[8].K != unix.SECCOMP_RET_ALLOW {
+		t.Errorf("inst 8: want SECCOMP_RET_ALLOW, got code=0x%x K=0x%x", filter[8].Code, filter[8].K)
+	}
+
+	// Instruction 9: reject setsid/setpgid with EPERM
+	wantEperm := unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)
+	if filter[9].Code != (unix.BPF_RET|unix.BPF_K) || filter[9].K != wantEperm {
+		t.Errorf("inst 9: want SECCOMP_RET_ERRNO | EPERM (0x%x), got code=0x%x K=0x%x", wantEperm, filter[9].Code, filter[9].K)
+	}
+}
+
 func TestStaticBPFArchitectureValidation(t *testing.T) {
 	switch runtime.GOARCH {
 	case "amd64":
