@@ -16,8 +16,22 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.arch }})
+    # arm64 is a first-class target, not only a cross-build: the isolation and
+    # seccomp proofs must run on AArch64 hardware too. Both legs are pinned to
+    # 26.04 (the image ubuntu-latest resolves to) and to the free native arm64
+    # runner: the 24.04 image denies bwrap its loopback RTM_NEWADDR, which
+    # fails the sandbox proof on either architecture.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -28,11 +42,17 @@ jobs:
 
       # The sandbox proof test is skipped when bubblewrap is absent. Install it
       # so CI actually proves the isolation instead of only compiling it.
-      - name: install bubblewrap for sandbox proof
+      # build-essential supplies the gcc the race detector needs.
+      - name: install bubblewrap and gcc for sandbox proof
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap
+          sudo apt-get install -y -qq bubblewrap build-essential
           bwrap --version
+
+      - name: verify native ${{ matrix.arch }}
+        run: |
+          uname -m
+          test "$(go env GOARCH)" = "${{ matrix.arch }}"
 
       - name: gofmt
         run: test -z "$(gofmt -l .)"
