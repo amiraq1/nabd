@@ -13,8 +13,6 @@ nabd-agent-audit
 /mcp-server.exe
 /mcp-guard
 /mcp-guard.exe
-/nabd-mcp-guard
-/nabd-mcp-guard.exe
 *.exe
 
 # Test, coverage and profiling artifacts
