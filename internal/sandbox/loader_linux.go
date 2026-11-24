@@ -112,11 +112,12 @@ func LoaderBinds(executable string) ([]string, error) {
 		return nil, err
 	}
 	elfFile, err := elf.NewFile(f)
-	f.Close()
 	if err != nil {
+		f.Close()
 		// Not an ELF binary: there is no loader to bind.
 		return nil, nil
 	}
+	// The file stays open: reading PT_INTERP and DT_NEEDED goes through it.
 	defer elfFile.Close()
 
 	interp, err := interpreterOf(elfFile)
