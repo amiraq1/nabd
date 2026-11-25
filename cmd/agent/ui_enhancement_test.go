@@ -477,3 +477,114 @@ func TestREAMCPUntrustedOutputDisplaySanitization(t *testing.T) {
 		t.Fatalf("payload text should remain as untrusted text without modification: %q", sanitizedInjection)
 	}
 }
+
+func TestSystemPromptConditionalREA(t *testing.T) {
+	// Case 1: Nil registry yields baseSystemPrompt only
+	mNil := initialModel(nil, &mockClient{})
+	if mNil.messages[0].Content != baseSystemPrompt {
+		t.Fatalf("expected nil registry to yield baseSystemPrompt, got:\n%s", mNil.messages[0].Content)
+	}
+
+	// Case 2: Default registry without REA yields baseSystemPrompt only (saves historyBudget)
+	dir := t.TempDir()
+	regDef, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regDef.Close()
+
+	if regDef.IsREAEnabled() {
+		t.Fatal("expected REA to be disabled by default")
+	}
+
+	mDef := initialModel(regDef, &mockClient{})
+	if mDef.messages[0].Content != baseSystemPrompt {
+		t.Fatalf("expected default registry to yield baseSystemPrompt, got:\n%s", mDef.messages[0].Content)
+	}
+	if strings.Contains(mDef.messages[0].Content, "REA REVERSE-ENGINEERING MODE") {
+		t.Fatal("default registry unexpectedly contained REA prompt")
+	}
+
+	// Case 3: REA enabled appends reaSystemPrompt
+	binFile := filepath.Join(dir, "rea-mock")
+	if err := os.WriteFile(binFile, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256Hex("#!/bin/sh\n")
+
+	guardFile := filepath.Join(dir, "nabd-mcp-guard")
+	if err := os.WriteFile(guardFile, []byte("#!/bin/sh\nexec \"$@\"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	guardHash := sha256Hex(string([]byte("#!/bin/sh\nexec \"$@\"\n")))
+
+	targetDir := t.TempDir()
+
+	t.Setenv("NABD_REA_MCP_BIN", binFile)
+	t.Setenv("NABD_REA_MCP_SHA256", hash)
+	t.Setenv("NABD_REA_MCP_GUARD", guardFile)
+	t.Setenv("NABD_REA_MCP_GUARD_SHA256", guardHash)
+	t.Setenv("NABD_REA_TARGET_DIR", targetDir)
+
+	regREA, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regREA.Close()
+
+	if !regREA.IsREAEnabled() {
+		t.Fatal("expected REA to be enabled on regREA")
+	}
+
+	mREA := initialModel(regREA, &mockClient{})
+	promptREA := mREA.messages[0].Content
+
+	expectedPrompt := baseSystemPrompt + "\n\n" + reaSystemPrompt
+	if promptREA != expectedPrompt {
+		t.Fatalf("expected promptREA to match baseSystemPrompt + reaSystemPrompt exactly, diff:\nGot: %q\nWant: %q", promptREA, expectedPrompt)
+	}
+
+	// Verify key prompt invariant sections
+	for _, expectedSnippet := range []string{
+		"REA REVERSE-ENGINEERING MODE (NABD SANDBOXED MCP)",
+		"SCOPE & UNTRUSTED DATA",
+		"NABD SANDBOX & EXECUTION LIMITS (HARD RULES)",
+		"KEEP RESPONSES UNDER NABD'S 32 KiB CAP",
+		"EVIDENCE DISCIPLINE & ERRORS",
+		"OUTPUT FORMAT",
+	} {
+		if !strings.Contains(promptREA, expectedSnippet) {
+			t.Fatalf("REA system prompt missing expected snippet: %q", expectedSnippet)
+		}
+	}
+
+	// Verify /clear and clear rebuild system prompt conditionally
+	// Add dummy conversation history
+	mREA.messages = append(mREA.messages, Message{Role: "user", Content: "test message"})
+	mREA.messages = append(mREA.messages, Message{Role: "assistant", Content: "test response"})
+
+	// Trigger /clear
+	mREA.textArea.SetValue("/clear")
+	updated, _ := mREA.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mCleared := updated.(uiModel)
+
+	if len(mCleared.messages) != 1 {
+		t.Fatalf("expected exactly 1 message after /clear, got %d", len(mCleared.messages))
+	}
+	if mCleared.messages[0].Content != expectedPrompt {
+		t.Fatalf("expected /clear on REA model to retain REA prompt, got:\n%s", mCleared.messages[0].Content)
+	}
+
+	// Trigger plain "clear" on default model
+	mDef.messages = append(mDef.messages, Message{Role: "user", Content: "hello"})
+	mDef.textArea.SetValue("clear")
+	updatedDef, _ := mDef.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDefCleared := updatedDef.(uiModel)
+
+	if len(mDefCleared.messages) != 1 {
+		t.Fatalf("expected exactly 1 message after clear, got %d", len(mDefCleared.messages))
+	}
+	if mDefCleared.messages[0].Content != baseSystemPrompt {
+		t.Fatalf("expected clear on default model to retain baseSystemPrompt alone, got:\n%s", mDefCleared.messages[0].Content)
+	}
+}
