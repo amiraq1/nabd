@@ -59,6 +59,7 @@ func TestPolicyMCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = reg.Close() })
 	s, err := newServer(reg)
 	if err != nil {
 		t.Fatal(err)

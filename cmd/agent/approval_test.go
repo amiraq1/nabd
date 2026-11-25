@@ -17,6 +17,7 @@ func approvalTestModel(t *testing.T, dir string) uiModel {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	t.Cleanup(func() { _ = reg.Close() })
 	return initialModel(reg, &mockClient{})
 }
 
