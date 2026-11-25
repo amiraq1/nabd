@@ -58,6 +58,7 @@ type Registry struct {
 	pending   map[string]pendingApproval
 	now       func() time.Time
 	mcpConfig *MCPConfig
+	reaConfig *REAConfig
 	sandbox   sandbox.Backend
 }
 
@@ -136,8 +137,41 @@ func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
 		}
 		r.mcpConfig = cfg
 	}
+
+	// Check opt-in REA MCP configuration (fail-closed if invalid)
+	reaCfg, err := LoadREAConfigFromEnv()
+	if err != nil {
+		_ = root.Close()
+		return nil, fmt.Errorf("load REA MCP configuration: %w", err)
+	}
+	if reaCfg != nil {
+		if r.mcpConfig == nil {
+			r.mcpConfig = &MCPConfig{servers: make(map[string]MCPServer)}
+		}
+		validatedServer, err := validateServer(REAServerName, reaCfg.Server)
+		if err != nil {
+			_ = root.Close()
+			return nil, fmt.Errorf("validate REA MCP server: %w", err)
+		}
+		r.mcpConfig.servers[REAServerName] = validatedServer
+		r.reaConfig = reaCfg
+	}
+
 	r.registerDefaults()
 	return r, nil
+}
+
+// IsREAEnabled reports whether the opt-in REA MCP integration is configured and enabled.
+func (r *Registry) IsREAEnabled() bool {
+	return r.reaConfig != nil && r.Has("mcp_call")
+}
+
+// READetails returns the configured REA binary path and target directory.
+func (r *Registry) READetails() (binPath, targetDir string) {
+	if r.reaConfig == nil {
+		return "", ""
+	}
+	return r.reaConfig.BinPath, r.reaConfig.TargetDir
 }
 
 // EnableExecution opts into external execution only after the isolation

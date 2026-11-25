@@ -189,6 +189,13 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 			Tool    string `json:"tool"`
 		}
 		_ = json.Unmarshal([]byte(rawArgs), &p)
+		if p.Command == "rea" {
+			toolName := p.Tool
+			if toolName == "" {
+				toolName = "tool"
+			}
+			return fmt.Sprintf("rea:%s(...) -> %d bytes", toolName, len(result))
+		}
 		return fmt.Sprintf("mcp_call(%s:%s) -> %d bytes", p.Command, p.Tool, len(result))
 
 	default:
