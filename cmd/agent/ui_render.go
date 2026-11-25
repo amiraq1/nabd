@@ -630,3 +630,23 @@ func renderMessageCard(msg Message, width int, isLastTool bool, expanded bool) s
 		return sanitizeForDisplay(msg.Content)
 	}
 }
+
+// formatHelp builds the agent help guide dynamically from the single source of truth slashCommands.
+func formatHelp() string {
+	var b strings.Builder
+	b.WriteString("=== NabdCoder Help ===\nCommands:\n")
+	for _, cmd := range slashCommands {
+		cmdAlias := fmt.Sprintf("/%s, %s", cmd.Name, cmd.Name)
+		fmt.Fprintf(&b, "  %-15s - %s\n", cmdAlias, cmd.Description)
+	}
+	b.WriteString("  undo [path]     - Restore file from shadow backup\n")
+	b.WriteString("  exit, quit      - Exit NabdCoder\n\n")
+	b.WriteString(`Keybindings:
+  Enter           - Send prompt to model
+  Alt+Enter/Ctrl+J- Insert newline in multi-line prompt
+  Up / Down       - Navigate prompt history (at line 0)
+  Esc             - Cancel active request (or reject approval/disclosure)
+  Ctrl+O          - Toggle last tool output full view / summary
+  Ctrl+C          - Force quit`)
+	return b.String()
+}

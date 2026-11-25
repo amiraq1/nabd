@@ -109,4 +109,13 @@ var (
 
 	// Approval prompt style
 	approvalPromptStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+
+	// Slash command palette styles
+	slashBoxStyle            = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorSubtle)
+	slashSelectedPrefixStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	slashSelectedNameStyle   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	slashSelectedDescStyle   = lipgloss.NewStyle().Foreground(colorFg)
+	slashNormalNameStyle     = lipgloss.NewStyle().Foreground(colorFg)
+	slashNormalDescStyle     = lipgloss.NewStyle().Foreground(colorMuted)
+	slashHintStyle           = lipgloss.NewStyle().Foreground(colorMuted)
 )

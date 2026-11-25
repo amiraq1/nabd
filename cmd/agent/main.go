@@ -100,6 +100,8 @@ type uiModel struct {
 	status            string
 	statusBar         string
 	busy              bool
+	palette           slashPalette
+	baseHeight        int
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -192,6 +194,7 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 		client:        client,
 		registry:      reg,
 		status:        "Ready",
+		baseHeight:    20,
 	}
 }
 
@@ -317,6 +320,42 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.palette.open {
+			switch msg.Type {
+			case tea.KeyUp:
+				m.palette.navigateUp()
+				return m, nil
+			case tea.KeyDown:
+				m.palette.navigateDown()
+				return m, nil
+			case tea.KeyTab:
+				cmd := m.palette.selectedCommand()
+				if cmd != nil {
+					completed := "/" + cmd.Name
+					m.textArea.SetValue(completed)
+					m.textArea.CursorEnd()
+					m.palette.updatePalette(completed, m.busy, m.awaitingApproval, m.pendingDisclosure != nil)
+					m.adjustViewportHeight()
+				}
+				return m, nil
+			case tea.KeyEsc:
+				m.palette.open = false
+				m.palette.dismissedInput = m.getInputValue()
+				m.adjustViewportHeight()
+				return m, nil
+			case tea.KeyEnter:
+				if !msg.Alt {
+					cmd := m.palette.selectedCommand()
+					if cmd != nil {
+						m.palette.open = false
+						m.palette.dismissedInput = ""
+						m.adjustViewportHeight()
+						return m.executeLocalCommand("/" + cmd.Name)
+					}
+				}
+			}
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.lifecycle.stop()
@@ -385,68 +424,14 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			m.history = append(m.history, input)
-			m.historyIdx = len(m.history)
-			m.historyDraft = ""
-
-			if input == "exit" || input == "quit" {
-				m.lifecycle.stop()
-				return m, tea.Quit
-			}
-			if input == "clear" || input == "/clear" {
-				m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
-				m.pendingTools = nil
-				m.awaitingApproval = false
-				m.approval = approvalPreview{}
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-			if input == "undo" || strings.HasPrefix(input, "undo ") {
-				target := strings.TrimSpace(strings.TrimPrefix(input, "undo"))
-				result, err := m.registry.Undo(target)
-				m.clearInput()
-				if err != nil {
-					m.messages = append(m.messages, Message{Role: "local", Content: "undo: " + err.Error()})
-				} else {
-					m.messages = append(m.messages, Message{Role: "local", Content: result})
-				}
-				m.refresh()
-				return m, nil
-			}
-			if input == "/status" || input == "status" {
-				m.messages = append(m.messages, Message{Role: "local", Content: m.formatStatus()})
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-			if input == "/tools" || input == "tools" {
-				m.messages = append(m.messages, Message{Role: "local", Content: m.formatTools()})
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-			if input == "/help" || input == "help" {
-				m.messages = append(m.messages, Message{Role: "local", Content: formatHelp()})
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-
-			m.messages = append(m.messages, Message{Role: "user", Content: input})
-			m.clearInput()
-			m.busy = true
-			m.iteration = 0
-			m.callCounts = make(map[string]int)
-			m.status = "Thinking..."
-			m.refresh()
-			return m.startLLM()
+			return m.executeLocalCommand(input)
 		}
 	case tea.WindowSizeMsg:
 		m.viewport.Width = max(20, msg.Width)
-		m.viewport.Height = max(1, msg.Height-8)
+		m.baseHeight = max(1, msg.Height-8)
 		m.textInput.Width = max(10, msg.Width-4)
 		m.textArea.SetWidth(max(10, msg.Width-4))
+		m.adjustViewportHeight()
 		m.refresh()
 	case llmResponseMsg:
 		m.finishRequest()
@@ -525,6 +510,11 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.textArea, cmd = m.textArea.Update(msg)
 	m.textInput, _ = m.textInput.Update(msg)
 	m.viewport, _ = m.viewport.Update(msg)
+	wasOpen := m.palette.open
+	m.palette.updatePalette(m.getInputValue(), m.busy, m.awaitingApproval, m.pendingDisclosure != nil)
+	if m.palette.open || wasOpen != m.palette.open {
+		m.adjustViewportHeight()
+	}
 	return m, cmd
 }
 
@@ -601,6 +591,9 @@ func (m uiModel) View() string {
 			inputView = m.textInput.View()
 		}
 		boxWidth := max(10, m.viewport.Width-2)
+		if m.palette.open {
+			b.WriteString(renderSlashPalette(&m.palette, m.viewport.Width, m.maxPaletteRows()) + "\n")
+		}
 		b.WriteString(composerBoxStyle.Width(boxWidth).Render(inputView) + "\n")
 	}
 	b.WriteString(renderFooter(&m, m.viewport.Width))
@@ -807,6 +800,95 @@ func (m *uiModel) clearInput() {
 	m.textArea.Reset()
 	m.textArea.SetHeight(1)
 	m.textInput.SetValue("")
+	m.palette.open = false
+	m.palette.filtered = nil
+	m.palette.selectedIndex = 0
+	m.palette.dismissedInput = ""
+	m.adjustViewportHeight()
+}
+
+func (m *uiModel) maxPaletteRows() int {
+	if m.baseHeight+8 < 20 {
+		return 3
+	}
+	return 5
+}
+
+func (m *uiModel) adjustViewportHeight() {
+	if m.baseHeight <= 0 {
+		m.baseHeight = max(1, m.viewport.Height)
+	}
+	if !m.palette.open || len(m.palette.filtered) == 0 {
+		m.viewport.Height = max(1, m.baseHeight)
+		return
+	}
+	maxRows := m.maxPaletteRows()
+	paletteHeight := min(len(m.palette.filtered), maxRows) + 3
+	m.viewport.Height = max(1, m.baseHeight-paletteHeight)
+}
+
+func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return m, nil
+	}
+
+	m.history = append(m.history, input)
+	m.historyIdx = len(m.history)
+	m.historyDraft = ""
+
+	if input == "exit" || input == "quit" {
+		m.lifecycle.stop()
+		return m, tea.Quit
+	}
+	if input == "clear" || input == "/clear" {
+		m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
+		m.pendingTools = nil
+		m.awaitingApproval = false
+		m.approval = approvalPreview{}
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+	if input == "undo" || strings.HasPrefix(input, "undo ") {
+		target := strings.TrimSpace(strings.TrimPrefix(input, "undo"))
+		result, err := m.registry.Undo(target)
+		m.clearInput()
+		if err != nil {
+			m.messages = append(m.messages, Message{Role: "local", Content: "undo: " + err.Error()})
+		} else {
+			m.messages = append(m.messages, Message{Role: "local", Content: result})
+		}
+		m.refresh()
+		return m, nil
+	}
+	if input == "/status" || input == "status" {
+		m.messages = append(m.messages, Message{Role: "local", Content: m.formatStatus()})
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+	if input == "/tools" || input == "tools" {
+		m.messages = append(m.messages, Message{Role: "local", Content: m.formatTools()})
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+	if input == "/help" || input == "help" {
+		m.messages = append(m.messages, Message{Role: "local", Content: formatHelp()})
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+
+	m.messages = append(m.messages, Message{Role: "user", Content: input})
+	m.clearInput()
+	m.busy = true
+	m.iteration = 0
+	m.callCounts = make(map[string]int)
+	m.status = "Thinking..."
+	m.refresh()
+	return m.startLLM()
 }
 
 func (m *uiModel) formatStatus() string {
@@ -872,25 +954,6 @@ func (m *uiModel) formatTools() string {
 		b.WriteString("\n\n• REA Reverse Engineering tools are active via mcp_call(command: \"rea\", tool: \"<name>\")")
 	}
 	return b.String()
-}
-
-func formatHelp() string {
-	return `=== NabdCoder Help ===
-Commands:
-  /status, status - View agent status, model info, and context metrics
-  /tools, tools   - List registered tools and approval requirements
-  /help, help     - Show this guide
-  /clear, clear   - Clear conversation history
-  undo [path]     - Restore file from shadow backup
-  exit, quit      - Exit NabdCoder
-
-Keybindings:
-  Enter           - Send prompt to model
-  Alt+Enter/Ctrl+J- Insert newline in multi-line prompt
-  Up / Down       - Navigate prompt history (at line 0)
-  Esc             - Cancel active request (or reject approval/disclosure)
-  Ctrl+O          - Toggle last tool output full view / summary
-  Ctrl+C          - Force quit`
 }
 
 func max(a, b int) int {
