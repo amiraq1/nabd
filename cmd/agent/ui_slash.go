@@ -31,6 +31,10 @@ var slashCommands = []slashCommand{
 		Description: "Clear conversation history (keeps the active system prompt)",
 	},
 	{
+		Name:        "copy",
+		Description: "Copy last reply (/copy code | /copy tool)",
+	},
+	{
 		Name:        "help",
 		Description: "Show available commands and keyboard shortcuts",
 	},

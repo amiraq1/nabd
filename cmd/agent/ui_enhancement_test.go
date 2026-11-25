@@ -1236,7 +1236,7 @@ func TestSlashPaletteResponsiveDimensions(t *testing.T) {
 	m.palette.updatePalette("/", false, false, false)
 	m.adjustViewportHeight()
 
-	paletteHeight := len(slashCommands) + 3 // 4 + 3 = 7
+	paletteHeight := min(len(slashCommands), m.maxPaletteRows()) + 3
 	expectedReduced := expectedBase - paletteHeight
 	if m.viewport.Height != expectedReduced {
 		t.Fatalf("expected reduced viewport.Height %d, got %d", expectedReduced, m.viewport.Height)
