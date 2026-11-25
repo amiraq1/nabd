@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 
@@ -92,6 +93,59 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		summary := fmt.Sprintf("runs project tests via go test with your user permissions inside the proven sandbox when enabled; otherwise the tool is disabled\nfilesystem and network access are bounded, with memory and process limits\npkg: %s", sanitizeForDisplay(pkg))
 		return approvalPreview{Summary: clip(sanitizeForDisplay(summary), maxApprovalChars)}
 
+	case "web_search":
+		var p struct {
+			Query      string `json:"query"`
+			MaxResults *int   `json:"max_results"`
+		}
+		_ = json.Unmarshal([]byte(tc.Function.Arguments), &p)
+		provider := "disabled"
+		if reg != nil {
+			provider = reg.WebSearchProvider()
+		}
+		maxRes := 5
+		if p.MaxResults != nil {
+			maxRes = *p.MaxResults
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "outbound network request: web search via %s\n", sanitizeForDisplay(provider))
+		b.WriteString("warning: search query leaves your machine to the external search provider; ensure no secrets are included\n")
+		fmt.Fprintf(&b, "query (%d bytes): %s\n", len(p.Query), sanitizeForDisplay(p.Query))
+		fmt.Fprintf(&b, "max_results: %d", maxRes)
+		return approvalPreview{Summary: clip(sanitizeForDisplay(b.String()), maxApprovalChars)}
+
+	case "web_fetch":
+		var p struct {
+			URL string `json:"url"`
+		}
+		_ = json.Unmarshal([]byte(tc.Function.Arguments), &p)
+		dest := "(invalid URL)"
+		queryNotice := "none"
+		if u, err := url.Parse(p.URL); err == nil {
+			if u.User != nil {
+				dest = "(blocked: URL contains userinfo)"
+			} else if u.Hostname() != "" {
+				dest = u.Scheme + "://" + u.Hostname()
+				if port := u.Port(); port != "" {
+					dest += ":" + port
+				}
+				dest += u.EscapedPath()
+			}
+			if u.RawQuery != "" {
+				queryNotice = fmt.Sprintf("present (%d bytes; parameter values omitted from preview)", len(u.RawQuery))
+			}
+		}
+		providerNote := "direct public HTTPS fetch (max 3 verified redirects)"
+		if reg != nil && reg.WebSearchProvider() == "firecrawl" {
+			providerNote = "outbound scrape via Firecrawl API after local SSRF/DNS check on target URL"
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "outbound network request: %s\n", providerNote)
+		fmt.Fprintf(&b, "destination: %s\n", sanitizeForDisplay(dest))
+		fmt.Fprintf(&b, "query_string: %s\n", queryNotice)
+		b.WriteString("warning: request leaves your device; verify destination and check for any embedded tokens in URL parameters")
+		return approvalPreview{Summary: clip(sanitizeForDisplay(b.String()), maxApprovalChars)}
+
 	default:
 		return approvalPreview{Summary: clip(sanitizeForDisplay("arguments: "+tc.Function.Arguments), maxApprovalChars)}
 	}
@@ -130,7 +184,18 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 				return approvalPreview{}, fmt.Errorf("command cannot be fully displayed for approval")
 			}
 		}
-		p.Summary += "\narguments: " + raw
+		if tc.Function.Name == "web_fetch" {
+			var a struct {
+				URL string `json:"url"`
+			}
+			if err := json.Unmarshal([]byte(raw), &a); err == nil {
+				if u, uErr := url.Parse(a.URL); uErr == nil && u.User != nil {
+					return approvalPreview{}, fmt.Errorf("web_fetch URL contains prohibited userinfo")
+				}
+			}
+		} else if tc.Function.Name != "web_search" {
+			p.Summary += "\narguments: " + raw
+		}
 	}
 	if len(p.Summary) > maxApprovalArgs {
 		return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; split the request", maxApprovalArgs)

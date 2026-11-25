@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -376,6 +377,47 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 		}
 		return fmt.Sprintf("mcp_call(%s:%s) -> %d bytes", p.Command, p.Tool, len(result))
 
+	case "web_search":
+		if strings.HasPrefix(result, "Error:") || strings.HasPrefix(result, "Action rejected") {
+			return "web_search -> " + truncate(result, 80)
+		}
+		var res struct {
+			ResultCount int  `json:"result_count"`
+			Truncated   bool `json:"truncated"`
+		}
+		if err := json.Unmarshal([]byte(result), &res); err == nil {
+			if res.Truncated {
+				return fmt.Sprintf("web_search -> %d results (truncated)", res.ResultCount)
+			}
+			return fmt.Sprintf("web_search -> %d results", res.ResultCount)
+		}
+		return fmt.Sprintf("web_search -> %d bytes", len(result))
+
+	case "web_fetch":
+		var p struct {
+			URL string `json:"url"`
+		}
+		_ = json.Unmarshal([]byte(rawArgs), &p)
+		host := "host"
+		if u, err := url.Parse(p.URL); err == nil && u.Hostname() != "" {
+			host = sanitizeForDisplay(u.Hostname())
+		}
+		if strings.HasPrefix(result, "Error:") || strings.HasPrefix(result, "Action rejected") {
+			return fmt.Sprintf("web_fetch(%s) -> %s", host, truncate(result, 80))
+		}
+		var res struct {
+			Bytes           int  `json:"bytes"`
+			SourceTruncated bool `json:"source_truncated"`
+			OutputTruncated bool `json:"output_truncated"`
+		}
+		if err := json.Unmarshal([]byte(result), &res); err == nil {
+			if res.SourceTruncated || res.OutputTruncated {
+				return fmt.Sprintf("web_fetch(%s) -> %d bytes (truncated)", host, res.Bytes)
+			}
+			return fmt.Sprintf("web_fetch(%s) -> %d bytes", host, res.Bytes)
+		}
+		return fmt.Sprintf("web_fetch(%s) -> %d bytes", host, len(result))
+
 	default:
 		return name + " -> " + truncate(result, maxUIDisplayChars)
 	}
@@ -400,7 +442,9 @@ func renderApprovalSummary(summary string, width int) string {
 		case strings.HasPrefix(line, "path:") || strings.HasPrefix(line, "base sha256:") ||
 			strings.HasPrefix(line, "old sha256:") || strings.HasPrefix(line, "new sha256:") ||
 			strings.HasPrefix(line, "arguments sha256:") || strings.HasPrefix(line, "pkg:") ||
-			strings.HasPrefix(line, "command:") || strings.HasPrefix(line, "tool:"):
+			strings.HasPrefix(line, "command:") || strings.HasPrefix(line, "tool:") ||
+			strings.HasPrefix(line, "destination:") || strings.HasPrefix(line, "query_string:") ||
+			strings.HasPrefix(line, "max_results:"):
 			b.WriteString(diffInfoStyle.Render(line))
 		default:
 			b.WriteString(line)
