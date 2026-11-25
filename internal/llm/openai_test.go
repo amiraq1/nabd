@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -16,26 +20,37 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("NABD_BASE_URL", "https://example.invalid/v1")
 	t.Setenv("NABD_MODEL", "test-model")
 	t.Setenv("NABD_API_KEY", "test-key")
-	cfg := ConfigFromEnv()
-	if cfg.BaseURL != "https://example.invalid/v1" || cfg.Model != "test-model" || cfg.APIKey != "test-key" {
+	t.Setenv("NABD_API_KEY_FILE", "")
+	t.Setenv("NABD_TIMEOUT", "")
+	t.Setenv("NABD_MAX_TOKENS", "")
+	t.Setenv("NABD_TEMPERATURE", "")
+	cfg, err := ConfigFromEnv()
+	if err != nil {
+		t.Fatalf("ConfigFromEnv = %v", err)
+	}
+	if cfg.BaseURL != "https://example.invalid/v1" || cfg.Model != "test-model" || cfg.APIKey.SecretValue() != "test-key" {
 		t.Fatalf("ConfigFromEnv = %+v", cfg)
 	}
 
 	t.Setenv("NABD_BASE_URL", "")
 	t.Setenv("NABD_MODEL", "")
 	t.Setenv("NABD_API_KEY", "")
-	cfg = ConfigFromEnv()
-	if cfg.BaseURL != DefaultBaseURL || cfg.Model != DefaultModel || cfg.APIKey != "sk-no-key" {
+	t.Setenv("NABD_API_KEY_FILE", "")
+	cfg, err = ConfigFromEnv()
+	if err != nil {
+		t.Fatalf("defaults error = %v", err)
+	}
+	if cfg.BaseURL != DefaultBaseURL || cfg.Model != DefaultModel || cfg.APIKey != "" {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 }
 
 func TestNewOpenAIClientDefaults(t *testing.T) {
 	client := NewOpenAIClient(Config{})
-	if client.cfg.BaseURL != DefaultBaseURL || client.cfg.Model != DefaultModel || client.cfg.APIKey != "sk-no-key" {
+	if client.cfg.BaseURL != DefaultBaseURL || client.cfg.Model != DefaultModel || client.cfg.APIKey != "" {
 		t.Fatalf("defaults = %+v", client.cfg)
 	}
-	if client.cfg.MaxTokens != DefaultMaxTokens || client.cfg.Temperature != DefaultTemperature {
+	if client.cfg.MaxTokens != DefaultMaxTokens || client.cfg.GetTemperature() != DefaultTemperature {
 		t.Fatalf("generation defaults = %+v", client.cfg)
 	}
 }
@@ -249,5 +264,498 @@ func TestParseRetryAfter(t *testing.T) {
 	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
 	if got := parseRetryAfter(future); got <= 0 || got > 3*time.Second {
 		t.Errorf("http date = %v", got)
+	}
+}
+
+func TestAPIKeyHandling(t *testing.T) {
+	tempDir := t.TempDir()
+
+	validKeyPath := filepath.Join(tempDir, "valid.key")
+	if err := os.WriteFile(validKeyPath, []byte("valid-secret-key\n  "), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	openPermPath := filepath.Join(tempDir, "open.key")
+	if err := os.WriteFile(openPermPath, []byte("valid-secret-key\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(openPermPath, 0644)
+
+	symlinkPath := filepath.Join(tempDir, "link.key")
+	symlinkSupported := true
+	if err := os.Symlink(validKeyPath, symlinkPath); err != nil {
+		symlinkSupported = false
+	}
+
+	oversizePath := filepath.Join(tempDir, "oversize.key")
+	if err := os.WriteFile(oversizePath, make([]byte, 4097), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		envKey     string
+		envFile    string
+		wantKey    string
+		wantErrMsg string
+		skipOnWin  bool
+	}{
+		{
+			name:    "key_from_env",
+			envKey:  "valid-secret-key-123",
+			wantKey: "valid-secret-key-123",
+		},
+		{
+			name:    "key_from_file",
+			envFile: validKeyPath,
+			wantKey: "valid-secret-key",
+		},
+		{
+			name:       "both_set_error",
+			envKey:     "valid-secret-key-123",
+			envFile:    validKeyPath,
+			wantErrMsg: "both NABD_API_KEY and NABD_API_KEY_FILE are set",
+		},
+		{
+			name:       "open_permissions_0644_error",
+			envFile:    openPermPath,
+			wantErrMsg: "too open",
+			skipOnWin:  true,
+		},
+		{
+			name:       "symlink_error",
+			envFile:    symlinkPath,
+			wantErrMsg: "symlink",
+		},
+		{
+			name:       "oversize_error",
+			envFile:    oversizePath,
+			wantErrMsg: "exceeds maximum size",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skipOnWin && runtime.GOOS == "windows" {
+				t.Skip("skipping unix permission check on windows")
+			}
+			if tc.name == "symlink_error" && !symlinkSupported {
+				t.Skip("symlink creation not supported")
+			}
+
+			t.Setenv("NABD_API_KEY", tc.envKey)
+			t.Setenv("NABD_API_KEY_FILE", tc.envFile)
+			t.Setenv("NABD_BASE_URL", "http://127.0.0.1:8080/v1")
+			t.Setenv("NABD_MODEL", "local")
+
+			cfg, err := ConfigFromEnv()
+			if tc.wantErrMsg != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrMsg) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErrMsg, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.APIKey.SecretValue() != tc.wantKey {
+				t.Fatalf("got key %q, want %q", cfg.APIKey.SecretValue(), tc.wantKey)
+			}
+		})
+	}
+}
+
+func TestAPIKeyFormatValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		wantErr bool
+	}{
+		{"valid_alphanumeric", "sk-proj-12345678", false},
+		{"valid_min_length_8", "12345678", false},
+		{"too_short", "short", true},
+		{"contains_crlf", "sk-proj\r\n1234", true},
+		{"contains_newline", "sk-proj\n1234", true},
+		{"contains_space", "sk-proj 1234", true},
+		{"contains_tab", "sk-proj\t1234", true},
+		{"non_ascii", "sk-proj-مفتاح", true},
+		{"too_long", strings.Repeat("a", 513), true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				BaseURL: DefaultBaseURL,
+				Model:   DefaultModel,
+				APIKey:  Secret(tc.key),
+			}
+			err := cfg.Validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for key %q, got nil", tc.key)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for key %q: %v", tc.key, err)
+			}
+		})
+	}
+}
+
+func TestEmptyKeyLoopbackNoAuthHeader(t *testing.T) {
+	var receivedAuth string
+	var headerPresent bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, headerPresent = r.Header["Authorization"]
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hello"}}]}`))
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient(Config{
+		BaseURL: server.URL,
+		Model:   "local",
+		APIKey:  "",
+		Timeout: 5 * time.Second,
+	})
+	resp, err := client.Chat(context.Background(), Request{})
+	if err != nil {
+		t.Fatalf("chat failed: %v", err)
+	}
+	if resp.Message.Content != "hello" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if headerPresent || receivedAuth != "" {
+		t.Fatalf("expected no Authorization header on loopback with empty key, got %q", receivedAuth)
+	}
+}
+
+func TestEmptyKeyRemoteHTTPSFailsValidate(t *testing.T) {
+	cfg := Config{
+		BaseURL: "https://api.openai.com/v1",
+		Model:   "gpt-4",
+		APIKey:  "",
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "remote endpoint requires an API key") {
+		t.Fatalf("expected remote endpoint requires an API key error, got %v", err)
+	}
+}
+
+func TestGenerationSettingsFromEnv(t *testing.T) {
+	tests := []struct {
+		name       string
+		timeout    string
+		maxTokens  string
+		temp       string
+		wantErrMsg string
+		check      func(t *testing.T, cfg Config)
+	}{
+		{
+			name:      "valid_settings",
+			timeout:   "90s",
+			maxTokens: "4096",
+			temp:      "0.7",
+			check: func(t *testing.T, cfg Config) {
+				if cfg.Timeout != 90*time.Second {
+					t.Fatalf("timeout = %v, want 90s", cfg.Timeout)
+				}
+				if cfg.MaxTokens != 4096 {
+					t.Fatalf("max_tokens = %d, want 4096", cfg.MaxTokens)
+				}
+				if cfg.Temperature == nil || *cfg.Temperature != 0.7 {
+					t.Fatalf("temperature = %v, want 0.7", cfg.Temperature)
+				}
+			},
+		},
+		{
+			name:       "invalid_timeout_range_low",
+			timeout:    "2s",
+			wantErrMsg: "NABD_TIMEOUT",
+		},
+		{
+			name:       "invalid_timeout_range_high",
+			timeout:    "700s",
+			wantErrMsg: "NABD_TIMEOUT",
+		},
+		{
+			name:       "invalid_max_tokens_zero",
+			maxTokens:  "0",
+			wantErrMsg: "NABD_MAX_TOKENS",
+		},
+		{
+			name:       "invalid_max_tokens_high",
+			maxTokens:  "200000",
+			wantErrMsg: "NABD_MAX_TOKENS",
+		},
+		{
+			name:       "invalid_temperature_negative",
+			temp:       "-0.1",
+			wantErrMsg: "NABD_TEMPERATURE",
+		},
+		{
+			name:       "invalid_temperature_high",
+			temp:       "2.5",
+			wantErrMsg: "NABD_TEMPERATURE",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NABD_TIMEOUT", tc.timeout)
+			t.Setenv("NABD_MAX_TOKENS", tc.maxTokens)
+			t.Setenv("NABD_TEMPERATURE", tc.temp)
+			t.Setenv("NABD_BASE_URL", DefaultBaseURL)
+			t.Setenv("NABD_MODEL", DefaultModel)
+			t.Setenv("NABD_API_KEY", "")
+			t.Setenv("NABD_API_KEY_FILE", "")
+
+			cfg, err := ConfigFromEnv()
+			if tc.wantErrMsg != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrMsg) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErrMsg, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.check != nil {
+				tc.check(t, cfg)
+			}
+		})
+	}
+}
+
+func TestTemperatureZeroSentInPayload(t *testing.T) {
+	t.Setenv("NABD_TEMPERATURE", "0")
+	t.Setenv("NABD_BASE_URL", DefaultBaseURL)
+	t.Setenv("NABD_MODEL", DefaultModel)
+	t.Setenv("NABD_API_KEY", "")
+	t.Setenv("NABD_API_KEY_FILE", "")
+	cfg, err := ConfigFromEnv()
+	if err != nil {
+		t.Fatalf("ConfigFromEnv failed: %v", err)
+	}
+	if cfg.Temperature == nil || *cfg.Temperature != 0.0 {
+		t.Fatalf("expected temperature 0.0, got %v", cfg.Temperature)
+	}
+
+	var seen struct {
+		Temperature *float64 `json:"temperature"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Errorf("decode error: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	cfg.BaseURL = server.URL
+	client := NewOpenAIClient(cfg)
+	_, err = client.Chat(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen.Temperature == nil || *seen.Temperature != 0.0 {
+		t.Fatalf("payload temperature = %v, want 0.0", seen.Temperature)
+	}
+}
+
+func TestErrorScrubbingRedactsKeyAndSubstrings(t *testing.T) {
+	apiKey := "super-secret-token-12345678"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("Error: rejected key " + apiKey + " and fragment super-secret-token"))
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient(Config{
+		BaseURL: server.URL,
+		Model:   "test-model",
+		APIKey:  Secret(apiKey),
+		Timeout: 5 * time.Second,
+	})
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+	_, err := client.Chat(context.Background(), Request{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, apiKey) {
+		t.Fatalf("error contains raw API key: %s", errStr)
+	}
+	if strings.Contains(errStr, "super-secret-token") {
+		t.Fatalf("error contains key substring: %s", errStr)
+	}
+	if !strings.Contains(errStr, "[REDACTED]") {
+		t.Fatalf("error does not contain [REDACTED]: %s", errStr)
+	}
+}
+
+func TestErrorScrubbingLargeBody(t *testing.T) {
+	apiKey := "super-secret-token-12345678"
+	body := "Error: " + apiKey + strings.Repeat("A", 128*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient(Config{
+		BaseURL: server.URL,
+		Model:   "test-model",
+		APIKey:  Secret(apiKey),
+		Timeout: 5 * time.Second,
+	})
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+	_, err := client.Chat(context.Background(), Request{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, apiKey) {
+		t.Fatalf("error contains raw API key: %s", errStr)
+	}
+	if !strings.Contains(errStr, "[REDACTED]") {
+		t.Fatalf("error does not contain [REDACTED]: %s", errStr)
+	}
+}
+
+func TestSecretFormatting(t *testing.T) {
+	keyVal := "sk-super-secret-api-key-987654321"
+	cfg := Config{
+		BaseURL: DefaultBaseURL,
+		Model:   DefaultModel,
+		APIKey:  Secret(keyVal),
+	}
+	str := fmt.Sprintf("%v %+v %#v", cfg, cfg, cfg)
+	if strings.Contains(str, keyVal) {
+		t.Fatalf("fmt.Sprintf exposed secret: %s", str)
+	}
+	if !strings.Contains(str, "[REDACTED]") {
+		t.Fatalf("fmt.Sprintf missing [REDACTED]: %s", str)
+	}
+
+	jsonData, err := json.Marshal(cfg.APIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(jsonData), keyVal) {
+		t.Fatalf("json.Marshal exposed secret: %s", jsonData)
+	}
+	if string(jsonData) != `"[REDACTED]"` {
+		t.Fatalf("json.Marshal = %s, want %q", jsonData, `"[REDACTED]"`)
+	}
+
+	textData, err := cfg.APIKey.MarshalText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(textData), keyVal) {
+		t.Fatalf("MarshalText exposed secret: %s", textData)
+	}
+	if string(textData) != "[REDACTED]" {
+		t.Fatalf("MarshalText = %s, want %q", textData, "[REDACTED]")
+	}
+}
+
+func TestCheckModel(t *testing.T) {
+	tests := []struct {
+		name        string
+		targetModel string
+		handler     http.HandlerFunc
+		wantErrMsg  string
+		wantNoErr   bool
+	}{
+		{
+			name:        "model_exists",
+			targetModel: "gpt-4o",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}`))
+			},
+			wantNoErr: true,
+		},
+		{
+			name:        "model_missing_with_suggestions",
+			targetModel: "gpt-4",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"},{"id":"gemini-1.5"}]}`))
+			},
+			wantErrMsg: "did you mean: gpt-4o, gpt-4o-mini, gemini-1.5?",
+		},
+		{
+			name:        "model_404_skips_without_failure",
+			targetModel: "gpt-4o",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			},
+			wantNoErr: true,
+		},
+		{
+			name:        "model_redirect_rejected",
+			targetModel: "gpt-4o",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "/other", http.StatusFound)
+			},
+			wantErrMsg: "redirect",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(tc.handler)
+			defer server.Close()
+
+			client := NewOpenAIClient(Config{
+				BaseURL: server.URL,
+				Model:   tc.targetModel,
+				APIKey:  "valid-secret-key",
+			})
+
+			err := client.CheckModel(context.Background())
+			if tc.wantNoErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.wantErrMsg != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrMsg) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErrMsg, err)
+				}
+			}
+		})
+	}
+}
+
+func TestUnauthorizedErrors(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		status := status
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			attempts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":"bad api key"}`))
+			}))
+			defer server.Close()
+
+			client := NewOpenAIClient(Config{
+				BaseURL: server.URL,
+				Model:   "test-model",
+				APIKey:  "secret-key-123",
+				Timeout: 5 * time.Second,
+			})
+			_, err := client.Chat(context.Background(), Request{})
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("expected ErrUnauthorized, got %v", err)
+			}
+			if attempts != 1 {
+				t.Fatalf("expected 1 attempt (no retry), got %d", attempts)
+			}
+		})
 	}
 }
