@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,7 +14,7 @@ func TestWebToolsAutoApproveReadOnlyStillPromptsAndStatusReports(t *testing.T) {
 	for _, k := range []string{
 		tools.WebSearchProviderEnv, tools.WebBraveAPIKeyEnv,
 		tools.WebTavilyAPIKeyEnv, tools.WebSearXNGURLEnv,
-		tools.WebFirecrawlAPIKeyEnv, tools.WebFirecrawlBaseURLEnv,
+		tools.WebFirecrawlAPIKeyEnv, tools.WebFirecrawlAPIKeyFileEnv, tools.WebFirecrawlBaseURLEnv,
 	} {
 		t.Setenv(k, "")
 	}
@@ -90,8 +92,14 @@ func TestWebToolsAutoApproveReadOnlyStillPromptsAndStatusReports(t *testing.T) {
 	if !strings.Contains(uiNext2.approval.Summary, "docs.example.com") {
 		t.Fatalf("approval preview missing destination hostname: %s", uiNext2.approval.Summary)
 	}
+	if !strings.Contains(uiNext2.approval.Summary, "firecrawl_endpoint: api.firecrawl.dev") || !strings.Contains(uiNext2.approval.Summary, "delegation_limit:") {
+		t.Fatalf("Firecrawl approval preview missing endpoint or remote delegation limits: %s", uiNext2.approval.Summary)
+	}
+	if !strings.Contains(uiNext.approval.Summary, "destination: api.firecrawl.dev") {
+		t.Fatalf("web_search approval preview missing destination host: %s", uiNext.approval.Summary)
+	}
 
-	// Verify prepareApprovalPreview rejects userinfo URLs in web_fetch
+	// Verify prepareApprovalPreview rejects userinfo URLs and non-HTTPS URLs in web_fetch
 	_, errUserinfo := prepareApprovalPreview(regFC, ToolCall{
 		ID: "call-bad",
 		Function: struct {
@@ -104,6 +112,79 @@ func TestWebToolsAutoApproveReadOnlyStillPromptsAndStatusReports(t *testing.T) {
 	})
 	if errUserinfo == nil {
 		t.Fatal("expected prepareApprovalPreview to reject web_fetch URL with userinfo")
+	}
+	_, errHTTP := prepareApprovalPreview(regFC, ToolCall{
+		ID: "call-http",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{
+			Name:      "web_fetch",
+			Arguments: `{"url":"http://docs.example.com/"}`,
+		},
+	})
+	if errHTTP == nil {
+		t.Fatal("expected prepareApprovalPreview to reject non-HTTPS web_fetch URL")
+	}
+}
+
+func TestWebToolsAutoApproveAllBehaviorAndFailClosedDisplay(t *testing.T) {
+	for _, k := range []string{
+		tools.WebSearchProviderEnv, tools.WebBraveAPIKeyEnv,
+		tools.WebTavilyAPIKeyEnv, tools.WebSearXNGURLEnv,
+		tools.WebFirecrawlAPIKeyEnv, tools.WebFirecrawlAPIKeyFileEnv, tools.WebFirecrawlBaseURLEnv,
+	} {
+		t.Setenv(k, "")
+	}
+	dir := t.TempDir()
+	t.Setenv(tools.WebSearchProviderEnv, "brave")
+	t.Setenv(tools.WebBraveAPIKeyEnv, "brave-test-key")
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	// AutoApproveAll bypasses manual prompt per policy, while preserving fail-closed display checks
+	mAll := initialModel(reg, &mockClient{}, AutoApproveAll)
+	mAll.pendingTools = []ToolCall{{
+		ID: "call-all-1",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{
+			Name:      "web_search",
+			Arguments: `{"query":"golang"}`,
+		},
+	}}
+	nextM, cmd := mAll.advance()
+	uiAll := nextM.(uiModel)
+	if uiAll.awaitingApproval || cmd == nil {
+		t.Fatal("expected AutoApproveAll to proceed without manual prompt")
+	}
+	auditBytes, aErr := os.ReadFile(filepath.Join(dir, ".nabd", "audit.log"))
+	if aErr != nil {
+		t.Fatalf("read audit.log: %v", aErr)
+	}
+	auditText := string(auditBytes)
+	if !strings.Contains(auditText, "[auto_approved:all]") || strings.Contains(auditText, `"golang"`) {
+		t.Fatalf("expected [auto_approved:all] tag without raw query in audit.log: %s", auditText)
+	}
+	// Fail closed on ANSI control sequences during disclosure even in AutoApproveAll mode
+	uiAll.pendingTools = []ToolCall{{
+		ID: "call-all-1",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{
+			Name:      "web_fetch",
+			Arguments: `{"url":"https://example.com"}`,
+		},
+	}}
+	upd, _ := uiAll.Update(toolExecutedMsg{toolMsg: Message{Role: "tool", ToolCallID: "call-all-1", Content: "bad \x1b[31mANSI\x1b[0m"}})
+	uiAfter := upd.(uiModel)
+	if !strings.Contains(uiAfter.messages[len(uiAfter.messages)-1].Content, "Tool disclosure blocked") {
+		t.Fatal("expected deceptive control sequences to fail closed even in AutoApproveAll")
 	}
 }
 

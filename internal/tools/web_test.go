@@ -59,7 +59,7 @@ func newWebTestRegistry(t *testing.T, env map[string]string, approver ApprovalFu
 	t.Helper()
 	for _, k := range []string{
 		WebSearchProviderEnv, WebBraveAPIKeyEnv, WebTavilyAPIKeyEnv,
-		WebSearXNGURLEnv, WebFirecrawlAPIKeyEnv, WebFirecrawlBaseURLEnv,
+		WebSearXNGURLEnv, WebFirecrawlAPIKeyEnv, WebFirecrawlAPIKeyFileEnv, WebFirecrawlBaseURLEnv,
 	} {
 		t.Setenv(k, "")
 	}
@@ -141,7 +141,7 @@ func TestWebConfigFailClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, k := range []string{
 				WebSearchProviderEnv, WebBraveAPIKeyEnv, WebTavilyAPIKeyEnv,
-				WebSearXNGURLEnv, WebFirecrawlAPIKeyEnv, WebFirecrawlBaseURLEnv,
+				WebSearXNGURLEnv, WebFirecrawlAPIKeyEnv, WebFirecrawlAPIKeyFileEnv, WebFirecrawlBaseURLEnv,
 			} {
 				t.Setenv(k, "")
 			}
@@ -798,5 +798,257 @@ func TestWebTLSMismatchHeadersMalformedJSONAndContextCancel(t *testing.T) {
 	outCancel := reg.RunApproved(ctx, "web_fetch", rawArgs, app)
 	if !strings.Contains(outCancel, "Error:") {
 		t.Fatalf("expected context cancellation/deadline error, got: %s", outCancel)
+	}
+}
+
+func TestWebFirecrawlKeyFileAndTimeouts(t *testing.T) {
+	clearWebEnv := func(t *testing.T) {
+		t.Helper()
+		for _, k := range []string{
+			WebSearchProviderEnv, WebBraveAPIKeyEnv, WebTavilyAPIKeyEnv,
+			WebSearXNGURLEnv, WebFirecrawlAPIKeyEnv, WebFirecrawlAPIKeyFileEnv, WebFirecrawlBaseURLEnv,
+		} {
+			t.Setenv(k, "")
+		}
+	}
+
+	// 1. Timeout configuration matches 15s direct/search and 25s Firecrawl scrape
+	if got := createSearchHTTPClient(nil, webDirectTimeout).Timeout; got != 15*time.Second {
+		t.Fatalf("expected 15s search timeout, got %v", got)
+	}
+	if got := createFetchHTTPClient(nil, webDirectTimeout).Timeout; got != 15*time.Second {
+		t.Fatalf("expected 15s direct fetch timeout, got %v", got)
+	}
+	if got := createSearchHTTPClient(nil, webFirecrawlScrapeTimeout).Timeout; got != 25*time.Second {
+		t.Fatalf("expected 25s Firecrawl scrape timeout, got %v", got)
+	}
+
+	// 2. Reject setting both NABD_FIRECRAWL_API_KEY and NABD_FIRECRAWL_API_KEY_FILE
+	keyDir := t.TempDir()
+	keyPath := filepath.Join(keyDir, "fc.key")
+	if err := os.WriteFile(keyPath, []byte("fc-file-secret-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearWebEnv(t)
+	t.Setenv(WebSearchProviderEnv, "firecrawl")
+	t.Setenv(WebFirecrawlAPIKeyEnv, "fc-inline-key")
+	t.Setenv(WebFirecrawlAPIKeyFileEnv, keyPath)
+	if _, err := LoadWebConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "specify only one") {
+		t.Fatalf("expected conflict error when both key and key_file are set, got: %v", err)
+	}
+
+	// 3. Reject missing, empty, oversized (>4KiB), control-char, symlink, and loose-perm files
+	t.Run("missing file", func(t *testing.T) {
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, filepath.Join(keyDir, "missing.key"))
+		if _, err := LoadWebConfigFromEnv(); err == nil {
+			t.Fatal("expected missing key file error")
+		}
+	})
+	t.Run("oversized >4KiB", func(t *testing.T) {
+		bigPath := filepath.Join(keyDir, "big.key")
+		if err := os.WriteFile(bigPath, bytes.Repeat([]byte("a"), maxWebKeyFileBytes+1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, bigPath)
+		if _, err := LoadWebConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "limit") {
+			t.Fatalf("expected 4KiB limit error, got: %v", err)
+		}
+	})
+	t.Run("empty file", func(t *testing.T) {
+		emptyPath := filepath.Join(keyDir, "empty.key")
+		if err := os.WriteFile(emptyPath, []byte("   \n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, emptyPath)
+		if _, err := LoadWebConfigFromEnv(); err == nil {
+			t.Fatal("expected empty key file error")
+		}
+	})
+	t.Run("control char rejected", func(t *testing.T) {
+		badPath := filepath.Join(keyDir, "bad.key")
+		if err := os.WriteFile(badPath, []byte("fc-abc\r\nX-Evil: 1"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, badPath)
+		if _, err := LoadWebConfigFromEnv(); err == nil {
+			t.Fatal("expected control character rejection in key file")
+		}
+	})
+	t.Run("symlink rejected", func(t *testing.T) {
+		symPath := filepath.Join(keyDir, "sym.key")
+		if err := os.Symlink(keyPath, symPath); err != nil {
+			t.Skipf("symlink creation unsupported: %v", err)
+		}
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, symPath)
+		if _, err := LoadWebConfigFromEnv(); err == nil {
+			t.Fatal("expected symlink rejection for key file")
+		}
+	})
+	t.Run("loose permissions rejected on unix", func(t *testing.T) {
+		if os.PathSeparator == '\\' {
+			t.Skip("POSIX 0600 permissions are not enforced on Windows")
+		}
+		loosePath := filepath.Join(keyDir, "loose.key")
+		if err := os.WriteFile(loosePath, []byte("fc-loose-key\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, loosePath)
+		if _, err := LoadWebConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "0600") {
+			t.Fatalf("expected 0600 permission error, got: %v", err)
+		}
+	})
+	t.Run("valid key file", func(t *testing.T) {
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, keyPath)
+		cfg, err := LoadWebConfigFromEnv()
+		if err != nil {
+			t.Fatalf("expected valid key file to load, got: %v", err)
+		}
+		if cfg.APIKey.raw() != "fc-file-secret-key" || cfg.APIKey.String() != "[REDACTED]" {
+			t.Fatalf("unexpected loaded key or redaction: %q", cfg.APIKey.String())
+		}
+	})
+}
+
+func TestWebFirecrawlScrapeErrorLimitsAndNoRedirectLeak(t *testing.T) {
+	var secondHostHit atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/scrape", func(w http.ResponseWriter, r *http.Request) {
+		mode := r.Header.Get("X-Test-Mode")
+		if mode == "" {
+			// Check URL inside payload to branch behavior
+			var req struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			switch {
+			case strings.Contains(req.URL, "oversized"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"success":true,"data":{"markdown":"`+strings.Repeat("x", maxDecompressedBodyBytes+1024)+`"}}`)
+				return
+			case strings.Contains(req.URL, "notfound"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"success":true,"data":{"markdown":"","metadata":{"statusCode":404,"sourceURL":"https://example.com/notfound"}}}`)
+				return
+			case strings.Contains(req.URL, "redir"):
+				http.Redirect(w, r, "https://other.example.net/steal", http.StatusFound)
+				return
+			}
+		}
+	})
+	mux.HandleFunc("/steal", func(w http.ResponseWriter, r *http.Request) {
+		secondHostHit.Store(true)
+	})
+
+	_, hooks, _ := newTestTLSServer(t, mux)
+	reg, _ := newWebTestRegistry(t, map[string]string{
+		WebSearchProviderEnv:   "firecrawl",
+		WebFirecrawlAPIKeyEnv:  "fc-no-leak-key",
+		WebFirecrawlBaseURLEnv: "https://example.com",
+	}, nil)
+	reg.webConfig.netHooks = hooks
+
+	// 1. Oversized Firecrawl JSON > 512 KiB reports limit error clearly
+	outBig := runWebToolApproved(t, reg, "web_fetch", map[string]any{"url": "https://example.com/oversized"})
+	if !strings.Contains(outBig, "exceeds") {
+		t.Fatalf("expected 512 KiB limit error on oversized Firecrawl response, got: %s", outBig)
+	}
+
+	// 2. Target HTTP 404 in metadata reported cleanly
+	out404 := runWebToolApproved(t, reg, "web_fetch", map[string]any{"url": "https://example.com/notfound"})
+	if !strings.Contains(out404, "HTTP 404") {
+		t.Fatalf("expected target HTTP 404 error, got: %s", out404)
+	}
+
+	// 3. Redirect on Firecrawl scrape endpoint blocked without forwarding Bearer key
+	outRedir := runWebToolApproved(t, reg, "web_fetch", map[string]any{"url": "https://example.com/redir"})
+	if !strings.Contains(outRedir, "redirects are disabled") || secondHostHit.Load() {
+		t.Fatalf("expected Firecrawl redirect block without contacting second host, got: %s", outRedir)
+	}
+	if strings.Contains(outRedir, "fc-no-leak-key") {
+		t.Fatal("Firecrawl API key leaked in redirect error")
+	}
+}
+
+func TestWebHTMLHardeningAndShortQueryRedaction(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/edge-html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, `<html><head><title>Unclosed Title
+		<body>
+		<p>Check 2 < 3 and a < b works.</p>
+		<svg><svg></svg>SVG_SECRET</svg>
+		<template><template></template>TEMPLATE_SECRET</template>
+		<iframe>IFRAME_SECRET</iframe>
+		<noembed>NOEMBED_SECRET</noembed>
+		<!-- comment --!><p>Visible after comment</p>
+		</body></html>`)
+	})
+	mux.HandleFunc("/bad-search-json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"web":{"results":[{"title":"Bad JS","url":"javascript:alert(1)","description":"bad link"},{"title":"Good","url":"https://go.dev","description":"ok"}]}}`)
+	})
+	mux.HandleFunc("/search-500", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `upstream google backend failed for q=go`)
+	})
+
+	_, hooks, _ := newTestTLSServer(t, mux)
+	reg, _ := newWebTestRegistry(t, map[string]string{
+		WebSearchProviderEnv: "brave",
+		WebBraveAPIKeyEnv:    "brave-short-query-key",
+	}, nil)
+	reg.webConfig.netHooks = hooks
+
+	// 1. HTML edge cases: "2 < 3", unclosed <title>, nested svg/template, iframe/noembed, --!> comment
+	outHTML := runWebToolApproved(t, reg, "web_fetch", map[string]any{"url": "https://example.com/edge-html"})
+	var parsed webFetchOutput
+	if err := json.Unmarshal([]byte(outHTML), &parsed); err != nil {
+		t.Fatalf("unmarshal HTML output: %v (%s)", err, outHTML)
+	}
+	if !strings.Contains(parsed.Content, "2 < 3 and a < b works.") || !strings.Contains(parsed.Content, "Visible after comment") {
+		t.Fatalf("HTML extraction lost text around '<' or unclosed title: %q", parsed.Content)
+	}
+	for _, hidden := range []string{"SVG_SECRET", "TEMPLATE_SECRET", "IFRAME_SECRET", "NOEMBED_SECRET"} {
+		if strings.Contains(outHTML, hidden) {
+			t.Fatalf("hidden element %q leaked into output: %s", hidden, outHTML)
+		}
+	}
+
+	// 2. Invalid search result URLs (javascript:) neutralized while preserving untrusted wrapper
+	reg.webConfig.Endpoint = "https://example.com/bad-search-json"
+	outSearch := runWebToolApproved(t, reg, "web_search", map[string]any{"query": "go"})
+	if strings.Contains(outSearch, "javascript:alert(1)") || !strings.Contains(outSearch, "[invalid-url]") {
+		t.Fatalf("expected invalid result URL to be neutralized, got: %s", outSearch)
+	}
+
+	// 3. Short query ("go") must NOT corrupt "google" in error messages, while redacting q=go
+	reg.webConfig.Endpoint = "https://example.com/search-500"
+	outErr := runWebToolApproved(t, reg, "web_search", map[string]any{"query": "go"})
+	if !strings.Contains(outErr, "google") || strings.Contains(outErr, "q=go") {
+		t.Fatalf("short query redaction corrupted error or failed to redact q=go: %s", outErr)
+	}
+
+	// 4. Trailing JSON tokens & control chars rejected
+	outTrailing := reg.Run(context.Background(), "web_search", json.RawMessage(`{"query":"ok"}{"extra":1}`))
+	if !strings.Contains(outTrailing, "Error:") {
+		t.Fatalf("expected trailing JSON error or approval refusal, got: %s", outTrailing)
+	}
+	outTrailingApproved := runWebToolApproved(t, reg, "web_search", map[string]any{"query": "bad\x1b[31mtext"})
+	if !strings.Contains(outTrailingApproved, "control characters") {
+		t.Fatalf("expected control char rejection, got: %s", outTrailingApproved)
 	}
 }

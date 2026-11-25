@@ -20,14 +20,15 @@ import (
 )
 
 const (
-	webRequestTimeout        = 15 * time.Second
-	maxFetchRedirects        = 3
-	maxFetchURLLen           = 2048
-	maxResponseHeadersBytes  = 64 << 10  // 64 KiB
-	maxCompressedBodyBytes   = 512 << 10 // 512 KiB pre-decompression read limit
-	maxDecompressedBodyBytes = 512 << 10 // 512 KiB post-decompression read limit
-	maxSearchResponseBytes   = 256 << 10 // 256 KiB JSON response limit for search providers
-	maxErrorBodyBytes        = 4096
+	webDirectTimeout          = 15 * time.Second
+	webFirecrawlScrapeTimeout = 25 * time.Second
+	maxFetchRedirects         = 3
+	maxFetchURLLen            = 2048
+	maxResponseHeadersBytes   = 64 << 10  // 64 KiB
+	maxCompressedBodyBytes    = 512 << 10 // 512 KiB pre-decompression read limit
+	maxDecompressedBodyBytes  = 512 << 10 // 512 KiB post-decompression read limit
+	maxSearchResponseBytes    = 256 << 10 // 256 KiB JSON response limit for search providers
+	maxErrorBodyBytes         = 4096
 )
 
 var (
@@ -68,21 +69,24 @@ var blockedIPPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),     // Reserved & Broadcast (255.255.255.255/32)
 
 	// IPv6 prohibited ranges
-	netip.MustParsePrefix("::/128"),         // Unspecified
-	netip.MustParsePrefix("::1/128"),        // Loopback
-	netip.MustParsePrefix("::/96"),          // Deprecated IPv4-compatible IPv6
-	netip.MustParsePrefix("::ffff:0:0/96"),  // IPv4-mapped IPv6
-	netip.MustParsePrefix("64:ff9b::/96"),   // NAT64 Well-Known Prefix
-	netip.MustParsePrefix("64:ff9b:1::/48"), // NAT64 Local-Use Prefix
-	netip.MustParsePrefix("100::/64"),       // Discard-Only
-	netip.MustParsePrefix("2001::/32"),      // Teredo
-	netip.MustParsePrefix("2001:2::/48"),    // Benchmarking
-	netip.MustParsePrefix("2001:db8::/32"),  // Documentation
-	netip.MustParsePrefix("2002::/16"),      // 6to4 (can embed private IPv4)
-	netip.MustParsePrefix("fc00::/7"),       // Unique Local Address (private)
-	netip.MustParsePrefix("fe80::/10"),      // Link-local
-	netip.MustParsePrefix("fec0::/10"),      // Deprecated site-local
-	netip.MustParsePrefix("ff00::/8"),       // Multicast
+	netip.MustParsePrefix("::/128"),          // Unspecified
+	netip.MustParsePrefix("::1/128"),         // Loopback
+	netip.MustParsePrefix("::/96"),           // Deprecated IPv4-compatible IPv6
+	netip.MustParsePrefix("::ffff:0:0/96"),   // IPv4-mapped IPv6
+	netip.MustParsePrefix("::ffff:0:0:0/96"), // RFC 2765 IPv4-translated
+	netip.MustParsePrefix("64:ff9b::/96"),    // NAT64 Well-Known Prefix
+	netip.MustParsePrefix("64:ff9b:1::/48"),  // NAT64 Local-Use Prefix
+	netip.MustParsePrefix("100::/64"),        // Discard-Only
+	netip.MustParsePrefix("2001::/32"),       // Teredo
+	netip.MustParsePrefix("2001:2::/48"),     // Benchmarking
+	netip.MustParsePrefix("2001:10::/28"),    // ORCHID (deprecated)
+	netip.MustParsePrefix("2001:20::/28"),    // ORCHIDv2
+	netip.MustParsePrefix("2001:db8::/32"),   // Documentation
+	netip.MustParsePrefix("2002::/16"),       // 6to4 (can embed private IPv4)
+	netip.MustParsePrefix("fc00::/7"),        // Unique Local Address (private)
+	netip.MustParsePrefix("fe80::/10"),       // Link-local
+	netip.MustParsePrefix("fec0::/10"),       // Deprecated site-local
+	netip.MustParsePrefix("ff00::/8"),        // Multicast
 }
 
 // validatePublicIP verifies that an IP address is a strictly public routable unicast IP.
@@ -316,9 +320,18 @@ func safeDialContext(ctx context.Context, network, addr string, resolver ipResol
 	return nil, lastErr
 }
 
-func buildHardenedTransport(hooks *webNetHooks) *http.Transport {
+func buildHardenedTransport(hooks *webNetHooks, timeout time.Duration) *http.Transport {
+	if timeout <= 0 {
+		timeout = webDirectTimeout
+	}
+	dialTimeout := min(10*time.Second, timeout)
+	respHdrTimeout := timeout - 3*time.Second
+	if respHdrTimeout < 1*time.Second {
+		respHdrTimeout = timeout
+	}
+
 	var resolver ipResolver = net.DefaultResolver
-	var rawDial webDialFunc = (&net.Dialer{Timeout: webRequestTimeout}).DialContext
+	var rawDial webDialFunc = (&net.Dialer{Timeout: dialTimeout}).DialContext
 	var rootCAs *x509.CertPool
 	if hooks != nil {
 		if hooks.resolver != nil {
@@ -343,9 +356,11 @@ func buildHardenedTransport(hooks *webNetHooks) *http.Transport {
 		Proxy:                  nil,
 		DisableKeepAlives:      true,
 		DisableCompression:     true,
+		MaxIdleConns:           0,
+		MaxConnsPerHost:        2,
 		MaxResponseHeaderBytes: maxResponseHeadersBytes,
-		TLSHandshakeTimeout:    10 * time.Second,
-		ResponseHeaderTimeout:  12 * time.Second,
+		TLSHandshakeTimeout:    dialTimeout,
+		ResponseHeaderTimeout:  respHdrTimeout,
 		TLSClientConfig:        tlsCfg,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return safeDialContext(ctx, network, addr, resolver, rawDial)
@@ -353,20 +368,26 @@ func buildHardenedTransport(hooks *webNetHooks) *http.Transport {
 	}
 }
 
-func createSearchHTTPClient(hooks *webNetHooks) *http.Client {
+func createSearchHTTPClient(hooks *webNetHooks, timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = webDirectTimeout
+	}
 	return &http.Client{
-		Timeout:   webRequestTimeout,
-		Transport: buildHardenedTransport(hooks),
+		Timeout:   timeout,
+		Transport: buildHardenedTransport(hooks, timeout),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return errSearchRedirectBlocked
 		},
 	}
 }
 
-func createFetchHTTPClient(hooks *webNetHooks) *http.Client {
+func createFetchHTTPClient(hooks *webNetHooks, timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = webDirectTimeout
+	}
 	return &http.Client{
-		Timeout:   webRequestTimeout,
-		Transport: buildHardenedTransport(hooks),
+		Timeout:   timeout,
+		Transport: buildHardenedTransport(hooks, timeout),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) > maxFetchRedirects {
 				return fmt.Errorf("stopped after %d redirects", maxFetchRedirects)
@@ -374,12 +395,13 @@ func createFetchHTTPClient(hooks *webNetHooks) *http.Client {
 			if _, err := validateExternalURL(req.URL.String()); err != nil {
 				return fmt.Errorf("redirect blocked: %w", err)
 			}
-			// Prevent credential leakage across any redirect hops
+			// Prevent credential and referrer leakage across any redirect hops
 			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
 			req.Header.Del("Proxy-Authorization")
 			req.Header.Del("X-Subscription-Token")
 			req.Header.Del("X-Api-Key")
+			req.Header.Del("Referer")
 			return nil
 		},
 	}
@@ -462,6 +484,40 @@ func sanitizeNetworkError(err error, secrets ...string) error {
 	return errors.New(redactSecrets(err.Error(), secrets...))
 }
 
+// sanitizeSearchError strips URL query strings, secret keys, and sensitive
+// queries from search errors without corrupting messages on short queries.
+func sanitizeSearchError(err error, secretKey, sensitiveQuery string) error {
+	if err == nil {
+		return nil
+	}
+	clean := sanitizeNetworkError(err, secretKey)
+	return errors.New(redactSensitiveQuery(clean.Error(), sensitiveQuery))
+}
+
+func redactSensitiveQuery(msg, query string) string {
+	if query == "" {
+		return msg
+	}
+	escaped := url.QueryEscape(query)
+	pathEsc := url.PathEscape(query)
+	if len(query) >= 6 {
+		msg = strings.ReplaceAll(msg, query, "[REDACTED]")
+		msg = strings.ReplaceAll(msg, escaped, "[REDACTED]")
+		msg = strings.ReplaceAll(msg, pathEsc, "[REDACTED]")
+		return msg
+	}
+	// For short queries (< 6 bytes), avoid blind substring replacement that would
+	// corrupt normal words (e.g., query="go" breaking "google" or "got").
+	for _, key := range []string{"q=", "query="} {
+		for _, val := range []string{escaped, pathEsc, query} {
+			if val != "" {
+				msg = strings.ReplaceAll(msg, key+val, key+"[REDACTED]")
+			}
+		}
+	}
+	return msg
+}
+
 func redactSecrets(msg string, secrets ...string) string {
 	for _, s := range secrets {
 		if s == "" {
@@ -469,6 +525,7 @@ func redactSecrets(msg string, secrets ...string) string {
 		}
 		msg = strings.ReplaceAll(msg, s, "[REDACTED]")
 		msg = strings.ReplaceAll(msg, url.QueryEscape(s), "[REDACTED]")
+		msg = strings.ReplaceAll(msg, url.PathEscape(s), "[REDACTED]")
 	}
 	return msg
 }
