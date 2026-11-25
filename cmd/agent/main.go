@@ -108,6 +108,7 @@ type uiModel struct {
 	searchEnabled     bool
 	autoApprove       AutoApproveMode
 	clipboardFn       func(ctx context.Context, text string, target copyTarget) (clipboardResult, error)
+	keySource         string
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -223,6 +224,7 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 		client:        client,
 		registry:      reg,
 		autoApprove:   mode,
+		keySource:     keyStatus,
 		status:        "Ready",
 		baseHeight:    20,
 	}
@@ -1165,6 +1167,18 @@ func (m *uiModel) handleCompactCommand() (tea.Model, tea.Cmd) {
 	return *m, nil
 }
 
+func (m *uiModel) setKeySource(source string) {
+	if source == "" {
+		source = "none"
+	}
+	m.keySource = source
+	endpointHost := m.destination
+	if u, err := url.Parse(m.destination); err == nil && u.Host != "" {
+		endpointHost = u.Host
+	}
+	m.statusBar = fmt.Sprintf("provider=%s model=%s endpoint=%s key=%s", m.provider, m.modelName, endpointHost, m.keySource)
+}
+
 func (m *uiModel) formatStatus() string {
 	tokens := estimateMessages(m.messages)
 	budget := m.historyBudget
@@ -1181,6 +1195,11 @@ func (m *uiModel) formatStatus() string {
 	}
 	fmt.Fprintf(&b, "Model: %s\n", m.modelName)
 	fmt.Fprintf(&b, "Destination: %s\n", m.destination)
+	keyDiag := m.keySource
+	if keyDiag == "" {
+		keyDiag = "none"
+	}
+	fmt.Fprintf(&b, "API Key: %s\n", keyDiag)
 	sandboxStr := "Disabled"
 	if m.sandboxProven {
 		sandboxStr = "Proven (active execution restrictions)"
@@ -1260,6 +1279,10 @@ func disableUnsandboxedTools(reg *tools.Registry) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		os.Exit(RunSetup(os.Stdin, os.Stdout, os.Stderr, defaultConfigDir(), os.Args[2:]))
+	}
+
 	if err := ensureInteractive(os.Stdin); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -1292,13 +1315,14 @@ func main() {
 	if err := reg.EnableExecution(context.Background()); err != nil {
 		disableUnsandboxedTools(reg)
 	}
-	cfg, err := llm.ConfigFromEnv()
+	cfg, keySource, err := LoadEffectiveConfig(defaultConfigDir())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
 		os.Exit(2)
 	}
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "Config validation error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Tip: run 'nabd-agent setup' to configure your provider and API key securely.\n")
 		os.Exit(2)
 	}
 	client, err := llm.NewClient(cfg)
@@ -1317,6 +1341,7 @@ func main() {
 		}
 	}
 	model := initialModel(reg, client, autoMode)
+	model.setKeySource(keySource)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	_, runErr := p.Run()
 	model.lifecycle.stop()
