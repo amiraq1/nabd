@@ -1008,9 +1008,9 @@ func (r *Registry) registerDefaults() {
 func (r *Registry) registerEditTool() {
 	r.handlers["edit_file"] = ToolSpec{
 		Name:        "edit_file",
-		Description: "Replace an exact block of text in a file. Validates Go syntax before saving without reformatting unrelated bytes.",
+		Description: "Replace an exact block of text in a file. Validates Go syntax before saving without reformatting unrelated bytes. Keep edits under 4000 bytes (the approval limit). Provide 2-4 lines of unique surrounding context in old_text to avoid ambiguous matches. For large changes, apply multiple smaller syntax-valid edits.",
 		ReadOnly:    false,
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"old_text":{"type":"string","description":"Exact existing block to replace"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path within workspace"},"old_text":{"type":"string","description":"Exact existing block to replace, including 2-4 lines of surrounding context for uniqueness"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			return r.withProcessLock(func() (string, error) { return r.executeEdit(ctx, args) })
 		},
@@ -1118,7 +1118,7 @@ func (r *Registry) registerOtherTools() {
 
 	r.handlers["read_file"] = ToolSpec{
 		Name:        "read_file",
-		Description: "Read a bounded UTF-8-safe byte range inside the workspace; follow the continuation offset when truncated.",
+		Description: "Read a bounded UTF-8-safe byte range inside the workspace. Each page is capped at 3584 bytes. Use format: \"json\" to receive structured pagination (content, truncated flag, and next_offset). When truncated is true, issue another read_file call with offset set to next_offset to read the remainder.",
 		ReadOnly:    true,
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"offset":{"type":"integer","minimum":0,"description":"Zero-based byte offset, default 0"},"limit":{"type":"integer","minimum":1,"maximum":3584,"description":"Maximum input bytes per page, default 3584; a first UTF-8 rune may extend this by up to 3 bytes"},"format":{"type":"string","enum":["text","json"],"description":"text by default; json returns content, truncated, and next_offset"}},"required":["path"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
@@ -1148,7 +1148,7 @@ func (r *Registry) registerOtherTools() {
 
 	r.handlers["list_dir"] = ToolSpec{
 		Name:        "list_dir",
-		Description: "List directory contents inside the workspace.",
+		Description: "List directory contents inside the workspace. Displays up to 1000 entries and scans up to 4096 directory entries. Returns F for files and D for directories.",
 		ReadOnly:    true,
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative directory path (default .)"}}}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
