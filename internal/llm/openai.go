@@ -6,23 +6,29 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
 
+var ErrUnauthorized = errors.New("المفتاح مرفوض من المزوّد")
+
 const (
-	maxAttempts      = 4
-	maxRetryAfter    = 30 * time.Second
-	maxResponseBytes = 4 << 20
-	maxToolCalls     = 64
+	maxAttempts        = 4
+	maxRetryAfter      = 30 * time.Second
+	maxResponseBytes   = 4 << 20
+	maxToolCalls       = 64
+	maxErrorScrubBytes = 64 << 10
 )
 
 // OpenAIClient talks to an OpenAI-compatible /chat/completions endpoint.
@@ -40,17 +46,15 @@ func NewOpenAIClient(cfg Config) *OpenAIClient {
 	if cfg.Model == "" {
 		cfg.Model = DefaultModel
 	}
-	if cfg.APIKey == "" {
-		cfg.APIKey = "sk-no-key"
-	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultTimeout
 	}
 	if cfg.MaxTokens <= 0 {
 		cfg.MaxTokens = DefaultMaxTokens
 	}
-	if cfg.Temperature == 0 {
-		cfg.Temperature = DefaultTemperature
+	if cfg.Temperature == nil {
+		t := DefaultTemperature
+		cfg.Temperature = &t
 	}
 	return &OpenAIClient{
 		cfg:         cfg,
@@ -62,6 +66,12 @@ func NewOpenAIClient(cfg Config) *OpenAIClient {
 
 // BaseURL identifies the model endpoint for disclosure prompts.
 func (c *OpenAIClient) BaseURL() string { return c.cfg.BaseURL }
+
+// Model identifies the configured model name.
+func (c *OpenAIClient) Model() string { return c.cfg.Model }
+
+// HasKey reports whether an API key is configured.
+func (c *OpenAIClient) HasKey() bool { return c.cfg.APIKey != "" }
 
 func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
@@ -131,7 +141,7 @@ func (c *OpenAIClient) encode(req Request) ([]byte, error) {
 	payload := map[string]any{
 		"model":       c.cfg.Model,
 		"messages":    req.Messages,
-		"temperature": c.cfg.Temperature,
+		"temperature": c.cfg.GetTemperature(),
 		"max_tokens":  c.cfg.MaxTokens,
 	}
 	if len(req.Tools) > 0 {
@@ -150,7 +160,9 @@ func (c *OpenAIClient) attempt(ctx context.Context, endpoint string, body []byte
 		return nil, false, 0, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	if c.cfg.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey.SecretValue())
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -169,9 +181,23 @@ func (c *OpenAIClient) attempt(ctx context.Context, endpoint string, body []byte
 		return nil, false, 0, fmt.Errorf("response too large: exceeds %d bytes", maxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
+		errBytes := data
+		if len(errBytes) > maxErrorScrubBytes {
+			errBytes = errBytes[:maxErrorScrubBytes]
+		}
+		rawBody := string(errBytes)
+		if c.cfg.APIKey != "" {
+			rawBody = redactSecret(rawBody, c.cfg.APIKey.SecretValue())
+		}
+		clipped := clipText(rawBody, 300)
+
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return nil, false, 0, fmt.Errorf("%w (status %d): %s", ErrUnauthorized, resp.StatusCode, clipped)
+		}
+
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		delay := parseRetryAfter(resp.Header.Get("Retry-After"))
-		return nil, retryable, delay, fmt.Errorf("status %d: %s", resp.StatusCode, clipText(string(data), 300))
+		return nil, retryable, delay, fmt.Errorf("status %d: %s", resp.StatusCode, clipped)
 	}
 
 	parsed, err := parseResponse(data)
@@ -179,6 +205,163 @@ func (c *OpenAIClient) attempt(ctx context.Context, endpoint string, body []byte
 		return nil, false, 0, err
 	}
 	return parsed, false, 0, nil
+}
+
+// CheckModel verifies that cfg.Model is present in GET {base}/models.
+// If the provider returns 404, it prints a warning to stderr and skips without failure.
+func (c *OpenAIClient) CheckModel(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	endpoint := strings.TrimRight(c.cfg.BaseURL, "/") + "/models"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("create check model request: %w", err)
+	}
+	if c.cfg.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey.SecretValue())
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("model check request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		fmt.Fprintf(os.Stderr, "Warning: model check endpoint %s returned 404; skipping check\n", endpoint)
+		return nil
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return fmt.Errorf("model check redirected with status %d (redirects are not allowed)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("model check returned status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("read model check response: %w", err)
+	}
+	if len(data) > maxResponseBytes {
+		return fmt.Errorf("model check response too large: exceeds %d bytes", maxResponseBytes)
+	}
+
+	var modelsResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &modelsResp); err != nil {
+		return fmt.Errorf("decode models response: %w", err)
+	}
+
+	var names []string
+	for _, item := range modelsResp.Data {
+		id := strings.TrimSpace(item.ID)
+		if id != "" {
+			if id == c.cfg.Model {
+				return nil
+			}
+			names = append(names, id)
+		}
+	}
+
+	suggestions := closestNames(c.cfg.Model, names, 3)
+	if len(suggestions) > 0 {
+		return fmt.Errorf("model %q not found; did you mean: %s?", c.cfg.Model, strings.Join(suggestions, ", "))
+	}
+	return fmt.Errorf("model %q not found on provider", c.cfg.Model)
+}
+
+// CheckModel is a convenience function that verifies the model using a temporary client.
+func CheckModel(ctx context.Context, cfg Config) error {
+	return NewOpenAIClient(cfg).CheckModel(ctx)
+}
+
+func closestNames(target string, candidates []string, maxN int) []string {
+	if len(candidates) == 0 || maxN <= 0 {
+		return nil
+	}
+	type item struct {
+		name string
+		dist int
+	}
+	items := make([]item, len(candidates))
+	for i, c := range candidates {
+		items[i] = item{name: c, dist: levenshtein(target, c)}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].dist != items[j].dist {
+			return items[i].dist < items[j].dist
+		}
+		return items[i].name < items[j].name
+	})
+	n := maxN
+	if len(items) < n {
+		n = len(items)
+	}
+	res := make([]string, n)
+	for i := 0; i < n; i++ {
+		res[i] = items[i].name
+	}
+	return res
+}
+
+func levenshtein(a, b string) int {
+	d := make([][]int, len(a)+1)
+	for i := range d {
+		d[i] = make([]int, len(b)+1)
+		d[i][0] = i
+	}
+	for j := 0; j <= len(b); j++ {
+		d[0][j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			d[i][j] = min(d[i-1][j]+1, min(d[i][j-1]+1, d[i-1][j-1]+cost))
+		}
+	}
+	return d[len(a)][len(b)]
+}
+
+func redactSecret(text, secret string) string {
+	if secret == "" || text == "" {
+		return text
+	}
+	text = strings.ReplaceAll(text, secret, "[REDACTED]")
+	if len(secret) < 8 || len(text) < 8 {
+		return text
+	}
+
+	eightGrams := make(map[string]struct{}, len(secret)-7)
+	for i := 0; i <= len(secret)-8; i++ {
+		eightGrams[secret[i:i+8]] = struct{}{}
+	}
+
+	var b strings.Builder
+	b.Grow(len(text))
+	i := 0
+	for i < len(text) {
+		if i+8 <= len(text) {
+			if _, ok := eightGrams[text[i:i+8]]; ok {
+				j := i + 8
+				for j < len(text) && strings.Contains(secret, text[i:j+1]) {
+					j++
+				}
+				b.WriteString("[REDACTED]")
+				i = j
+				continue
+			}
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
 }
 
 func parseResponse(data []byte) (*Response, error) {
