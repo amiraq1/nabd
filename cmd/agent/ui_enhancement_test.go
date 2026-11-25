@@ -956,8 +956,9 @@ func TestSlashPaletteNavigationWrappingAndHistory(t *testing.T) {
 	m.palette.updatePalette("/", false, false, false)
 	m.adjustViewportHeight()
 
-	if !m.palette.open || len(m.palette.filtered) != 4 {
-		t.Fatalf("expected open palette with 4 items, got open=%v, len=%d", m.palette.open, len(m.palette.filtered))
+	n := len(slashCommands)
+	if !m.palette.open || len(m.palette.filtered) != n {
+		t.Fatalf("expected open palette with %d items, got open=%v, len=%d", n, m.palette.open, len(m.palette.filtered))
 	}
 
 	initialHistoryLen := len(m.history)
@@ -967,37 +968,27 @@ func TestSlashPaletteNavigationWrappingAndHistory(t *testing.T) {
 		t.Fatalf("expected initial selectedIndex 0, got %d", m.palette.selectedIndex)
 	}
 
-	// Navigate Down: 0 -> 1 -> 2 -> 3 -> 0 (wrap)
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = updated.(uiModel)
-	if m.palette.selectedIndex != 1 {
-		t.Fatalf("expected selectedIndex 1 after Down, got %d", m.palette.selectedIndex)
-	}
-
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = updated.(uiModel)
-	if m.palette.selectedIndex != 2 {
-		t.Fatalf("expected selectedIndex 2 after Down, got %d", m.palette.selectedIndex)
-	}
-
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = updated.(uiModel)
-	if m.palette.selectedIndex != 3 {
-		t.Fatalf("expected selectedIndex 3 after Down, got %d", m.palette.selectedIndex)
+	// Navigate Down from 0 to n-1
+	for i := 1; i < n; i++ {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(uiModel)
+		if m.palette.selectedIndex != i {
+			t.Fatalf("expected selectedIndex %d after Down, got %d", i, m.palette.selectedIndex)
+		}
 	}
 
 	// Down from last wraps to 0
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
 	m = updated.(uiModel)
 	if m.palette.selectedIndex != 0 {
 		t.Fatalf("expected selectedIndex 0 after wrapping Down, got %d", m.palette.selectedIndex)
 	}
 
-	// Up from 0 wraps to 3
+	// Up from 0 wraps to n-1
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
 	m = updated.(uiModel)
-	if m.palette.selectedIndex != 3 {
-		t.Fatalf("expected selectedIndex 3 after wrapping Up, got %d", m.palette.selectedIndex)
+	if m.palette.selectedIndex != n-1 {
+		t.Fatalf("expected selectedIndex %d after wrapping Up, got %d", n-1, m.palette.selectedIndex)
 	}
 
 	// Verify history was not touched at all during navigation

@@ -23,6 +23,10 @@ var slashCommands = []slashCommand{
 		Description: "List registered tools and approval requirements",
 	},
 	{
+		Name:        "auto",
+		Description: "View or set auto-approval mode (/auto off|readonly|all)",
+	},
+	{
 		Name:        "clear",
 		Description: "Clear conversation history (keeps the active system prompt)",
 	},

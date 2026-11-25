@@ -54,10 +54,12 @@ func init() {
 // Lipgloss styles for quiet minimal agent UI.
 var (
 	// Header styles (quiet hairline header)
-	headerIdentityStyle = lipgloss.NewStyle().Foreground(colorAccent)
-	headerTitleStyle    = lipgloss.NewStyle().Foreground(colorFg).Bold(true)
-	headerMutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
-	headerDividerStyle  = lipgloss.NewStyle().Foreground(colorSubtle)
+	headerIdentityStyle     = lipgloss.NewStyle().Foreground(colorAccent)
+	headerTitleStyle        = lipgloss.NewStyle().Foreground(colorFg).Bold(true)
+	headerMutedStyle        = lipgloss.NewStyle().Foreground(colorMuted)
+	headerDividerStyle      = lipgloss.NewStyle().Foreground(colorSubtle)
+	headerAutoReadOnlyStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	headerAutoAllStyle      = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
 
 	// Stream styles (borderless, quiet)
 	userPrefixStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
