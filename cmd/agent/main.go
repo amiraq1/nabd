@@ -68,16 +68,6 @@ OUTPUT FORMAT
 - Reply in Arabic; keep tool names, file paths, symbols, addresses, and ` + "`evidence_id`" + ` values in English.
 - Structure every reverse-engineering answer into four concise parts: (1) السؤال، (2) النتائج (مع ` + "`evidence_id`" + ` وتصنيف واضح: **ملاحظة** أم **استنتاج**)، (3) القيود وغير المؤكّد (` + "`limitations`" + ` / ` + "`unknowns`" + `)، و(4) الخطوة التالية المفيدة.`
 
-var (
-	userStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
-	assistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	toolStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Italic(true)
-	approvalStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	statusStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	helpStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-)
-
 type Message = llm.Message
 type ToolCall = llm.ToolCall
 
@@ -91,6 +81,7 @@ type uiModel struct {
 	historyDraft      string
 	expandLastTool    bool
 	modelName         string
+	workspace         string
 	sandboxProven     bool
 	messages          []Message
 	pendingTools      []ToolCall
@@ -109,6 +100,8 @@ type uiModel struct {
 	status            string
 	statusBar         string
 	busy              bool
+	palette           slashPalette
+	baseHeight        int
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -130,17 +123,31 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 	ta.Focus()
 	ta.ShowLineNumbers = false
 	ta.SetHeight(1)
-	ta.Prompt = "❯ "
-	ta.SetWidth(80)
+	ta.Prompt = symPrompt + " "
+	ta.SetWidth(76)
+	ta.FocusedStyle.Prompt = lipgloss.NewStyle().Foreground(colorAccent)
+	ta.BlurredStyle.Prompt = lipgloss.NewStyle().Foreground(colorAccent)
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colorMuted)
+	ta.BlurredStyle.Placeholder = lipgloss.NewStyle().Foreground(colorMuted)
+	ta.FocusedStyle.Text = lipgloss.NewStyle().Foreground(colorFg)
+	ta.BlurredStyle.Text = lipgloss.NewStyle().Foreground(colorFg)
+	ta.FocusedStyle.Base = lipgloss.NewStyle()
+	ta.BlurredStyle.Base = lipgloss.NewStyle()
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	sp.Style = lipgloss.NewStyle().Foreground(colorAccent)
 
 	vp := viewport.New(80, 20)
 	vp.SetContent("NabdCoder ready — secure tools + Termux memory limits\n")
 
 	sysPrompt := buildSystemPrompt(reg)
+
+	workspace := "."
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		workspace = cwd
+	}
 
 	destination := "unknown model endpoint"
 	modelName := "unknown"
@@ -171,6 +178,7 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 		destination:   destination,
 		statusBar:     statusBar,
 		modelName:     modelName,
+		workspace:     workspace,
 		sandboxProven: sandboxProven,
 		lifecycle:     newLifecycle(),
 		textInput:     ti,
@@ -186,6 +194,7 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 		client:        client,
 		registry:      reg,
 		status:        "Ready",
+		baseHeight:    20,
 	}
 }
 
@@ -311,6 +320,42 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.palette.open {
+			switch msg.Type {
+			case tea.KeyUp:
+				m.palette.navigateUp()
+				return m, nil
+			case tea.KeyDown:
+				m.palette.navigateDown()
+				return m, nil
+			case tea.KeyTab:
+				cmd := m.palette.selectedCommand()
+				if cmd != nil {
+					completed := "/" + cmd.Name
+					m.textArea.SetValue(completed)
+					m.textArea.CursorEnd()
+					m.palette.updatePalette(completed, m.busy, m.awaitingApproval, m.pendingDisclosure != nil)
+					m.adjustViewportHeight()
+				}
+				return m, nil
+			case tea.KeyEsc:
+				m.palette.open = false
+				m.palette.dismissedInput = m.getInputValue()
+				m.adjustViewportHeight()
+				return m, nil
+			case tea.KeyEnter:
+				if !msg.Alt {
+					cmd := m.palette.selectedCommand()
+					if cmd != nil {
+						m.palette.open = false
+						m.palette.dismissedInput = ""
+						m.adjustViewportHeight()
+						return m.executeLocalCommand("/" + cmd.Name)
+					}
+				}
+			}
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.lifecycle.stop()
@@ -379,68 +424,14 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			m.history = append(m.history, input)
-			m.historyIdx = len(m.history)
-			m.historyDraft = ""
-
-			if input == "exit" || input == "quit" {
-				m.lifecycle.stop()
-				return m, tea.Quit
-			}
-			if input == "clear" || input == "/clear" {
-				m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
-				m.pendingTools = nil
-				m.awaitingApproval = false
-				m.approval = approvalPreview{}
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-			if input == "undo" || strings.HasPrefix(input, "undo ") {
-				target := strings.TrimSpace(strings.TrimPrefix(input, "undo"))
-				result, err := m.registry.Undo(target)
-				m.clearInput()
-				if err != nil {
-					m.messages = append(m.messages, Message{Role: "local", Content: "undo: " + err.Error()})
-				} else {
-					m.messages = append(m.messages, Message{Role: "local", Content: result})
-				}
-				m.refresh()
-				return m, nil
-			}
-			if input == "/status" || input == "status" {
-				m.messages = append(m.messages, Message{Role: "local", Content: m.formatStatus()})
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-			if input == "/tools" || input == "tools" {
-				m.messages = append(m.messages, Message{Role: "local", Content: m.formatTools()})
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-			if input == "/help" || input == "help" {
-				m.messages = append(m.messages, Message{Role: "local", Content: formatHelp()})
-				m.clearInput()
-				m.refresh()
-				return m, nil
-			}
-
-			m.messages = append(m.messages, Message{Role: "user", Content: input})
-			m.clearInput()
-			m.busy = true
-			m.iteration = 0
-			m.callCounts = make(map[string]int)
-			m.status = "Thinking..."
-			m.refresh()
-			return m.startLLM()
+			return m.executeLocalCommand(input)
 		}
 	case tea.WindowSizeMsg:
 		m.viewport.Width = max(20, msg.Width)
-		m.viewport.Height = max(1, msg.Height-7)
-		m.textInput.Width = max(20, msg.Width-4)
-		m.textArea.SetWidth(max(20, msg.Width-4))
+		m.baseHeight = max(1, msg.Height-8)
+		m.textInput.Width = max(10, msg.Width-4)
+		m.textArea.SetWidth(max(10, msg.Width-4))
+		m.adjustViewportHeight()
 		m.refresh()
 	case llmResponseMsg:
 		m.finishRequest()
@@ -519,6 +510,11 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.textArea, cmd = m.textArea.Update(msg)
 	m.textInput, _ = m.textInput.Update(msg)
 	m.viewport, _ = m.viewport.Update(msg)
+	wasOpen := m.palette.open
+	m.palette.updatePalette(m.getInputValue(), m.busy, m.awaitingApproval, m.pendingDisclosure != nil)
+	if m.palette.open || wasOpen != m.palette.open {
+		m.adjustViewportHeight()
+	}
 	return m, cmd
 }
 
@@ -572,25 +568,33 @@ func (m uiModel) View() string {
 	var b strings.Builder
 	b.WriteString(renderHeader(&m, m.viewport.Width) + "\n")
 	b.WriteString(m.viewport.View() + "\n")
-	b.WriteString(helpStyle.Render("────────────────────────────────") + "\n")
 	if m.pendingDisclosure != nil {
 		if warnings := advisorySecretWarnings(m.pendingDisclosure.Content); len(warnings) > 0 {
-			alert := advisoryAlertBoxStyle.Render("⚠️  ADVISORY WARNING: Potential credentials detected in tool output!\n" + strings.Join(warnings, "\n"))
+			warnWidth := max(10, m.viewport.Width-2)
+			alert := advisoryAlertBoxStyle.Width(warnWidth).Render("⚠️  ADVISORY WARNING: Potential credentials detected in tool output!\n" + strings.Join(warnings, "\n"))
 			b.WriteString(alert + "\n")
 		}
-		b.WriteString(approvalStyle.Render("Send the displayed tool output to the model? [Y/N]") + "\n")
+		prompt := approvalPromptStyle.Render("Send the displayed tool output to the model? [Y/N]")
+		b.WriteString(wrapIndented("", "", prompt, m.viewport.Width) + "\n")
 	} else if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
-		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", sanitizeForDisplay(tc.Function.Name))) + "\n")
+		prompt := approvalPromptStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", sanitizeForDisplay(tc.Function.Name)))
+		b.WriteString(wrapIndented("", "", prompt, m.viewport.Width) + "\n")
 		if m.approval.Summary != "" {
 			b.WriteString(renderApprovalSummary(m.approval.Summary, m.viewport.Width) + "\n")
 		}
 	} else {
+		var inputView string
 		if m.textArea.Value() != "" || m.textInput.Value() == "" {
-			b.WriteString(m.textArea.View() + "\n")
+			inputView = m.textArea.View()
 		} else {
-			b.WriteString(m.textInput.View() + "\n")
+			inputView = m.textInput.View()
 		}
+		boxWidth := max(10, m.viewport.Width-2)
+		if m.palette.open {
+			b.WriteString(renderSlashPalette(&m.palette, m.viewport.Width, m.maxPaletteRows()) + "\n")
+		}
+		b.WriteString(composerBoxStyle.Width(boxWidth).Render(inputView) + "\n")
 	}
 	b.WriteString(renderFooter(&m, m.viewport.Width))
 	return b.String()
@@ -796,6 +800,95 @@ func (m *uiModel) clearInput() {
 	m.textArea.Reset()
 	m.textArea.SetHeight(1)
 	m.textInput.SetValue("")
+	m.palette.open = false
+	m.palette.filtered = nil
+	m.palette.selectedIndex = 0
+	m.palette.dismissedInput = ""
+	m.adjustViewportHeight()
+}
+
+func (m *uiModel) maxPaletteRows() int {
+	if m.baseHeight+8 < 20 {
+		return 3
+	}
+	return 5
+}
+
+func (m *uiModel) adjustViewportHeight() {
+	if m.baseHeight <= 0 {
+		m.baseHeight = max(1, m.viewport.Height)
+	}
+	if !m.palette.open || len(m.palette.filtered) == 0 {
+		m.viewport.Height = max(1, m.baseHeight)
+		return
+	}
+	maxRows := m.maxPaletteRows()
+	paletteHeight := min(len(m.palette.filtered), maxRows) + 3
+	m.viewport.Height = max(1, m.baseHeight-paletteHeight)
+}
+
+func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return m, nil
+	}
+
+	m.history = append(m.history, input)
+	m.historyIdx = len(m.history)
+	m.historyDraft = ""
+
+	if input == "exit" || input == "quit" {
+		m.lifecycle.stop()
+		return m, tea.Quit
+	}
+	if input == "clear" || input == "/clear" {
+		m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
+		m.pendingTools = nil
+		m.awaitingApproval = false
+		m.approval = approvalPreview{}
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+	if input == "undo" || strings.HasPrefix(input, "undo ") {
+		target := strings.TrimSpace(strings.TrimPrefix(input, "undo"))
+		result, err := m.registry.Undo(target)
+		m.clearInput()
+		if err != nil {
+			m.messages = append(m.messages, Message{Role: "local", Content: "undo: " + err.Error()})
+		} else {
+			m.messages = append(m.messages, Message{Role: "local", Content: result})
+		}
+		m.refresh()
+		return m, nil
+	}
+	if input == "/status" || input == "status" {
+		m.messages = append(m.messages, Message{Role: "local", Content: m.formatStatus()})
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+	if input == "/tools" || input == "tools" {
+		m.messages = append(m.messages, Message{Role: "local", Content: m.formatTools()})
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+	if input == "/help" || input == "help" {
+		m.messages = append(m.messages, Message{Role: "local", Content: formatHelp()})
+		m.clearInput()
+		m.refresh()
+		return m, nil
+	}
+
+	m.messages = append(m.messages, Message{Role: "user", Content: input})
+	m.clearInput()
+	m.busy = true
+	m.iteration = 0
+	m.callCounts = make(map[string]int)
+	m.status = "Thinking..."
+	m.refresh()
+	return m.startLLM()
 }
 
 func (m *uiModel) formatStatus() string {
@@ -861,25 +954,6 @@ func (m *uiModel) formatTools() string {
 		b.WriteString("\n\n• REA Reverse Engineering tools are active via mcp_call(command: \"rea\", tool: \"<name>\")")
 	}
 	return b.String()
-}
-
-func formatHelp() string {
-	return `=== NabdCoder Help ===
-Commands:
-  /status, status - View agent status, model info, and context metrics
-  /tools, tools   - List registered tools and approval requirements
-  /help, help     - Show this guide
-  /clear, clear   - Clear conversation history
-  undo [path]     - Restore file from shadow backup
-  exit, quit      - Exit NabdCoder
-
-Keybindings:
-  Enter           - Send prompt to model
-  Alt+Enter/Ctrl+J- Insert newline in multi-line prompt
-  Up / Down       - Navigate prompt history (at line 0)
-  Esc             - Cancel active request (or reject approval/disclosure)
-  Ctrl+O          - Toggle last tool output full view / summary
-  Ctrl+C          - Force quit`
 }
 
 func max(a, b int) int {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/amiraq1/nabd/internal/tools"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestTermuxNarrowLayout(t *testing.T) {
@@ -586,5 +588,673 @@ func TestSystemPromptConditionalREA(t *testing.T) {
 	}
 	if mDefCleared.messages[0].Content != baseSystemPrompt {
 		t.Fatalf("expected clear on default model to retain baseSystemPrompt alone, got:\n%s", mDefCleared.messages[0].Content)
+	}
+}
+
+func TestTerminalWidthCompliance(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.workspace = "my-long-workspace-path/nabd"
+	m.modelName = "claude-3-5-sonnet-20241022"
+
+	widths := []int{36, 40, 45, 60, 80, 120}
+
+	testMessages := []Message{
+		{Role: "user", Content: "This is a long user prompt that should wrap cleanly without overflowing terminal width."},
+		{Role: "assistant", Content: "# Header 1\nSome analysis paragraph.\n- Item A\n- Item B\n```go\nfunc Code() {}\n```"},
+		{Role: "tool", ToolCallID: "c1", Content: "file content lines\nmore lines", Display: "read_file(internal/tools/registry.go) -> 1200 bytes"},
+		{Role: "error", Content: "This is a critical error message that should wrap nicely and show the danger prefix."},
+		{Role: "local", Content: "=== NabdCoder Status ===\nModel: claude-3-5-sonnet\nIteration: 1 / 10"},
+	}
+
+	for _, w := range widths {
+		t.Run(fmt.Sprintf("width_%d", w), func(t *testing.T) {
+			m.viewport.Width = w
+			m.viewport.Height = 20
+			m.textArea.SetWidth(max(10, w-4))
+
+			// 1. Header lines
+			header := renderHeader(&m, w)
+			for i, line := range strings.Split(header, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("header line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+
+			// 2. Footer lines in various states
+			// Normal state
+			footerNormal := renderFooter(&m, w)
+			for i, line := range strings.Split(footerNormal, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("footer (normal) line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+
+			// Busy state
+			m.busy = true
+			m.status = "Thinking..."
+			footerBusy := renderFooter(&m, w)
+			for i, line := range strings.Split(footerBusy, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("footer (busy) line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+			m.busy = false
+
+			// Awaiting approval state
+			m.awaitingApproval = true
+			footerApproval := renderFooter(&m, w)
+			for i, line := range strings.Split(footerApproval, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("footer (approval) line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+			m.awaitingApproval = false
+
+			// 3. Messages
+			for _, msg := range testMessages {
+				rendered := renderMessageCard(msg, w, false, false)
+				for i, line := range strings.Split(rendered, "\n") {
+					lw := lipgloss.Width(line)
+					if lw > w {
+						t.Errorf("message (%s) line %d exceeds width %d (got %d): %q", msg.Role, i, w, lw, line)
+					}
+				}
+			}
+
+			// 4. Full View()
+			view := m.View()
+			for i, line := range strings.Split(view, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("m.View() line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+		})
+	}
+}
+
+func TestHeaderResponsiveLines(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.modelName = "claude-code"
+	m.workspace = "/home/user/project/nabd"
+
+	// Width >= 60: 1 content line + 1 hairline divider = 2 lines total
+	for _, w := range []int{60, 80, 120} {
+		h := renderHeader(&m, w)
+		lines := strings.Split(h, "\n")
+		if len(lines) != 2 {
+			t.Fatalf("expected 2 lines for width %d, got %d:\n%s", w, len(lines), h)
+		}
+		if !strings.Contains(lines[0], "NabdCoder") {
+			t.Fatalf("width %d missing title in line 0: %q", w, lines[0])
+		}
+		if w >= 80 && !strings.Contains(lines[0], "claude-code") {
+			t.Fatalf("width %d missing model in line 0: %q", w, lines[0])
+		}
+		if !strings.Contains(lines[0], "Sandbox:") || !strings.Contains(lines[0], "Iter") {
+			t.Fatalf("width %d missing sandbox or iter in line 0: %q", w, lines[0])
+		}
+		// Hairline divider width
+		if lipgloss.Width(lines[1]) != w {
+			t.Fatalf("expected hairline divider width %d, got %d", w, lipgloss.Width(lines[1]))
+		}
+	}
+
+	// Width < 60: 2 content lines + 1 hairline divider = 3 lines total
+	for _, w := range []int{36, 40, 45, 50, 59} {
+		h := renderHeader(&m, w)
+		lines := strings.Split(h, "\n")
+		if len(lines) != 3 {
+			t.Fatalf("expected 3 lines for width %d, got %d:\n%s", w, len(lines), h)
+		}
+		if !strings.Contains(lines[0], "NabdCoder") {
+			t.Fatalf("width %d missing NabdCoder in line 0: %q", w, lines[0])
+		}
+		if !strings.Contains(lines[1], "Sandbox:") || !strings.Contains(lines[1], "Iter") {
+			t.Fatalf("width %d missing sandbox or iter in line 1: %q", w, lines[1])
+		}
+		if lipgloss.Width(lines[2]) != w {
+			t.Fatalf("expected hairline divider width %d, got %d", w, lipgloss.Width(lines[2]))
+		}
+	}
+}
+
+func TestNoBordersAroundMessages(t *testing.T) {
+	boxRunes := []string{"╭", "╮", "╰", "╯", "┌", "┐", "└", "┘"}
+
+	testMessages := []Message{
+		{Role: "user", Content: "Hello world"},
+		{Role: "assistant", Content: "Hello! How can I help you today?"},
+		{Role: "tool", ToolCallID: "c1", Content: "read file content", Display: "read_file(a.go) -> 50 bytes"},
+		{Role: "error", Content: "file not found"},
+		{Role: "local", Content: "local command output"},
+	}
+
+	for _, msg := range testMessages {
+		rendered := renderMessageCard(msg, 80, false, false)
+		for _, r := range boxRunes {
+			if strings.Contains(rendered, r) {
+				t.Fatalf("message role %q unexpectedly contains border glyph %q:\n%s", msg.Role, r, rendered)
+			}
+		}
+	}
+}
+
+func TestAdvisoryWarningNotTruncatedAt36(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.viewport.Width = 36
+	m.viewport.Height = 10
+	m.pendingDisclosure = &Message{
+		Role:       "tool",
+		ToolCallID: "c_sec",
+		Content:    "Secret found: sk-1234567890abcdef1234567890abcdef",
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "ADVISORY WARNING") {
+		t.Fatalf("view missing ADVISORY WARNING at width 36:\n%s", view)
+	}
+	if !strings.Contains(view, "credentials") {
+		t.Fatalf("view missing credentials warning text:\n%s", view)
+	}
+
+	// Verify no line exceeds width 36
+	for i, line := range strings.Split(view, "\n") {
+		lw := lipgloss.Width(line)
+		if lw > 36 {
+			t.Fatalf("view line %d exceeds width 36 (got %d): %q", i, lw, line)
+		}
+	}
+}
+
+func TestToolSummaryCtrlOHintAndREA(t *testing.T) {
+	// Standard tool
+	msgTool := Message{
+		Role:       "tool",
+		ToolCallID: "call_std",
+		Display:    formatToolSummary("read_file", `{"path":"internal/tools/registry.go"}`, `{"content":"package tools","truncated":false}`),
+		Content:    "package tools\n...",
+	}
+	rendered := renderMessageCard(msgTool, 80, false, false)
+	if !strings.Contains(rendered, "Ctrl+O") {
+		t.Fatalf("tool card missing Ctrl+O hint: %s", rendered)
+	}
+
+	// REA formatting
+	reaSummary := formatToolSummary("mcp_call", `{"command":"rea","tool":"inspect_binary_layout"}`, "layout output 100 bytes")
+	if !strings.Contains(reaSummary, "rea:inspect_binary_layout(...)") {
+		t.Fatalf("formatToolSummary missing rea:<tool> formatting: %s", reaSummary)
+	}
+
+	msgREA := Message{
+		Role:       "tool",
+		ToolCallID: "call_rea",
+		Display:    reaSummary,
+		Content:    "binary info",
+	}
+	renderedREA := renderMessageCard(msgREA, 80, false, false)
+	if !strings.Contains(renderedREA, "rea:inspect_binary_layout(...)") || !strings.Contains(renderedREA, "Ctrl+O") {
+		t.Fatalf("rendered REA tool card missing format or Ctrl+O hint: %s", renderedREA)
+	}
+
+	// Expanded view
+	renderedExpanded := renderMessageCard(msgTool, 80, true, true)
+	if !strings.Contains(renderedExpanded, "Full Output") || !strings.Contains(renderedExpanded, "Ctrl+O to collapse") {
+		t.Fatalf("expanded tool card missing Full Output or collapse hint: %s", renderedExpanded)
+	}
+}
+
+func TestSlashPaletteOpenConditions(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+
+	// 1. Should open at "/" and show all commands
+	if !shouldOpenPalette("/", false, false, false, "") {
+		t.Fatal("expected palette to open for /")
+	}
+	filtered, _ := filterSlashCommands("/", "")
+	if len(filtered) != len(slashCommands) {
+		t.Fatalf("expected all %d commands for /, got %d", len(slashCommands), len(filtered))
+	}
+
+	// 2. Should open at "/st" and show status
+	if !shouldOpenPalette("/st", false, false, false, "") {
+		t.Fatal("expected palette to open for /st")
+	}
+	filtered, _ = filterSlashCommands("/st", "")
+	if len(filtered) != 1 || filtered[0].Name != "status" {
+		t.Fatalf("expected [status] for /st, got %v", filtered)
+	}
+
+	// 3. Should NOT open without "/" (e.g. "status")
+	if shouldOpenPalette("status", false, false, false, "") {
+		t.Fatal("expected palette NOT to open for input without /")
+	}
+
+	// 4. Should NOT open with spaces (e.g. "/st abc")
+	if shouldOpenPalette("/st abc", false, false, false, "") {
+		t.Fatal("expected palette NOT to open for input with space")
+	}
+
+	// 5. Should NOT open for multiline (e.g. "/st\nabc")
+	if shouldOpenPalette("/st\nabc", false, false, false, "") {
+		t.Fatal("expected palette NOT to open for multiline input")
+	}
+
+	// 6. Should NOT open while model is busy
+	if shouldOpenPalette("/st", true, false, false, "") {
+		t.Fatal("expected palette NOT to open when busy")
+	}
+
+	// 7. Should NOT open while awaiting approval or pending disclosure
+	if shouldOpenPalette("/st", false, true, false, "") {
+		t.Fatal("expected palette NOT to open when awaiting approval")
+	}
+	if shouldOpenPalette("/st", false, false, true, "") {
+		t.Fatal("expected palette NOT to open when pending disclosure")
+	}
+
+	// 8. Should close when no command matches (/xyz)
+	if shouldOpenPalette("/xyz", false, false, false, "") {
+		t.Fatal("expected palette NOT to open for non-matching command /xyz")
+	}
+
+	// 9. Should stay closed if dismissed for exact same input
+	if shouldOpenPalette("/st", false, false, false, "/st") {
+		t.Fatal("expected palette NOT to open when input equals dismissedInput")
+	}
+	// But opens if input changes
+	if !shouldOpenPalette("/sta", false, false, false, "/st") {
+		t.Fatal("expected palette to open when input differs from dismissedInput")
+	}
+	_ = m
+}
+
+func TestSlashPaletteFilteringOrderAndStability(t *testing.T) {
+	// Query "s":
+	// "status" starts with "s" -> prefix match
+	// "tools" contains "s" -> substring match
+	// Prefix match should come before substring match
+	filtered, _ := filterSlashCommands("s", "")
+	if len(filtered) < 2 {
+		t.Fatalf("expected at least 2 matches for 's', got %d", len(filtered))
+	}
+	if filtered[0].Name != "status" {
+		t.Fatalf("expected prefix match 'status' first, got %q", filtered[0].Name)
+	}
+	foundTools := false
+	for _, cmd := range filtered[1:] {
+		if cmd.Name == "tools" {
+			foundTools = true
+			break
+		}
+	}
+	if !foundTools {
+		t.Fatal("expected substring match 'tools' to be in results")
+	}
+
+	// Query "e":
+	// "clear" contains "e", "help" contains "e" (neither starts with "e")
+	// Order should be stable according to slashCommands definition order ("clear" then "help")
+	filteredE, _ := filterSlashCommands("e", "")
+	if len(filteredE) < 2 {
+		t.Fatalf("expected at least 2 matches for 'e', got %d", len(filteredE))
+	}
+	if filteredE[0].Name != "clear" || filteredE[1].Name != "help" {
+		t.Fatalf("expected stable order [clear, help] for 'e', got [%s, %s]", filteredE[0].Name, filteredE[1].Name)
+	}
+}
+
+func TestSlashPaletteNavigationWrappingAndHistory(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.textArea.SetValue("/")
+	m.palette.updatePalette("/", false, false, false)
+	m.adjustViewportHeight()
+
+	if !m.palette.open || len(m.palette.filtered) != 4 {
+		t.Fatalf("expected open palette with 4 items, got open=%v, len=%d", m.palette.open, len(m.palette.filtered))
+	}
+
+	initialHistoryLen := len(m.history)
+
+	// Initial selection is 0
+	if m.palette.selectedIndex != 0 {
+		t.Fatalf("expected initial selectedIndex 0, got %d", m.palette.selectedIndex)
+	}
+
+	// Navigate Down: 0 -> 1 -> 2 -> 3 -> 0 (wrap)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(uiModel)
+	if m.palette.selectedIndex != 1 {
+		t.Fatalf("expected selectedIndex 1 after Down, got %d", m.palette.selectedIndex)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(uiModel)
+	if m.palette.selectedIndex != 2 {
+		t.Fatalf("expected selectedIndex 2 after Down, got %d", m.palette.selectedIndex)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(uiModel)
+	if m.palette.selectedIndex != 3 {
+		t.Fatalf("expected selectedIndex 3 after Down, got %d", m.palette.selectedIndex)
+	}
+
+	// Down from last wraps to 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(uiModel)
+	if m.palette.selectedIndex != 0 {
+		t.Fatalf("expected selectedIndex 0 after wrapping Down, got %d", m.palette.selectedIndex)
+	}
+
+	// Up from 0 wraps to 3
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(uiModel)
+	if m.palette.selectedIndex != 3 {
+		t.Fatalf("expected selectedIndex 3 after wrapping Up, got %d", m.palette.selectedIndex)
+	}
+
+	// Verify history was not touched at all during navigation
+	if len(m.history) != initialHistoryLen {
+		t.Fatalf("expected history to remain unchanged, had %d, now %d", initialHistoryLen, len(m.history))
+	}
+}
+
+func TestSlashPaletteTabCompletion(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.textArea.SetValue("/st")
+	m.palette.updatePalette("/st", false, false, false)
+	m.adjustViewportHeight()
+
+	if !m.palette.open {
+		t.Fatal("expected palette to be open for /st")
+	}
+
+	initialMsgCount := len(m.messages)
+
+	// Press Tab
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(uiModel)
+
+	// Text completed to /status
+	if m.textArea.Value() != "/status" {
+		t.Fatalf("expected textArea value '/status', got %q", m.textArea.Value())
+	}
+
+	// Palette stays open with status as single selected option
+	if !m.palette.open {
+		t.Fatal("expected palette to stay open after Tab completion")
+	}
+	sel := m.palette.selectedCommand()
+	if sel == nil || sel.Name != "status" {
+		t.Fatalf("expected selected command 'status', got %v", sel)
+	}
+
+	// No command executed yet
+	if len(m.messages) != initialMsgCount || m.busy {
+		t.Fatalf("command should not execute on Tab: messages=%d (initially %d), busy=%v", len(m.messages), initialMsgCount, m.busy)
+	}
+}
+
+func TestSlashPaletteEscDismissal(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.textArea.SetValue("/st")
+	m.palette.updatePalette("/st", false, false, false)
+	m.adjustViewportHeight()
+
+	if !m.palette.open {
+		t.Fatal("expected palette to be open for /st")
+	}
+
+	// First Esc: closes palette, does not clear text
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(uiModel)
+
+	if m.palette.open {
+		t.Fatal("expected palette to close on Esc")
+	}
+	if m.textArea.Value() != "/st" {
+		t.Fatalf("expected text '/st' to remain untouched, got %q", m.textArea.Value())
+	}
+	if m.palette.dismissedInput != "/st" {
+		t.Fatalf("expected dismissedInput '/st', got %q", m.palette.dismissedInput)
+	}
+
+	// Modify text: e.g. append 'a'
+	m.textArea.SetValue("/sta")
+	m.palette.updatePalette(m.getInputValue(), false, false, false)
+	if !m.palette.open {
+		t.Fatal("expected palette to reopen after text change following Esc")
+	}
+
+	// Close again with Esc
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(uiModel)
+	if m.palette.open {
+		t.Fatal("expected palette to close on second Esc")
+	}
+
+	// Esc when palette is closed clears the non-empty input
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(uiModel)
+	if m.getInputValue() != "" {
+		t.Fatalf("expected input to be cleared on Esc when palette is closed, got %q", m.getInputValue())
+	}
+}
+
+func TestSlashPaletteEnterExecution(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+
+	// 1. Enter execution for /status from palette
+	m.textArea.SetValue("/st")
+	m.palette.updatePalette("/st", false, false, false)
+	m.adjustViewportHeight()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(uiModel)
+
+	if m.palette.open {
+		t.Fatal("expected palette to be closed after Enter")
+	}
+	if m.getInputValue() != "" {
+		t.Fatalf("expected input to be cleared after Enter, got %q", m.getInputValue())
+	}
+	if len(m.history) == 0 || m.history[len(m.history)-1] != "/status" {
+		t.Fatalf("expected /status in history, got %v", m.history)
+	}
+	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != "local" || !strings.Contains(m.messages[len(m.messages)-1].Content, "NabdCoder Status") {
+		t.Fatalf("expected status message, got %v", m.messages)
+	}
+	if m.busy {
+		t.Fatal("expected m.busy to remain false for local command")
+	}
+
+	// 2. Enter execution for /clear
+	m.textArea.SetValue("/clear")
+	m.palette.updatePalette("/clear", false, false, false)
+	m.adjustViewportHeight()
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(uiModel)
+
+	if m.palette.open {
+		t.Fatal("expected palette to be closed after /clear Enter")
+	}
+	if len(m.messages) != 1 || m.messages[0].Role != "system" {
+		t.Fatalf("expected only system prompt in messages after /clear, got %v", m.messages)
+	}
+	if m.history[len(m.history)-1] != "/clear" {
+		t.Fatalf("expected /clear in history, got %v", m.history)
+	}
+}
+
+func TestSlashPaletteSingleSourceOfTruth(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	helpText := formatHelp()
+
+	for _, cmd := range slashCommands {
+		// Command must be present in /help
+		if !strings.Contains(helpText, "/"+cmd.Name) {
+			t.Fatalf("command /%s missing from formatHelp() output:\n%s", cmd.Name, helpText)
+		}
+		if !strings.Contains(helpText, cmd.Description) {
+			t.Fatalf("description for /%s missing from formatHelp() output:\n%s", cmd.Name, helpText)
+		}
+
+		// Command must be executable via executeLocalCommand without error
+		updated, _ := m.executeLocalCommand("/" + cmd.Name)
+		um := updated.(uiModel)
+		if len(um.messages) == 0 {
+			t.Fatalf("command /%s produced no messages", cmd.Name)
+		}
+	}
+}
+
+func TestSlashPaletteResponsiveDimensions(t *testing.T) {
+	widths := []int{36, 40, 45, 60, 80, 120}
+
+	p := slashPalette{
+		open:          true,
+		selectedIndex: 0,
+		filtered:      slashCommands,
+	}
+
+	for _, w := range widths {
+		rendered := renderSlashPalette(&p, w, 5)
+		if !utf8.ValidString(rendered) {
+			t.Fatalf("renderSlashPalette returned invalid UTF-8 for width %d", w)
+		}
+
+		lines := strings.Split(rendered, "\n")
+		for lineIdx, line := range lines {
+			lw := lipgloss.Width(line)
+			if lw > w {
+				t.Fatalf("renderSlashPalette width %d line %d exceeds width (got %d): %q", w, lineIdx, lw, line)
+			}
+		}
+
+		// Width < 45: descriptions must be hidden
+		if w < 45 {
+			if strings.Contains(rendered, "Show model") || strings.Contains(rendered, "List registered") {
+				t.Fatalf("renderSlashPalette for width %d should hide descriptions, got:\n%s", w, rendered)
+			}
+		} else {
+			// Width >= 45: at least partial descriptions should appear
+			if !strings.Contains(rendered, "Show model") && !strings.Contains(rendered, "Show") {
+				t.Fatalf("renderSlashPalette for width %d should include descriptions, got:\n%s", w, rendered)
+			}
+		}
+	}
+
+	// Viewport height dynamics
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	// Simulate window size 80x30
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	m = updated.(uiModel)
+
+	expectedBase := 30 - 8 // 22
+	if m.baseHeight != expectedBase {
+		t.Fatalf("expected baseHeight %d, got %d", expectedBase, m.baseHeight)
+	}
+	if m.viewport.Height != expectedBase {
+		t.Fatalf("expected initial viewport.Height %d, got %d", expectedBase, m.viewport.Height)
+	}
+
+	// Open palette with 4 commands
+	m.palette.updatePalette("/", false, false, false)
+	m.adjustViewportHeight()
+
+	paletteHeight := len(slashCommands) + 3 // 4 + 3 = 7
+	expectedReduced := expectedBase - paletteHeight
+	if m.viewport.Height != expectedReduced {
+		t.Fatalf("expected reduced viewport.Height %d, got %d", expectedReduced, m.viewport.Height)
+	}
+
+	// Close palette
+	m.palette.open = false
+	m.adjustViewportHeight()
+	if m.viewport.Height != expectedBase {
+		t.Fatalf("expected restored viewport.Height %d, got %d", expectedBase, m.viewport.Height)
+	}
+
+	// Small terminal height (< 20)
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 18})
+	m = updated.(uiModel)
+	if m.maxPaletteRows() != 3 {
+		t.Fatalf("expected maxPaletteRows 3 for small height, got %d", m.maxPaletteRows())
 	}
 }
