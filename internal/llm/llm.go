@@ -16,11 +16,15 @@ import (
 )
 
 const (
-	DefaultBaseURL     = "http://127.0.0.1:8080/v1"
-	DefaultModel       = "local"
-	DefaultTimeout     = 180 * time.Second
-	DefaultMaxTokens   = 2048
-	DefaultTemperature = 0.2
+	DefaultBaseURL       = "http://127.0.0.1:8080/v1"
+	DefaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
+	DefaultModel         = "local"
+	DefaultGeminiModel   = "gemini-2.5-flash"
+	DefaultTimeout       = 180 * time.Second
+	DefaultMaxTokens     = 2048
+	DefaultTemperature   = 0.2
+	ProviderOpenAI       = "openai"
+	ProviderGemini       = "gemini"
 )
 
 // Message is one chat message in OpenAI wire format.
@@ -40,6 +44,7 @@ type ToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	ThoughtSignature string `json:"thought_signature,omitempty"`
 }
 
 // Request is a single chat completion request.
@@ -95,12 +100,14 @@ func (s Secret) SecretValue() string {
 // Config holds endpoint and generation settings. Values come from the
 // environment, never from command-line arguments.
 type Config struct {
-	BaseURL     string
-	Model       string
-	APIKey      Secret
-	Timeout     time.Duration
-	MaxTokens   int
-	Temperature *float64
+	Provider     string
+	BaseURL      string
+	Model        string
+	APIKey       Secret
+	Timeout      time.Duration
+	MaxTokens    int
+	Temperature  *float64
+	GeminiSearch bool
 }
 
 // GetTemperature returns the configured temperature or the default (0.2).
@@ -115,13 +122,26 @@ func (c Config) GetTemperature() float64 {
 func ConfigFromEnv() (Config, error) {
 	var errs []error
 
-	baseURL := getEnv("NABD_BASE_URL", DefaultBaseURL)
-	model := getEnv("NABD_MODEL", DefaultModel)
+	providerRaw := strings.ToLower(strings.TrimSpace(os.Getenv("NABD_PROVIDER")))
+	if providerRaw == "" {
+		providerRaw = ProviderOpenAI
+	}
 
+	defaultBaseURL := DefaultBaseURL
+	defaultModel := DefaultModel
+	if providerRaw == ProviderGemini {
+		defaultBaseURL = DefaultGeminiBaseURL
+		defaultModel = DefaultGeminiModel
+	}
+
+	baseURL := getEnv("NABD_BASE_URL", defaultBaseURL)
+	model := getEnv("NABD_MODEL", defaultModel)
+
+	// OpenAI keys
 	apiKeyVal := strings.TrimSpace(os.Getenv("NABD_API_KEY"))
 	apiKeyFile := strings.TrimSpace(os.Getenv("NABD_API_KEY_FILE"))
 
-	var apiKey Secret
+	var openAIKey Secret
 	if apiKeyVal != "" && apiKeyFile != "" {
 		errs = append(errs, errors.New("both NABD_API_KEY and NABD_API_KEY_FILE are set; specify only one"))
 	} else if apiKeyFile != "" {
@@ -129,10 +149,52 @@ func ConfigFromEnv() (Config, error) {
 		if err != nil {
 			errs = append(errs, err)
 		} else {
-			apiKey = Secret(key)
+			openAIKey = Secret(key)
 		}
 	} else if apiKeyVal != "" {
-		apiKey = Secret(apiKeyVal)
+		openAIKey = Secret(apiKeyVal)
+	}
+
+	// Gemini keys
+	geminiKeyVal := strings.TrimSpace(os.Getenv("NABD_GEMINI_API_KEY"))
+	geminiKeyFile := strings.TrimSpace(os.Getenv("NABD_GEMINI_API_KEY_FILE"))
+
+	var geminiKey Secret
+	if geminiKeyVal != "" && geminiKeyFile != "" {
+		errs = append(errs, errors.New("both NABD_GEMINI_API_KEY and NABD_GEMINI_API_KEY_FILE are set; specify only one"))
+	} else if geminiKeyFile != "" {
+		key, err := readAPIKeyFile(geminiKeyFile)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			geminiKey = Secret(key)
+		}
+	} else if geminiKeyVal != "" {
+		geminiKey = Secret(geminiKeyVal)
+	}
+
+	// Select key based on provider with fallback
+	var apiKey Secret
+	if providerRaw == ProviderGemini {
+		if geminiKey != "" {
+			apiKey = geminiKey
+		} else {
+			apiKey = openAIKey
+		}
+	} else {
+		apiKey = openAIKey
+	}
+
+	// Gemini search grounding
+	var geminiSearch bool
+	if v := strings.TrimSpace(os.Getenv("NABD_GEMINI_SEARCH")); v != "" {
+		if v == "1" {
+			geminiSearch = true
+		} else if v == "0" {
+			geminiSearch = false
+		} else {
+			errs = append(errs, fmt.Errorf("invalid NABD_GEMINI_SEARCH %q: must be 1, 0, or empty", v))
+		}
 	}
 
 	timeout := DefaultTimeout
@@ -167,12 +229,14 @@ func ConfigFromEnv() (Config, error) {
 	}
 
 	cfg := Config{
-		BaseURL:     baseURL,
-		Model:       model,
-		APIKey:      apiKey,
-		Timeout:     timeout,
-		MaxTokens:   maxTokens,
-		Temperature: temp,
+		Provider:     providerRaw,
+		BaseURL:      baseURL,
+		Model:        model,
+		APIKey:       apiKey,
+		Timeout:      timeout,
+		MaxTokens:    maxTokens,
+		Temperature:  temp,
+		GeminiSearch: geminiSearch,
 	}
 
 	if len(errs) > 0 {
@@ -184,6 +248,14 @@ func ConfigFromEnv() (Config, error) {
 // Validate checks all configuration values, returning all detected errors.
 func (c Config) Validate() error {
 	var errs []error
+
+	provider := strings.ToLower(strings.TrimSpace(c.Provider))
+	if provider == "" {
+		provider = ProviderOpenAI
+	}
+	if provider != ProviderOpenAI && provider != ProviderGemini {
+		errs = append(errs, fmt.Errorf("invalid NABD_PROVIDER %q: must be openai or gemini", c.Provider))
+	}
 
 	if err := validateBaseURL(c.BaseURL); err != nil {
 		errs = append(errs, err)
@@ -217,6 +289,22 @@ func (c Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// NewClient returns a configured Client based on cfg.Provider.
+func NewClient(cfg Config) (Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
+	switch provider {
+	case ProviderGemini:
+		return NewGeminiClient(cfg), nil
+	case ProviderOpenAI, "":
+		return NewOpenAIClient(cfg), nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q", cfg.Provider)
+	}
 }
 
 func readAPIKeyFile(path string) (string, error) {
