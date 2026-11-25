@@ -104,6 +104,7 @@ type uiModel struct {
 	baseHeight        int
 	provider          string
 	searchEnabled     bool
+	autoApprove       AutoApproveMode
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -114,7 +115,12 @@ func buildSystemPrompt(reg *tools.Registry) string {
 	return prompt
 }
 
-func initialModel(reg *tools.Registry, client llm.Client) uiModel {
+func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApproveMode) uiModel {
+	mode := AutoApproveOff
+	if len(autoMode) > 0 {
+		mode = autoMode[0]
+	}
+
 	ti := textinput.New()
 	ti.Placeholder = "Message to NabdCoder... (Ctrl+C to quit)"
 	ti.Focus()
@@ -184,6 +190,14 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 		sandboxProven = true
 	}
 
+	initialMsgs := []Message{{Role: "system", Content: sysPrompt}}
+	if mode == AutoApproveAll {
+		initialMsgs = append(initialMsgs, Message{
+			Role:    "local",
+			Content: "⚠️ WARNING: Auto-approve mode is ALL. Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review.",
+		})
+	}
+
 	return uiModel{
 		destination:   destination,
 		statusBar:     statusBar,
@@ -199,12 +213,13 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 		history:       nil,
 		historyIdx:    0,
 		viewport:      vp,
-		messages:      []Message{{Role: "system", Content: sysPrompt}},
+		messages:      initialMsgs,
 		maxIterations: defaultMaxIterations,
 		historyBudget: defaultHistoryTokens,
 		callCounts:    make(map[string]int),
 		client:        client,
 		registry:      reg,
+		autoApprove:   mode,
 		status:        "Ready",
 		baseHeight:    20,
 	}
@@ -501,6 +516,31 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refresh()
 			return m.advance()
 		}
+
+		canAutoDisclose := false
+		if m.autoApprove == AutoApproveAll {
+			canAutoDisclose = true
+		} else if m.autoApprove == AutoApproveReadOnly && len(m.pendingTools) > 0 {
+			toolName := m.pendingTools[0].Function.Name
+			isReadOnly := m.registry.Has(toolName) && !m.registry.RequiresApproval(toolName)
+			hasSecretWarnings := len(advisorySecretWarnings(msg.toolMsg.Content)) > 0
+			if isReadOnly && !hasSecretWarnings {
+				canAutoDisclose = true
+			}
+		}
+
+		if canAutoDisclose {
+			if len(m.pendingTools) > 0 {
+				_ = m.registry.LogDisclosure(m.pendingTools[0].Function.Name, sha256Hex(msg.toolMsg.Content), string(m.autoApprove), true)
+			}
+			m.messages = append(m.messages, msg.toolMsg)
+			if len(m.pendingTools) > 0 {
+				m.pendingTools = m.pendingTools[1:]
+			}
+			m.refresh()
+			return m.advance()
+		}
+
 		m.pendingDisclosure = &msg.toolMsg
 		m.status = "Review tool output; scroll to end, then approve [y/n]"
 		m.refreshDisclosure()
@@ -550,6 +590,59 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 			m.refresh()
 			return m.advance()
 		}
+
+		if m.autoApprove == AutoApproveAll {
+			m.approval = preview
+			if !m.approvalStillValid() {
+				m.pendingTools = m.pendingTools[1:]
+				m.approval = approvalPreview{}
+				m.messages = append(m.messages, Message{
+					Role:       "tool",
+					ToolCallID: next.ID,
+					Content:    "Error: file changed since approval preview; re-read it and retry.",
+					Display:    "Blocked: file changed after preview",
+				})
+				m.refresh()
+				return m.advance()
+			}
+			var approval tools.Approval
+			var approveErr error
+			if next.Function.Name == "edit_file" {
+				approval, approveErr = m.registry.ApprovePreviewAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), m.approval.State, "all")
+			} else if next.Function.Name == "mcp_call" {
+				var p struct {
+					Command string `json:"command"`
+				}
+				if jsonErr := json.Unmarshal([]byte(next.Function.Arguments), &p); jsonErr != nil {
+					approveErr = jsonErr
+				} else {
+					var identity string
+					identity, approveErr = m.registry.MCPIdentity(p.Command)
+					if approveErr == nil {
+						approval, approveErr = m.registry.ApproveWithIdentityAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), identity, "all")
+					}
+				}
+			} else {
+				approval, approveErr = m.registry.ApproveAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), "all")
+			}
+			if approveErr != nil {
+				m.pendingTools = m.pendingTools[1:]
+				m.approval = approvalPreview{}
+				m.messages = append(m.messages, Message{
+					Role:       "tool",
+					ToolCallID: next.ID,
+					Content:    "Error: approval could not be recorded: " + approveErr.Error(),
+					Display:    "Approval not recorded",
+				})
+				m.refresh()
+				return m.advance()
+			}
+			m.approval = approvalPreview{}
+			m.status = "Executing: " + sanitizeForDisplay(next.Function.Name)
+			m.refresh()
+			return m, m.lifecycle.wrap(executeToolCmd(m.lifecycle.ctx, m.registry, next, &approval))
+		}
+
 		m.awaitingApproval = true
 		m.approval = preview
 		m.status = "Approval required [y/n]"
@@ -886,6 +979,10 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, nil
 	}
+	if input == "/auto" || input == "auto" || strings.HasPrefix(input, "/auto ") || strings.HasPrefix(input, "auto ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(input, "/auto"), "auto"))
+		return m.handleAutoCommand(arg)
+	}
 	if input == "/help" || input == "help" {
 		m.messages = append(m.messages, Message{Role: "local", Content: formatHelp()})
 		m.clearInput()
@@ -903,11 +1000,50 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	return m.startLLM()
 }
 
+func (m *uiModel) handleAutoCommand(arg string) (tea.Model, tea.Cmd) {
+	m.clearInput()
+	if arg == "" {
+		content := fmt.Sprintf("Auto-approval mode: %s\nUsage: /auto off | readonly | all", m.autoApprove)
+		if m.autoApprove == AutoApproveAll {
+			content += "\n⚠️ WARNING: In 'all' mode, tool approvals and disclosures are bypassed. Tool outputs and potential credentials may be sent to the model provider."
+		}
+		m.messages = append(m.messages, Message{Role: "local", Content: content})
+		m.refresh()
+		return *m, nil
+	}
+
+	mode, err := ParseAutoApproveMode(arg)
+	if err != nil {
+		m.messages = append(m.messages, Message{Role: "local", Content: fmt.Sprintf("Error: %v", err)})
+		m.refresh()
+		return *m, nil
+	}
+
+	if m.awaitingApproval || m.pendingDisclosure != nil {
+		m.messages = append(m.messages, Message{
+			Role:    "local",
+			Content: "Cannot change auto-approval mode while a tool approval or disclosure is pending. Please approve or reject the pending action first.",
+		})
+		m.refresh()
+		return *m, nil
+	}
+
+	m.autoApprove = mode
+	content := fmt.Sprintf("Auto-approval mode set to: %s", mode)
+	if mode == AutoApproveAll {
+		content += "\n⚠️ WARNING: Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review."
+	}
+	m.messages = append(m.messages, Message{Role: "local", Content: content})
+	m.refresh()
+	return *m, nil
+}
+
 func (m *uiModel) formatStatus() string {
 	tokens := estimateMessages(m.messages)
 	budget := m.historyBudget
 	var b strings.Builder
 	b.WriteString("=== NabdCoder Status ===\n")
+	fmt.Fprintf(&b, "Auto-approve: %s\n", m.autoApprove)
 	fmt.Fprintf(&b, "Provider: %s\n", m.provider)
 	if m.provider == "gemini" {
 		searchStatus := "off"
@@ -1001,6 +1137,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	autoMode, err := LoadAutoApproveFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
+		os.Exit(2)
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -1041,7 +1183,7 @@ func main() {
 			}
 		}
 	}
-	model := initialModel(reg, client)
+	model := initialModel(reg, client, autoMode)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	_, runErr := p.Run()
 	model.lifecycle.stop()

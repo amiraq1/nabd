@@ -253,6 +253,15 @@ func (r *Registry) RequiresApproval(name string) bool {
 	return !spec.ReadOnly
 }
 
+// IsReadOnly reports whether a registered tool is marked ReadOnly.
+func (r *Registry) IsReadOnly(name string) bool {
+	spec, ok := r.handlers[name]
+	if !ok {
+		return false
+	}
+	return spec.ReadOnly
+}
+
 // Has reports whether a tool is registered.
 func (r *Registry) NeedsApproval(name string) bool { return r.RequiresApproval(name) }
 
@@ -813,7 +822,21 @@ func (r *Registry) Approve(name string, rawArgs json.RawMessage) (Approval, erro
 			state = &preview.State
 		}
 	}
-	return r.approveWithState(name, rawArgs, state, previewErr, "")
+	return r.approveWithState(name, rawArgs, state, previewErr, "", "")
+}
+
+// ApproveAuto records an explicit approval with an auto-approval mode tag in the audit log.
+func (r *Registry) ApproveAuto(name string, rawArgs json.RawMessage, mode string) (Approval, error) {
+	var state *ApprovalState
+	var previewErr error
+	if name == "edit_file" {
+		preview, err := r.PreviewApproval(name, rawArgs)
+		previewErr = err
+		if err == nil {
+			state = &preview.State
+		}
+	}
+	return r.approveWithState(name, rawArgs, state, previewErr, "", mode)
 }
 
 // ApproveWithIdentity binds a token to a server identity digest in addition to
@@ -823,7 +846,15 @@ func (r *Registry) ApproveWithIdentity(name string, rawArgs json.RawMessage, ide
 	if identity == "" {
 		return Approval{}, fmt.Errorf("identity is required for approval")
 	}
-	return r.approveWithState(name, rawArgs, nil, nil, identity)
+	return r.approveWithState(name, rawArgs, nil, nil, identity, "")
+}
+
+// ApproveWithIdentityAuto binds a token with server identity and an auto-approval mode tag.
+func (r *Registry) ApproveWithIdentityAuto(name string, rawArgs json.RawMessage, identity string, mode string) (Approval, error) {
+	if identity == "" {
+		return Approval{}, fmt.Errorf("identity is required for approval")
+	}
+	return r.approveWithState(name, rawArgs, nil, nil, identity, mode)
 }
 
 // ApprovePreview binds a single-use token to the file state shown in the UI.
@@ -831,9 +862,39 @@ func (r *Registry) ApprovePreview(name string, rawArgs json.RawMessage, state Ap
 	if name != "edit_file" {
 		return Approval{}, fmt.Errorf("preview state is only valid for edit_file")
 	}
-	return r.approveWithState(name, rawArgs, &state, nil, "")
+	return r.approveWithState(name, rawArgs, &state, nil, "", "")
 }
-func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state *ApprovalState, preflightErr error, identity string) (Approval, error) {
+
+// ApprovePreviewAuto binds a single-use token to preview state with an auto-approval mode tag.
+func (r *Registry) ApprovePreviewAuto(name string, rawArgs json.RawMessage, state ApprovalState, mode string) (Approval, error) {
+	if name != "edit_file" {
+		return Approval{}, fmt.Errorf("preview state is only valid for edit_file")
+	}
+	return r.approveWithState(name, rawArgs, &state, nil, "", mode)
+}
+
+// LogDisclosure records a tool output disclosure event in the audit log.
+func (r *Registry) LogDisclosure(tool string, contentHash string, autoMode string, approved bool) error {
+	event := "disclosure_approved"
+	reason := ""
+	if !approved {
+		event = "disclosure_denied"
+		reason = "user rejected"
+	}
+	detail := ""
+	if autoMode != "" {
+		detail = "[auto_approved:" + autoMode + "]"
+	}
+	return r.logEvent(audit.Event{
+		Event:        event,
+		Tool:         tool,
+		ResultSHA256: contentHash,
+		Detail:       detail,
+		Reason:       reason,
+	})
+}
+
+func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state *ApprovalState, preflightErr error, identity string, autoTag string) (Approval, error) {
 	spec, ok := r.handlers[name]
 	if !ok {
 		return Approval{}, fmt.Errorf("unknown tool %q", name)
@@ -857,7 +918,11 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 	if _, exists := r.pending[token]; exists {
 		return Approval{}, fmt.Errorf("approval token collision")
 	}
-	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
+	detail := ""
+	if autoTag != "" {
+		detail = "[auto_approved:" + autoTag + "]"
+	}
+	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash, Detail: detail}); err != nil {
 		return Approval{}, err
 	}
 	r.pending[token] = pendingApproval{state: state, preflightErr: preflightErr, tool: name, argsHash: hash, identity: identity, expires: now.Add(approvalTTL)}

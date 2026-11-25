@@ -43,17 +43,39 @@ func renderHeader(m *uiModel, width int) string {
 		ws = "."
 	}
 
+	var autoBadge string
+	switch m.autoApprove {
+	case AutoApproveReadOnly:
+		autoBadge = headerAutoReadOnlyStyle.Render("Auto: ReadOnly")
+	case AutoApproveAll:
+		autoBadge = headerAutoAllStyle.Render("Auto: ALL")
+	}
+
 	hairline := headerDividerStyle.Render(strings.Repeat(symDivider, width))
 
 	// Narrow layout (< 60 columns)
 	if width < 60 {
-		prefix := headerIdentityStyle.Render(symIdentity) + " " + headerTitleStyle.Render("NabdCoder") + "   "
-		availModel := width - lipgloss.Width(prefix)
-		displayModel := modelPill
-		if availModel > 0 && lipgloss.Width(displayModel) > availModel {
-			displayModel = truncateEnd(displayModel, availModel)
+		var line1 string
+		if autoBadge != "" {
+			prefix := headerIdentityStyle.Render(symIdentity) + " " + headerTitleStyle.Render("NabdCoder") + " " + autoBadge
+			avail := width - lipgloss.Width(prefix) - 1
+			displayModel := modelPill
+			if avail >= 4 {
+				line1 = prefix + " " + headerMutedStyle.Render(truncateEnd(displayModel, avail))
+			} else if lipgloss.Width(prefix) <= width {
+				line1 = prefix
+			} else {
+				line1 = truncateEnd(prefix, width)
+			}
+		} else {
+			prefix := headerIdentityStyle.Render(symIdentity) + " " + headerTitleStyle.Render("NabdCoder") + "   "
+			availModel := width - lipgloss.Width(prefix)
+			displayModel := modelPill
+			if availModel > 0 && lipgloss.Width(displayModel) > availModel {
+				displayModel = truncateEnd(displayModel, availModel)
+			}
+			line1 = prefix + headerMutedStyle.Render(displayModel)
 		}
-		line1 := prefix + headerMutedStyle.Render(displayModel)
 
 		// Line 2: Sandbox: Off|Proven   0.4k/24k   Iter 0/10
 		// Spacing degrades from 3 spaces to 2 or 1 if needed to fit width without truncating Sandbox or Iter
@@ -67,14 +89,27 @@ func renderHeader(m *uiModel, width int) string {
 			spacing = " "
 			line2Text = fmt.Sprintf("%s%s%s%s%s", sandboxText, spacing, ctxMetric, spacing, iterMetric)
 		}
+		if lipgloss.Width(line2Text) > width {
+			sbShort := "SB: Off"
+			if m.sandboxProven {
+				sbShort = "SB: Proven"
+			}
+			line2Text = fmt.Sprintf("%s %s %s", sbShort, ctxMetric, iterMetric)
+		}
+		if lipgloss.Width(line2Text) > width {
+			line2Text = truncateEnd(line2Text, width)
+		}
 		line2 := headerMutedStyle.Render(line2Text)
 
 		return line1 + "\n" + line2 + "\n" + hairline
 	}
 
 	// Desktop / standard terminal layout (>= 60 columns): single line
-	// Format: ● NabdCoder   <model>   <workspace>   Sandbox: Off|Proven   0.4k/24k   Iter 0/10
+	// Format: ● NabdCoder   [Auto: ALL]   <model>   <workspace>   Sandbox: Off|Proven   0.4k/24k   Iter 0/10
 	prefix := headerIdentityStyle.Render(symIdentity) + " " + headerTitleStyle.Render("NabdCoder")
+	if autoBadge != "" {
+		prefix += "   " + autoBadge
+	}
 	fixedSuffixText := fmt.Sprintf("   %s   %s   %s", sandboxText, ctxMetric, iterMetric)
 	fixedSuffix := headerMutedStyle.Render(fixedSuffixText)
 
