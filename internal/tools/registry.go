@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,7 +44,9 @@ type ToolSpec struct {
 	// external code. The zero value is false, so every new tool requires
 	// approval unless its author explicitly declares it read-only.
 	ReadOnly bool
-	Execute  func(ctx context.Context, args json.RawMessage) (string, error)
+	// MaxOutputBytes overrides the default 4096-byte cap when > 0.
+	MaxOutputBytes int
+	Execute        func(ctx context.Context, args json.RawMessage) (string, error)
 }
 
 type Registry struct {
@@ -59,6 +62,7 @@ type Registry struct {
 	now       func() time.Time
 	mcpConfig *MCPConfig
 	reaConfig *REAConfig
+	webConfig *WebConfig
 	sandbox   sandbox.Backend
 }
 
@@ -156,6 +160,14 @@ func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
 		r.mcpConfig.servers[REAServerName] = validatedServer
 		r.reaConfig = reaCfg
 	}
+
+	// Check opt-in web search/fetch configuration (fail-closed if invalid)
+	webCfg, err := LoadWebConfigFromEnv()
+	if err != nil {
+		_ = root.Close()
+		return nil, fmt.Errorf("load web search configuration: %w", err)
+	}
+	r.webConfig = webCfg
 
 	r.registerDefaults()
 	return r, nil
@@ -750,7 +762,7 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 		return fmt.Sprintf("Error: unknown tool %q", name)
 	}
 	hash := hashBytes(rawArgs)
-	detail := toolDetail(name, rawArgs)
+	detail := r.toolDetail(name, rawArgs)
 
 	if spec.ReadOnly {
 		_ = r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: detail})
@@ -904,7 +916,7 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 	}
 
 	hash := hashBytes(rawArgs)
-	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)}); err != nil {
+	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: r.toolDetail(name, rawArgs)}); err != nil {
 		return Approval{}, err
 	}
 	token, err := newApprovalToken()
@@ -940,7 +952,7 @@ func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.Ra
 	hash := hashBytes(rawArgs)
 
 	if spec.ReadOnly {
-		_ = r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)})
+		_ = r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: r.toolDetail(name, rawArgs)})
 		return r.execute(ctx, spec, name, rawArgs, hash)
 	}
 
@@ -985,19 +997,23 @@ func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawA
 	// Record the decision to execute before side effects happen. If the final
 	// result record fails, the log still shows that the operation was started.
 	if !spec.ReadOnly {
-		if err := r.logEvent(audit.Event{Event: "executing", Tool: name, ArgsSHA256: hash, Detail: toolDetail(name, rawArgs)}); err != nil {
+		if err := r.logEvent(audit.Event{Event: "executing", Tool: name, ArgsSHA256: hash, Detail: r.toolDetail(name, rawArgs)}); err != nil {
 			result := fmt.Sprintf("Error: cannot record execution in audit log: %v", err)
 			_ = r.logEvent(audit.Event{Event: "failed", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))})
 			return result
 		}
 	}
+	outCap := maxOutputBytes
+	if spec.MaxOutputBytes > 0 {
+		outCap = spec.MaxOutputBytes
+	}
 	out, err := spec.Execute(ctx, rawArgs)
 	if err != nil {
-		result := fmt.Sprintf("Error: %v\nOutput:\n%s", err, truncateOutput(out))
+		result := fmt.Sprintf("Error: %v\nOutput:\n%s", err, truncateOutputWithCap(out, outCap))
 		_ = r.logEvent(audit.Event{Event: "failed", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))})
 		return result
 	}
-	result := truncateOutput(out)
+	result := truncateOutputWithCap(out, outCap)
 	if err := r.logEvent(audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))}); err != nil && !spec.ReadOnly {
 		result += "\nWarning: audit log write failed"
 	}
@@ -1051,11 +1067,13 @@ func (r *Registry) logEvent(event audit.Event) error {
 	return r.auditLog.Write(event)
 }
 
-func toolDetail(name string, rawArgs json.RawMessage) string {
+func (r *Registry) toolDetail(name string, rawArgs json.RawMessage) string {
 	var p struct {
 		Path    string `json:"path"`
 		Pkg     string `json:"pkg"`
 		Command string `json:"command"`
+		Query   string `json:"query"`
+		URL     string `json:"url"`
 	}
 	_ = json.Unmarshal(rawArgs, &p)
 
@@ -1070,6 +1088,16 @@ func toolDetail(name string, rawArgs json.RawMessage) string {
 		}
 	case "mcp_call":
 		detail = p.Command
+	case "web_search":
+		// Record provider and query length only; never record raw query text in audit logs.
+		detail = fmt.Sprintf("provider=%s query_len=%d", r.WebSearchProvider(), len(strings.TrimSpace(p.Query)))
+	case "web_fetch":
+		// Record destination hostname only; never record query strings or sensitive URL components.
+		host := "(invalid-url)"
+		if u, err := url.Parse(p.URL); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+		}
+		detail = "host=" + host
 	}
 	if name == "list_dir" && detail == "" {
 		detail = "."
@@ -1102,6 +1130,7 @@ func sanitizeAuditDetail(s string) string {
 func (r *Registry) registerDefaults() {
 	r.registerEditTool()
 	r.registerOtherTools()
+	r.registerWebTools()
 }
 
 func (r *Registry) registerEditTool() {
@@ -1564,10 +1593,17 @@ func buildVerifyEnv() []string {
 }
 
 func truncateOutput(s string) string {
-	if len(s) <= maxOutputBytes {
+	return truncateOutputWithCap(s, maxOutputBytes)
+}
+
+func truncateOutputWithCap(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = maxOutputBytes
+	}
+	if len(s) <= maxBytes {
 		return s
 	}
-	half := maxOutputBytes / 2
+	half := maxBytes / 2
 
 	head := s[:half]
 	for len(head) > 0 && !utf8.ValidString(head) {
