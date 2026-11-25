@@ -152,10 +152,14 @@ func callExternalMCPServer(ctx context.Context, dir string, b sandbox.Backend, s
 	if err != nil {
 		return "", err
 	}
-	return runMCPProtocol(callCtx, process, stdin, stdout, tool, args)
+	return runMCPServerProtocol(callCtx, process, stdin, stdout, server.Name, tool, args)
 }
 
 func runMCPProtocol(callCtx context.Context, process *mcpProcess, stdin, stdout *os.File, tool string, args map[string]any) (output string, retErr error) {
+	return runMCPServerProtocol(callCtx, process, stdin, stdout, "", tool, args)
+}
+
+func runMCPServerProtocol(callCtx context.Context, process *mcpProcess, stdin, stdout *os.File, serverName, tool string, args map[string]any) (output string, retErr error) {
 	limited := &wireLimitReader{r: stdout, remaining: maxMCPWireBytes}
 	c := client.NewClient(transport.NewIO(limited, stdin, nil))
 	defer func() {
@@ -199,9 +203,14 @@ func runMCPProtocol(callCtx context.Context, process *mcpProcess, stdin, stdout 
 	if err := callCtx.Err(); err != nil {
 		return fail(err)
 	}
-	return collectMCPText(result), nil
+	maxBytes := maxMCPResponseBytes
+	if serverName == REAServerName {
+		maxBytes = maxREAMCPResponseBytes
+	}
+	return collectMCPTextWithLimit(result, maxBytes), nil
 }
-func collectMCPText(result *mcp.CallToolResult) string {
+
+func collectMCPTextWithLimit(result *mcp.CallToolResult, maxBytes int) string {
 	var out strings.Builder
 	truncated := false
 	for _, content := range result.Content {
@@ -210,7 +219,7 @@ func collectMCPText(result *mcp.CallToolResult) string {
 			continue
 		}
 		text := tc.Text + "\n"
-		remaining := maxMCPResponseBytes - out.Len()
+		remaining := maxBytes - out.Len()
 		if len(text) > remaining {
 			text = text[:remaining]
 			for len(text) > 0 && !utf8.ValidString(text) {
@@ -229,4 +238,8 @@ func collectMCPText(result *mcp.CallToolResult) string {
 		return "(no text content returned)"
 	}
 	return out.String()
+}
+
+func collectMCPText(result *mcp.CallToolResult) string {
+	return collectMCPTextWithLimit(result, maxMCPResponseBytes)
 }
