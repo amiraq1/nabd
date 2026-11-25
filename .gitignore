@@ -4,6 +4,7 @@ nabd-agent-audit
 /nabdcoder
 /nabdcoder.exe
 /nabdcoder-arm64
+/nabd-agent-*
 /mcp-server
 /mcp-server.exe
 *.test
