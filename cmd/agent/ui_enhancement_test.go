@@ -127,8 +127,11 @@ func TestFormatToolSummary(t *testing.T) {
 	// repo_map
 	repoMapResult := "=== REPO MAP (path: ., scanned: 12 files, symbols: 45, tests: 6) ===\nmodule github.com/amiraq1/nabd\n"
 	sumRepoMap := formatToolSummary("repo_map", `{"path":"."}`, repoMapResult)
-	if sumRepoMap != "repo_map(.) -> 12 files, 45 symbols (Ctrl+O)" {
+	if sumRepoMap != "repo_map(.) -> 12 files, 45 symbols" {
 		t.Fatalf("unexpected repo_map summary: %s", sumRepoMap)
+	}
+	if strings.Contains(sumRepoMap, "Ctrl+O") {
+		t.Fatalf("formatToolSummary(repo_map) must not embed Ctrl+O: %s", sumRepoMap)
 	}
 }
 
@@ -800,16 +803,20 @@ func TestAdvisoryWarningNotTruncatedAt36(t *testing.T) {
 }
 
 func TestToolSummaryCtrlOHintAndREA(t *testing.T) {
-	// Standard tool
+	// Standard tool: Ctrl+O appears only when isLastTool is true
 	msgTool := Message{
 		Role:       "tool",
 		ToolCallID: "call_std",
 		Display:    formatToolSummary("read_file", `{"path":"internal/tools/registry.go"}`, `{"content":"package tools","truncated":false}`),
 		Content:    "package tools\n...",
 	}
-	rendered := renderMessageCard(msgTool, 80, false, false)
-	if !strings.Contains(rendered, "Ctrl+O") {
-		t.Fatalf("tool card missing Ctrl+O hint: %s", rendered)
+	renderedOlder := renderMessageCard(msgTool, 80, false, false)
+	if strings.Contains(renderedOlder, "Ctrl+O") {
+		t.Fatalf("older tool card should not show Ctrl+O hint: %s", renderedOlder)
+	}
+	renderedLatest := renderMessageCard(msgTool, 80, true, false)
+	if !strings.Contains(renderedLatest, "Ctrl+O") {
+		t.Fatalf("latest eligible tool card missing Ctrl+O hint: %s", renderedLatest)
 	}
 
 	// REA formatting
@@ -824,7 +831,7 @@ func TestToolSummaryCtrlOHintAndREA(t *testing.T) {
 		Display:    reaSummary,
 		Content:    "binary info",
 	}
-	renderedREA := renderMessageCard(msgREA, 80, false, false)
+	renderedREA := renderMessageCard(msgREA, 80, true, false)
 	if !strings.Contains(renderedREA, "rea:inspect_binary_layout(...)") || !strings.Contains(renderedREA, "Ctrl+O") {
 		t.Fatalf("rendered REA tool card missing format or Ctrl+O hint: %s", renderedREA)
 	}
@@ -833,6 +840,9 @@ func TestToolSummaryCtrlOHintAndREA(t *testing.T) {
 	renderedExpanded := renderMessageCard(msgTool, 80, true, true)
 	if !strings.Contains(renderedExpanded, "Full Output") || !strings.Contains(renderedExpanded, "Ctrl+O to collapse") {
 		t.Fatalf("expanded tool card missing Full Output or collapse hint: %s", renderedExpanded)
+	}
+	if got := strings.Count(renderedExpanded, "(Ctrl+O to collapse)"); got != 1 {
+		t.Fatalf("expected one collapse hint in expanded tool card, got %d:\n%s", got, renderedExpanded)
 	}
 }
 
@@ -1255,4 +1265,484 @@ func TestSlashPaletteResponsiveDimensions(t *testing.T) {
 	if m.maxPaletteRows() != 3 {
 		t.Fatalf("expected maxPaletteRows 3 for small height, got %d", m.maxPaletteRows())
 	}
+}
+
+func setUnicodeDisplayEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NABD_ASCII", "")
+}
+
+func makeTestToolCall(id, name, args string) ToolCall {
+	tc := ToolCall{ID: id, Type: "function"}
+	tc.Function.Name = name
+	tc.Function.Arguments = args
+	return tc
+}
+
+func TestCompactToolCallMatchingAndWaitingState(t *testing.T) {
+	tests := []struct {
+		name           string
+		messages       []Message
+		wantContains   []string
+		wantNotContain []string
+	}{
+		{
+			name: "resolved_call_hides_call_line_and_keeps_intro_text",
+			messages: []Message{
+				{
+					Role:      "assistant",
+					Content:   "Checking main.go now.",
+					ToolCalls: []ToolCall{makeTestToolCall("c1", "read_file", `{"path":"main.go"}`)},
+				},
+				{
+					Role:       "tool",
+					ToolCallID: "c1",
+					Content:    "package main",
+					Display:    "read_file(main.go) -> 12 bytes",
+				},
+			},
+			wantContains:   []string{"Checking main.go now.", "read_file(main.go) -> 12 bytes"},
+			wantNotContain: []string{"call: read_file", "… read_file"},
+		},
+		{
+			name: "partial_results_show_waiting_only_for_missing_id",
+			messages: []Message{
+				{
+					Role:    "assistant",
+					Content: "Reading both files.",
+					ToolCalls: []ToolCall{
+						makeTestToolCall("c1", "read_file", `{"path":"a.go"}`),
+						makeTestToolCall("c2", "list_dir", `{"path":"."}`),
+					},
+				},
+				{
+					Role:       "tool",
+					ToolCallID: "c1",
+					Content:    "package a",
+					Display:    "read_file(a.go) -> 9 bytes",
+				},
+			},
+			wantContains:   []string{"Reading both files.", "… list_dir", "read_file(a.go) -> 9 bytes"},
+			wantNotContain: []string{"call: read_file", "call: list_dir", "… read_file"},
+		},
+		{
+			name: "same_tool_different_ids_not_confused",
+			messages: []Message{
+				{
+					Role: "assistant",
+					ToolCalls: []ToolCall{
+						makeTestToolCall("c_first", "read_file", `{"path":"a.go"}`),
+						makeTestToolCall("c_second", "read_file", `{"path":"b.go"}`),
+					},
+				},
+				{
+					Role:       "tool",
+					ToolCallID: "c_second",
+					Content:    "package b",
+					Display:    "read_file(b.go) -> 9 bytes",
+				},
+			},
+			wantContains:   []string{"… read_file", "read_file(b.go) -> 9 bytes"},
+			wantNotContain: []string{"call: read_file"},
+		},
+		{
+			name: "empty_tool_call_id_keeps_call_line",
+			messages: []Message{
+				{
+					Role:      "assistant",
+					ToolCalls: []ToolCall{makeTestToolCall("", "read_file", `{"path":"a.go"}`)},
+				},
+				{
+					Role:       "tool",
+					ToolCallID: "",
+					Content:    "package a",
+					Display:    "read_file(a.go) -> 9 bytes",
+				},
+			},
+			wantContains: []string{"call: read_file", "read_file(a.go) -> 9 bytes"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setUnicodeDisplayEnv(t)
+			out := renderMessages(tc.messages, 80, false)
+			for _, w := range tc.wantContains {
+				if !strings.Contains(out, w) {
+					t.Fatalf("expected output to contain %q, got:\n%s", w, out)
+				}
+			}
+			for _, nw := range tc.wantNotContain {
+				if strings.Contains(out, nw) {
+					t.Fatalf("expected output NOT to contain %q, got:\n%s", nw, out)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactToolCtrlOEligibilityAndSingleHint(t *testing.T) {
+	tests := []struct {
+		name           string
+		messages       []Message
+		wantCtrlOCount int
+		wantOnSummary  string
+		wantAbsentOn   []string
+	}{
+		{
+			name: "only_newest_eligible_tool_shows_ctrl_o",
+			messages: []Message{
+				{Role: "tool", ToolCallID: "c1", Content: "first output", Display: "read_file(a.go) -> 12 bytes"},
+				{Role: "tool", ToolCallID: "c2", Content: "=== REPO MAP", Display: formatToolSummary("repo_map", `{"path":"."}`, "=== REPO MAP (path: ., scanned: 5 files, symbols: 10, tests: 1) ===")},
+			},
+			wantCtrlOCount: 1,
+			wantOnSummary:  "repo_map(.) -> 5 files, 10 symbols",
+			wantAbsentOn:   []string{"read_file(a.go)"},
+		},
+		{
+			name: "denied_and_blocked_tools_never_show_ctrl_o",
+			messages: []Message{
+				{Role: "tool", ToolCallID: "c1", Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"},
+				{Role: "tool", ToolCallID: "c2", Content: "Tool execution denied by policy.", Display: "Tool execution denied"},
+				{Role: "tool", ToolCallID: "c3", Content: "Tool disclosure blocked: output cannot be displayed safely.", Display: "Tool disclosure blocked"},
+			},
+			wantCtrlOCount: 0,
+		},
+		{
+			name: "latest_rejected_falls_back_to_newest_eligible_for_ctrl_o",
+			messages: []Message{
+				{Role: "tool", ToolCallID: "c1", Content: "eligible file content", Display: "read_file(ok.go) -> 21 bytes"},
+				{Role: "tool", ToolCallID: "c2", Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"},
+			},
+			wantCtrlOCount: 1,
+			wantOnSummary:  "read_file(ok.go) -> 21 bytes",
+			wantAbsentOn:   []string{"Tool output disclosure rejected"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := renderMessages(tc.messages, 100, false)
+			gotCount := strings.Count(out, "(Ctrl+O)")
+			if gotCount != tc.wantCtrlOCount {
+				t.Fatalf("expected %d occurrences of (Ctrl+O), got %d in:\n%s", tc.wantCtrlOCount, gotCount, out)
+			}
+			if tc.wantOnSummary != "" {
+				found := false
+				for _, line := range strings.Split(out, "\n") {
+					if strings.Contains(line, tc.wantOnSummary) && strings.Contains(line, "(Ctrl+O)") {
+						found = true
+					}
+					for _, absent := range tc.wantAbsentOn {
+						if strings.Contains(line, absent) && strings.Contains(line, "(Ctrl+O)") {
+							t.Fatalf("unexpected (Ctrl+O) on %q line: %q", absent, line)
+						}
+					}
+				}
+				if !found {
+					t.Fatalf("expected (Ctrl+O) on %q in:\n%s", tc.wantOnSummary, out)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactToolGroupingAndFolding(t *testing.T) {
+	makeTools := func(names ...string) ([]ToolCall, []Message) {
+		var tcs []ToolCall
+		var msgs []Message
+		for i, n := range names {
+			id := fmt.Sprintf("call_%d", i+1)
+			tcs = append(tcs, makeTestToolCall(id, n, `{"path":"f.go"}`))
+			msgs = append(msgs, Message{
+				Role:       "tool",
+				ToolCallID: id,
+				Content:    fmt.Sprintf("content-%d", i+1),
+				Display:    fmt.Sprintf("%s(f%d.go) -> %d bytes", n, i+1, 10+i),
+			})
+		}
+		return tcs, msgs
+	}
+
+	t.Run("consecutive_tools_have_no_blank_lines_and_separate_from_other_roles", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		tcs, tools := makeTools("read_file", "list_dir", "read_file")
+		msgs := []Message{
+			{Role: "user", Content: "Inspect repo"},
+			{Role: "assistant", Content: "Running tools", ToolCalls: tcs},
+		}
+		msgs = append(msgs, tools...)
+		msgs = append(msgs, Message{Role: "assistant", Content: "Done."})
+
+		out := renderMessages(msgs, 80, false)
+		if strings.Contains(out, "read_file(f1.go) -> 10 bytes\n\n") {
+			t.Fatalf("found unexpected blank line between consecutive tools:\n%s", out)
+		}
+		if !strings.Contains(out, "Running tools\n\n│ ✓") {
+			t.Fatalf("expected single blank line before tool group, got:\n%s", out)
+		}
+		if !strings.Contains(out, "(Ctrl+O)\n\n●  Done.") {
+			t.Fatalf("expected single blank line after tool group, got:\n%s", out)
+		}
+	})
+
+	t.Run("non_adjacent_tool_groups_are_not_merged", func(t *testing.T) {
+		tcs1, tools1 := makeTools("read_file", "read_file", "read_file")
+		tcs2, tools2 := makeTools("read_file", "read_file", "read_file")
+		var msgs []Message
+		msgs = append(msgs, Message{Role: "assistant", Content: "Batch 1", ToolCalls: tcs1})
+		msgs = append(msgs, tools1...)
+		msgs = append(msgs, Message{Role: "local", Content: "Status check"})
+		msgs = append(msgs, Message{Role: "assistant", Content: "Batch 2", ToolCalls: tcs2})
+		msgs = append(msgs, tools2...)
+
+		out := renderMessages(msgs, 80, false)
+		if strings.Contains(out, "earlier tool calls") {
+			t.Fatalf("separate tool groups should not be merged or folded:\n%s", out)
+		}
+	})
+
+	foldTests := []struct {
+		name           string
+		toolNames      []string
+		wantFold       bool
+		wantFoldLine   string
+		wantVisible    []string
+		wantNotVisible []string
+	}{
+		{
+			name:        "five_results_not_folded",
+			toolNames:   []string{"read_file", "read_file", "read_file", "list_dir", "edit_file"},
+			wantFold:    false,
+			wantVisible: []string{"f1.go", "f2.go", "f3.go", "f4.go", "f5.go"},
+		},
+		{
+			name:           "six_results_folded_keeping_last_three",
+			toolNames:      []string{"read_file", "list_dir", "read_file", "edit_file", "go_verify", "read_file"},
+			wantFold:       true,
+			wantFoldLine:   "+3 earlier tool calls (2 read_file, 1 list_dir)",
+			wantVisible:    []string{"f4.go", "f5.go", "f6.go"},
+			wantNotVisible: []string{"f1.go", "f2.go", "f3.go"},
+		},
+		{
+			name:           "seven_results_folded_to_plus_4_and_last_three_kept",
+			toolNames:      []string{"read_file", "read_file", "list_dir", "read_file", "edit_file", "go_verify", "repo_map"},
+			wantFold:       true,
+			wantFoldLine:   "+4 earlier tool calls (3 read_file, 1 list_dir)",
+			wantVisible:    []string{"f5.go", "f6.go", "f7.go"},
+			wantNotVisible: []string{"f1.go", "f2.go", "f3.go", "f4.go"},
+		},
+	}
+
+	for _, tc := range foldTests {
+		t.Run(tc.name, func(t *testing.T) {
+			tcs, tools := makeTools(tc.toolNames...)
+			msgs := []Message{{Role: "assistant", ToolCalls: tcs}}
+			msgs = append(msgs, tools...)
+			origLen := len(msgs)
+
+			out := renderMessages(msgs, 80, false)
+			if len(msgs) != origLen {
+				t.Fatalf("renderMessages mutated messages slice length from %d to %d", origLen, len(msgs))
+			}
+
+			if tc.wantFold {
+				if !strings.Contains(out, tc.wantFoldLine) {
+					t.Fatalf("expected fold line %q in:\n%s", tc.wantFoldLine, out)
+				}
+			} else if strings.Contains(out, "earlier tool calls") {
+				t.Fatalf("unexpected folding for %d results:\n%s", len(tc.toolNames), out)
+			}
+
+			for _, v := range tc.wantVisible {
+				if !strings.Contains(out, v) {
+					t.Fatalf("expected visible item %q in:\n%s", v, out)
+				}
+			}
+			for _, nv := range tc.wantNotVisible {
+				if strings.Contains(out, nv) {
+					t.Fatalf("expected folded item %q to be hidden in:\n%s", nv, out)
+				}
+			}
+		})
+	}
+}
+
+func TestToolStatusIndicatorsAndASCIIFallback(t *testing.T) {
+	tests := []struct {
+		name      string
+		asciiEnv  string
+		msg       Message
+		wantGlyph string
+	}{
+		{
+			name:      "unicode_success",
+			msg:       Message{Role: "tool", ToolCallID: "c1", Content: "ok", Display: "read_file(a.go) -> 2 bytes"},
+			wantGlyph: "│ ✓ ",
+		},
+		{
+			name:      "unicode_rejection",
+			msg:       Message{Role: "tool", ToolCallID: "c2", Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"},
+			wantGlyph: "│ ✗ ",
+		},
+		{
+			name:      "unicode_blocked",
+			msg:       Message{Role: "tool", ToolCallID: "c3", Content: "Tool disclosure blocked: output cannot be displayed safely.", Display: "Tool disclosure blocked"},
+			wantGlyph: "│ ✗ ",
+		},
+		{
+			name:      "unicode_denied",
+			msg:       Message{Role: "tool", ToolCallID: "c4", Content: "Tool execution denied.", Display: "Tool execution denied"},
+			wantGlyph: "│ ✗ ",
+		},
+		{
+			name:      "unicode_go_verify_fail",
+			msg:       Message{Role: "tool", ToolCallID: "c5", Content: "FAIL\n--- FAIL: TestX", Display: "go_verify(./...) -> FAIL (tests failed)"},
+			wantGlyph: "│ ✗ ",
+		},
+		{
+			name:      "ascii_success",
+			asciiEnv:  "1",
+			msg:       Message{Role: "tool", ToolCallID: "c6", Content: "ok", Display: "read_file(a.go) -> 2 bytes"},
+			wantGlyph: "| + ",
+		},
+		{
+			name:      "ascii_failure",
+			asciiEnv:  "1",
+			msg:       Message{Role: "tool", ToolCallID: "c7", Content: "Error: file not found", Display: "Blocked: missing"},
+			wantGlyph: "| x ",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.asciiEnv != "" {
+				t.Setenv("NABD_ASCII", tc.asciiEnv)
+			} else {
+				setUnicodeDisplayEnv(t)
+			}
+			out := renderMessages([]Message{tc.msg}, 80, false)
+			if !strings.Contains(out, tc.wantGlyph) {
+				t.Fatalf("expected status prefix %q in:\n%s", tc.wantGlyph, out)
+			}
+		})
+	}
+
+	t.Run("ascii_waiting_indicator", func(t *testing.T) {
+		t.Setenv("NABD_ASCII", "1")
+		out := renderMessages([]Message{
+			{Role: "assistant", ToolCalls: []ToolCall{makeTestToolCall("c_wait", "read_file", `{"path":"a.go"}`)}},
+		}, 80, false)
+		if !strings.Contains(out, "| ... read_file") {
+			t.Fatalf("expected ASCII waiting line '| ... read_file', got:\n%s", out)
+		}
+	})
+}
+
+func TestCompactToolsWidthComplianceWithANSIAndWideRunes(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	widths := []int{36, 40, 45, 60, 80, 120}
+
+	// Build a realistic long conversation with folded batch, failures, waiting call,
+	// long unspaced paths, Arabic/CJK/emoji wide characters, and ANSI-styled wrapping.
+	msgs := []Message{
+		{Role: "system", Content: "system"},
+		{Role: "user", Content: "افحص ملفات المشروع 中文文件名测试🔍 واختبر العرض الضيق"},
+		{
+			Role:    "assistant",
+			Content: "Inspecting multiple files across nested packages.",
+			ToolCalls: []ToolCall{
+				makeTestToolCall("t1", "read_file", `{"path":"internal/very/deeply/nested/directory/alpha_component.go"}`),
+				makeTestToolCall("t2", "read_file", `{"path":"internal/very/deeply/nested/directory/beta_component.go"}`),
+				makeTestToolCall("t3", "list_dir", `{"path":"internal/tools"}`),
+				makeTestToolCall("t4", "read_file", `{"path":"cmd/agent/ui_render.go"}`),
+				makeTestToolCall("t5", "edit_file", `{"path":"cmd/agent/main.go"}`),
+				makeTestToolCall("t6", "go_verify", `{"pkg":"./cmd/agent"}`),
+				makeTestToolCall("t7", "mcp_call", `{"command":"rea","tool":"inspect_binary_layout_extended"}`),
+			},
+		},
+		{Role: "tool", ToolCallID: "t1", Content: "a", Display: "read_file(internal/very/deeply/nested/directory/alpha_component.go) -> 120 bytes"},
+		{Role: "tool", ToolCallID: "t2", Content: "b", Display: "read_file(internal/very/deeply/nested/directory/beta_component.go) -> 240 bytes"},
+		{Role: "tool", ToolCallID: "t3", Content: "c", Display: "list_dir(internal/tools) -> 18 entries"},
+		{Role: "tool", ToolCallID: "t4", Content: "d", Display: "read_file(cmd/agent/ui_render.go) -> 18500 bytes"},
+		{Role: "tool", ToolCallID: "t5", Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"},
+		{Role: "tool", ToolCallID: "t6", Content: "FAIL\n--- FAIL: TestOverflow", Display: "go_verify(./cmd/agent) -> FAIL (tests failed)"},
+		{Role: "tool", ToolCallID: "t7", Content: "Full wide output: 中文测试データ🔍🔍🔍\n" + strings.Repeat("x", 90), Display: "rea:inspect_binary_layout_extended(...) -> 512 bytes"},
+		{
+			Role:      "assistant",
+			Content:   "Follow-up check",
+			ToolCalls: []ToolCall{makeTestToolCall("t8", "read_file_with_very_long_tool_name_for_narrow_termux_screen", `{}`)},
+		},
+	}
+
+	for _, w := range widths {
+		t.Run(fmt.Sprintf("width_%d", w), func(t *testing.T) {
+			setUnicodeDisplayEnv(t)
+			for _, expand := range []bool{false, true} {
+				m := initialModel(reg, &mockClient{})
+				m.viewport.Width = w
+				m.viewport.Height = 30
+				m.messages = msgs
+				m.expandLastTool = expand
+				m.refresh()
+
+				rendered := m.viewport.View()
+				for i, line := range strings.Split(rendered, "\n") {
+					if lw := lipgloss.Width(line); lw > w {
+						t.Fatalf("expand=%v line %d exceeds width %d (got %d): %q", expand, i, w, lw, line)
+					}
+				}
+			}
+
+			// Verify wrapIndented directly with explicit ANSI SGR sequences + wide runes.
+			styledLong := "\x1b[1;38;2;230;237;243m" + strings.Repeat("漢字", 20) + "unspaced_identifier_token_1234567890" + "\x1b[0m"
+			wrapped := wrapIndented("\x1b[38;2;125;133;144m│ \x1b[0m\x1b[38;2;74;222;128m✓\x1b[0m ", "\x1b[38;2;125;133;144m│   \x1b[0m", styledLong, w)
+			for i, line := range strings.Split(wrapped, "\n") {
+				if lw := lipgloss.Width(line); lw > w {
+					t.Fatalf("ANSI+wide wrap line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+		})
+	}
+
+	t.Run("preview_40_cols", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		previewMsgs := []Message{
+			{Role: "user", Content: "Inspect agent files"},
+			{
+				Role:    "assistant",
+				Content: "Reading project files.",
+				ToolCalls: []ToolCall{
+					makeTestToolCall("p1", "read_file", `{"path":"a.go"}`),
+					makeTestToolCall("p2", "read_file", `{"path":"b.go"}`),
+					makeTestToolCall("p3", "list_dir", `{"path":"."}`),
+					makeTestToolCall("p4", "read_file", `{"path":"c.go"}`),
+					makeTestToolCall("p5", "edit_file", `{"path":"d.go"}`),
+					makeTestToolCall("p6", "go_verify", `{"pkg":"./..."}`),
+					makeTestToolCall("p7", "repo_map", `{"path":"."}`),
+				},
+			},
+			{Role: "tool", ToolCallID: "p1", Content: "a", Display: "read_file(a.go) -> 120 bytes"},
+			{Role: "tool", ToolCallID: "p2", Content: "b", Display: "read_file(b.go) -> 240 bytes"},
+			{Role: "tool", ToolCallID: "p3", Content: "c", Display: "list_dir(.) -> 8 entries"},
+			{Role: "tool", ToolCallID: "p4", Content: "d", Display: "read_file(c.go) -> 90 bytes"},
+			{Role: "tool", ToolCallID: "p5", Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"},
+			{Role: "tool", ToolCallID: "p6", Content: "FAIL", Display: "go_verify(./...) -> FAIL (tests failed)"},
+			{Role: "tool", ToolCallID: "p7", Content: "=== REPO MAP", Display: formatToolSummary("repo_map", `{"path":"."}`, "=== REPO MAP (path: ., scanned: 12 files, symbols: 45, tests: 6) ===")},
+		}
+		out := renderMessages(previewMsgs, 40, false)
+		for i, line := range strings.Split(out, "\n") {
+			if lw := lipgloss.Width(line); lw > 40 {
+				t.Fatalf("preview line %d exceeds width 40 (got %d): %q", i, lw, line)
+			}
+		}
+		t.Logf("\n%s", out)
+	})
 }
