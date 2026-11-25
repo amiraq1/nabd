@@ -68,16 +68,6 @@ OUTPUT FORMAT
 - Reply in Arabic; keep tool names, file paths, symbols, addresses, and ` + "`evidence_id`" + ` values in English.
 - Structure every reverse-engineering answer into four concise parts: (1) السؤال، (2) النتائج (مع ` + "`evidence_id`" + ` وتصنيف واضح: **ملاحظة** أم **استنتاج**)، (3) القيود وغير المؤكّد (` + "`limitations`" + ` / ` + "`unknowns`" + `)، و(4) الخطوة التالية المفيدة.`
 
-var (
-	userStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
-	assistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	toolStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Italic(true)
-	approvalStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	statusStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	helpStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-)
-
 type Message = llm.Message
 type ToolCall = llm.ToolCall
 
@@ -91,6 +81,7 @@ type uiModel struct {
 	historyDraft      string
 	expandLastTool    bool
 	modelName         string
+	workspace         string
 	sandboxProven     bool
 	messages          []Message
 	pendingTools      []ToolCall
@@ -130,17 +121,31 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 	ta.Focus()
 	ta.ShowLineNumbers = false
 	ta.SetHeight(1)
-	ta.Prompt = "❯ "
-	ta.SetWidth(80)
+	ta.Prompt = symPrompt + " "
+	ta.SetWidth(76)
+	ta.FocusedStyle.Prompt = lipgloss.NewStyle().Foreground(colorAccent)
+	ta.BlurredStyle.Prompt = lipgloss.NewStyle().Foreground(colorAccent)
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colorMuted)
+	ta.BlurredStyle.Placeholder = lipgloss.NewStyle().Foreground(colorMuted)
+	ta.FocusedStyle.Text = lipgloss.NewStyle().Foreground(colorFg)
+	ta.BlurredStyle.Text = lipgloss.NewStyle().Foreground(colorFg)
+	ta.FocusedStyle.Base = lipgloss.NewStyle()
+	ta.BlurredStyle.Base = lipgloss.NewStyle()
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	sp.Style = lipgloss.NewStyle().Foreground(colorAccent)
 
 	vp := viewport.New(80, 20)
 	vp.SetContent("NabdCoder ready — secure tools + Termux memory limits\n")
 
 	sysPrompt := buildSystemPrompt(reg)
+
+	workspace := "."
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		workspace = cwd
+	}
 
 	destination := "unknown model endpoint"
 	modelName := "unknown"
@@ -171,6 +176,7 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 		destination:   destination,
 		statusBar:     statusBar,
 		modelName:     modelName,
+		workspace:     workspace,
 		sandboxProven: sandboxProven,
 		lifecycle:     newLifecycle(),
 		textInput:     ti,
@@ -438,9 +444,9 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.WindowSizeMsg:
 		m.viewport.Width = max(20, msg.Width)
-		m.viewport.Height = max(1, msg.Height-7)
-		m.textInput.Width = max(20, msg.Width-4)
-		m.textArea.SetWidth(max(20, msg.Width-4))
+		m.viewport.Height = max(1, msg.Height-8)
+		m.textInput.Width = max(10, msg.Width-4)
+		m.textArea.SetWidth(max(10, msg.Width-4))
 		m.refresh()
 	case llmResponseMsg:
 		m.finishRequest()
@@ -572,25 +578,30 @@ func (m uiModel) View() string {
 	var b strings.Builder
 	b.WriteString(renderHeader(&m, m.viewport.Width) + "\n")
 	b.WriteString(m.viewport.View() + "\n")
-	b.WriteString(helpStyle.Render("────────────────────────────────") + "\n")
 	if m.pendingDisclosure != nil {
 		if warnings := advisorySecretWarnings(m.pendingDisclosure.Content); len(warnings) > 0 {
-			alert := advisoryAlertBoxStyle.Render("⚠️  ADVISORY WARNING: Potential credentials detected in tool output!\n" + strings.Join(warnings, "\n"))
+			warnWidth := max(10, m.viewport.Width-2)
+			alert := advisoryAlertBoxStyle.Width(warnWidth).Render("⚠️  ADVISORY WARNING: Potential credentials detected in tool output!\n" + strings.Join(warnings, "\n"))
 			b.WriteString(alert + "\n")
 		}
-		b.WriteString(approvalStyle.Render("Send the displayed tool output to the model? [Y/N]") + "\n")
+		prompt := approvalPromptStyle.Render("Send the displayed tool output to the model? [Y/N]")
+		b.WriteString(wrapIndented("", "", prompt, m.viewport.Width) + "\n")
 	} else if m.awaitingApproval && len(m.pendingTools) > 0 {
 		tc := m.pendingTools[0]
-		b.WriteString(approvalStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", sanitizeForDisplay(tc.Function.Name))) + "\n")
+		prompt := approvalPromptStyle.Render(fmt.Sprintf("Approve %s? [Y/N]", sanitizeForDisplay(tc.Function.Name)))
+		b.WriteString(wrapIndented("", "", prompt, m.viewport.Width) + "\n")
 		if m.approval.Summary != "" {
 			b.WriteString(renderApprovalSummary(m.approval.Summary, m.viewport.Width) + "\n")
 		}
 	} else {
+		var inputView string
 		if m.textArea.Value() != "" || m.textInput.Value() == "" {
-			b.WriteString(m.textArea.View() + "\n")
+			inputView = m.textArea.View()
 		} else {
-			b.WriteString(m.textInput.View() + "\n")
+			inputView = m.textInput.View()
 		}
+		boxWidth := max(10, m.viewport.Width-2)
+		b.WriteString(composerBoxStyle.Width(boxWidth).Render(inputView) + "\n")
 	}
 	b.WriteString(renderFooter(&m, m.viewport.Width))
 	return b.String()

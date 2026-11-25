@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/amiraq1/nabd/internal/tools"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestTermuxNarrowLayout(t *testing.T) {
@@ -586,5 +588,243 @@ func TestSystemPromptConditionalREA(t *testing.T) {
 	}
 	if mDefCleared.messages[0].Content != baseSystemPrompt {
 		t.Fatalf("expected clear on default model to retain baseSystemPrompt alone, got:\n%s", mDefCleared.messages[0].Content)
+	}
+}
+
+func TestTerminalWidthCompliance(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.workspace = "my-long-workspace-path/nabd"
+	m.modelName = "claude-3-5-sonnet-20241022"
+
+	widths := []int{36, 40, 45, 60, 80, 120}
+
+	testMessages := []Message{
+		{Role: "user", Content: "This is a long user prompt that should wrap cleanly without overflowing terminal width."},
+		{Role: "assistant", Content: "# Header 1\nSome analysis paragraph.\n- Item A\n- Item B\n```go\nfunc Code() {}\n```"},
+		{Role: "tool", ToolCallID: "c1", Content: "file content lines\nmore lines", Display: "read_file(internal/tools/registry.go) -> 1200 bytes"},
+		{Role: "error", Content: "This is a critical error message that should wrap nicely and show the danger prefix."},
+		{Role: "local", Content: "=== NabdCoder Status ===\nModel: claude-3-5-sonnet\nIteration: 1 / 10"},
+	}
+
+	for _, w := range widths {
+		t.Run(fmt.Sprintf("width_%d", w), func(t *testing.T) {
+			m.viewport.Width = w
+			m.viewport.Height = 20
+			m.textArea.SetWidth(max(10, w-4))
+
+			// 1. Header lines
+			header := renderHeader(&m, w)
+			for i, line := range strings.Split(header, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("header line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+
+			// 2. Footer lines in various states
+			// Normal state
+			footerNormal := renderFooter(&m, w)
+			for i, line := range strings.Split(footerNormal, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("footer (normal) line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+
+			// Busy state
+			m.busy = true
+			m.status = "Thinking..."
+			footerBusy := renderFooter(&m, w)
+			for i, line := range strings.Split(footerBusy, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("footer (busy) line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+			m.busy = false
+
+			// Awaiting approval state
+			m.awaitingApproval = true
+			footerApproval := renderFooter(&m, w)
+			for i, line := range strings.Split(footerApproval, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("footer (approval) line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+			m.awaitingApproval = false
+
+			// 3. Messages
+			for _, msg := range testMessages {
+				rendered := renderMessageCard(msg, w, false, false)
+				for i, line := range strings.Split(rendered, "\n") {
+					lw := lipgloss.Width(line)
+					if lw > w {
+						t.Errorf("message (%s) line %d exceeds width %d (got %d): %q", msg.Role, i, w, lw, line)
+					}
+				}
+			}
+
+			// 4. Full View()
+			view := m.View()
+			for i, line := range strings.Split(view, "\n") {
+				lw := lipgloss.Width(line)
+				if lw > w {
+					t.Errorf("m.View() line %d exceeds width %d (got %d): %q", i, w, lw, line)
+				}
+			}
+		})
+	}
+}
+
+func TestHeaderResponsiveLines(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.modelName = "claude-code"
+	m.workspace = "/home/user/project/nabd"
+
+	// Width >= 60: 1 content line + 1 hairline divider = 2 lines total
+	for _, w := range []int{60, 80, 120} {
+		h := renderHeader(&m, w)
+		lines := strings.Split(h, "\n")
+		if len(lines) != 2 {
+			t.Fatalf("expected 2 lines for width %d, got %d:\n%s", w, len(lines), h)
+		}
+		if !strings.Contains(lines[0], "NabdCoder") {
+			t.Fatalf("width %d missing title in line 0: %q", w, lines[0])
+		}
+		if w >= 80 && !strings.Contains(lines[0], "claude-code") {
+			t.Fatalf("width %d missing model in line 0: %q", w, lines[0])
+		}
+		if !strings.Contains(lines[0], "Sandbox:") || !strings.Contains(lines[0], "Iter") {
+			t.Fatalf("width %d missing sandbox or iter in line 0: %q", w, lines[0])
+		}
+		// Hairline divider width
+		if lipgloss.Width(lines[1]) != w {
+			t.Fatalf("expected hairline divider width %d, got %d", w, lipgloss.Width(lines[1]))
+		}
+	}
+
+	// Width < 60: 2 content lines + 1 hairline divider = 3 lines total
+	for _, w := range []int{36, 40, 45, 50, 59} {
+		h := renderHeader(&m, w)
+		lines := strings.Split(h, "\n")
+		if len(lines) != 3 {
+			t.Fatalf("expected 3 lines for width %d, got %d:\n%s", w, len(lines), h)
+		}
+		if !strings.Contains(lines[0], "NabdCoder") {
+			t.Fatalf("width %d missing NabdCoder in line 0: %q", w, lines[0])
+		}
+		if !strings.Contains(lines[1], "Sandbox:") || !strings.Contains(lines[1], "Iter") {
+			t.Fatalf("width %d missing sandbox or iter in line 1: %q", w, lines[1])
+		}
+		if lipgloss.Width(lines[2]) != w {
+			t.Fatalf("expected hairline divider width %d, got %d", w, lipgloss.Width(lines[2]))
+		}
+	}
+}
+
+func TestNoBordersAroundMessages(t *testing.T) {
+	boxRunes := []string{"╭", "╮", "╰", "╯", "┌", "┐", "└", "┘"}
+
+	testMessages := []Message{
+		{Role: "user", Content: "Hello world"},
+		{Role: "assistant", Content: "Hello! How can I help you today?"},
+		{Role: "tool", ToolCallID: "c1", Content: "read file content", Display: "read_file(a.go) -> 50 bytes"},
+		{Role: "error", Content: "file not found"},
+		{Role: "local", Content: "local command output"},
+	}
+
+	for _, msg := range testMessages {
+		rendered := renderMessageCard(msg, 80, false, false)
+		for _, r := range boxRunes {
+			if strings.Contains(rendered, r) {
+				t.Fatalf("message role %q unexpectedly contains border glyph %q:\n%s", msg.Role, r, rendered)
+			}
+		}
+	}
+}
+
+func TestAdvisoryWarningNotTruncatedAt36(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.viewport.Width = 36
+	m.viewport.Height = 10
+	m.pendingDisclosure = &Message{
+		Role:       "tool",
+		ToolCallID: "c_sec",
+		Content:    "Secret found: sk-1234567890abcdef1234567890abcdef",
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "ADVISORY WARNING") {
+		t.Fatalf("view missing ADVISORY WARNING at width 36:\n%s", view)
+	}
+	if !strings.Contains(view, "credentials") {
+		t.Fatalf("view missing credentials warning text:\n%s", view)
+	}
+
+	// Verify no line exceeds width 36
+	for i, line := range strings.Split(view, "\n") {
+		lw := lipgloss.Width(line)
+		if lw > 36 {
+			t.Fatalf("view line %d exceeds width 36 (got %d): %q", i, lw, line)
+		}
+	}
+}
+
+func TestToolSummaryCtrlOHintAndREA(t *testing.T) {
+	// Standard tool
+	msgTool := Message{
+		Role:       "tool",
+		ToolCallID: "call_std",
+		Display:    formatToolSummary("read_file", `{"path":"internal/tools/registry.go"}`, `{"content":"package tools","truncated":false}`),
+		Content:    "package tools\n...",
+	}
+	rendered := renderMessageCard(msgTool, 80, false, false)
+	if !strings.Contains(rendered, "Ctrl+O") {
+		t.Fatalf("tool card missing Ctrl+O hint: %s", rendered)
+	}
+
+	// REA formatting
+	reaSummary := formatToolSummary("mcp_call", `{"command":"rea","tool":"inspect_binary_layout"}`, "layout output 100 bytes")
+	if !strings.Contains(reaSummary, "rea:inspect_binary_layout(...)") {
+		t.Fatalf("formatToolSummary missing rea:<tool> formatting: %s", reaSummary)
+	}
+
+	msgREA := Message{
+		Role:       "tool",
+		ToolCallID: "call_rea",
+		Display:    reaSummary,
+		Content:    "binary info",
+	}
+	renderedREA := renderMessageCard(msgREA, 80, false, false)
+	if !strings.Contains(renderedREA, "rea:inspect_binary_layout(...)") || !strings.Contains(renderedREA, "Ctrl+O") {
+		t.Fatalf("rendered REA tool card missing format or Ctrl+O hint: %s", renderedREA)
+	}
+
+	// Expanded view
+	renderedExpanded := renderMessageCard(msgTool, 80, true, true)
+	if !strings.Contains(renderedExpanded, "Full Output") || !strings.Contains(renderedExpanded, "Ctrl+O to collapse") {
+		t.Fatalf("expanded tool card missing Full Output or collapse hint: %s", renderedExpanded)
 	}
 }

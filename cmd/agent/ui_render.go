@@ -3,15 +3,21 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
-// renderHeader builds a responsive, information-dense status bar.
-// On small screens (< 60 columns), it displays a compact layout.
+// renderHeader builds a quiet, responsive hairline status bar.
+// Width >= 60: single line followed by subtle hairline divider.
+// Width < 60: two compact lines followed by subtle hairline divider.
 func renderHeader(m *uiModel, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+
 	tokens := estimateMessages(m.messages)
 	budget := m.historyBudget
 	if budget <= 0 {
@@ -23,47 +29,149 @@ func renderHeader(m *uiModel, width int) string {
 		modelPill = "default-model"
 	}
 
-	sandboxText := "Sandbox: Disabled"
-	sandboxStyle := headerPillWarnStyle
+	sandboxText := "Sandbox: Off"
 	if m.sandboxProven {
 		sandboxText = "Sandbox: Proven"
-		sandboxStyle = headerPillSuccessStyle
 	}
 
-	ctxMetric := fmt.Sprintf("~%.1fk/%dk", float64(tokens)/1000.0, budget/1000)
+	ctxMetric := fmt.Sprintf("%.1fk/%dk", float64(tokens)/1000.0, budget/1000)
 	iterMetric := fmt.Sprintf("Iter %d/%d", m.iteration, m.maxIterations)
 
-	// Narrow screen (< 60 columns) compact rendering for Termux
-	if width < 60 {
-		line1 := headerLogoStyle.Render("NabdCoder") + " " + headerPillStyle.Render(modelPill)
-		line2 := fmt.Sprintf("%s | %s | %s", ctxMetric, iterMetric, sandboxStyle.Render(sandboxText))
-		return line1 + "\n" + line2
+	// Workspace path
+	ws := m.workspace
+	if ws == "" {
+		ws = "."
 	}
 
-	// Desktop / standard terminal layout
-	left := lipgloss.JoinHorizontal(
-		lipgloss.Center,
-		headerLogoStyle.Render("NabdCoder"),
-		" ",
-		headerPillStyle.Render(modelPill),
-		" ",
-		sandboxStyle.Render(sandboxText),
-	)
+	hairline := headerDividerStyle.Render(strings.Repeat(symDivider, width))
 
-	right := lipgloss.JoinHorizontal(
-		lipgloss.Center,
-		headerMetricStyle.Render(ctxMetric),
-		" ",
-		headerMetricStyle.Render(iterMetric),
-	)
+	// Narrow layout (< 60 columns)
+	if width < 60 {
+		prefix := headerIdentityStyle.Render(symIdentity) + " " + headerTitleStyle.Render("NabdCoder") + "   "
+		availModel := width - lipgloss.Width(prefix)
+		displayModel := modelPill
+		if availModel > 0 && lipgloss.Width(displayModel) > availModel {
+			displayModel = truncateEnd(displayModel, availModel)
+		}
+		line1 := prefix + headerMutedStyle.Render(displayModel)
 
-	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right)-2)
-	return headerBarStyle.Width(width).Render(left + strings.Repeat(" ", gap) + right)
+		// Line 2: Sandbox: Off|Proven   0.4k/24k   Iter 0/10
+		// Spacing degrades from 3 spaces to 2 or 1 if needed to fit width without truncating Sandbox or Iter
+		spacing := "   "
+		line2Text := fmt.Sprintf("%s%s%s%s%s", sandboxText, spacing, ctxMetric, spacing, iterMetric)
+		if lipgloss.Width(line2Text) > width {
+			spacing = "  "
+			line2Text = fmt.Sprintf("%s%s%s%s%s", sandboxText, spacing, ctxMetric, spacing, iterMetric)
+		}
+		if lipgloss.Width(line2Text) > width {
+			spacing = " "
+			line2Text = fmt.Sprintf("%s%s%s%s%s", sandboxText, spacing, ctxMetric, spacing, iterMetric)
+		}
+		line2 := headerMutedStyle.Render(line2Text)
+
+		return line1 + "\n" + line2 + "\n" + hairline
+	}
+
+	// Desktop / standard terminal layout (>= 60 columns): single line
+	// Format: ● NabdCoder   <model>   <workspace>   Sandbox: Off|Proven   0.4k/24k   Iter 0/10
+	prefix := headerIdentityStyle.Render(symIdentity) + " " + headerTitleStyle.Render("NabdCoder")
+	fixedSuffixText := fmt.Sprintf("   %s   %s   %s", sandboxText, ctxMetric, iterMetric)
+	fixedSuffix := headerMutedStyle.Render(fixedSuffixText)
+
+	// Available width for: "   <model>   <workspace>"
+	fixedWidth := lipgloss.Width(prefix) + lipgloss.Width(fixedSuffix)
+	availMiddle := width - fixedWidth
+
+	modelDisplay := modelPill
+	wsDisplay := ws
+
+	if availMiddle >= 6 {
+		// Try full first: "   " + modelDisplay + "   " + wsDisplay
+		needed := 3 + lipgloss.Width(modelDisplay) + 3 + lipgloss.Width(wsDisplay)
+		if needed > availMiddle {
+			// Truncate workspace first (shorten from beginning keeping last folder)
+			wsDisplay = truncateWorkspace(ws, max(3, availMiddle-6-lipgloss.Width(modelDisplay)))
+			needed = 3 + lipgloss.Width(modelDisplay) + 3 + lipgloss.Width(wsDisplay)
+			if needed > availMiddle {
+				// Workspace already minimal; truncate model next
+				availForModel := max(3, availMiddle-6-lipgloss.Width(wsDisplay))
+				modelDisplay = truncateEnd(modelDisplay, availForModel)
+			}
+		}
+	} else {
+		// Extremely narrow space between fixed parts
+		wsDisplay = ""
+		modelDisplay = truncateEnd(modelDisplay, max(3, availMiddle-3))
+	}
+
+	var middle string
+	if wsDisplay != "" {
+		middle = fmt.Sprintf("   %s   %s", modelDisplay, wsDisplay)
+	} else if modelDisplay != "" {
+		middle = fmt.Sprintf("   %s", modelDisplay)
+	}
+
+	headerLine := prefix + headerMutedStyle.Render(middle) + fixedSuffix
+	// Ensure headerLine strictly does not exceed width
+	if lipgloss.Width(headerLine) > width {
+		headerLine = truncateEnd(headerLine, width)
+	}
+
+	return headerLine + "\n" + hairline
 }
 
-// renderFooter builds an interactive footer with spinner, active status,
-// disclosure progress, and contextual key hints.
+// truncateWorkspace shortens a directory path from the start with "…",
+// keeping the last folder name intact.
+func truncateWorkspace(path string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	if lipgloss.Width(path) <= maxLen {
+		return path
+	}
+
+	base := filepath.Base(path)
+	if base == "" || base == "." || base == "/" || base == "\\" {
+		base = path
+	}
+
+	candidate := "…/" + base
+	if lipgloss.Width(candidate) <= maxLen {
+		return candidate
+	}
+
+	if lipgloss.Width(base) <= maxLen {
+		return base
+	}
+
+	return truncateEnd(base, maxLen)
+}
+
+// truncateEnd truncates a string from the end with "…".
+func truncateEnd(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxLen {
+		return s
+	}
+	if maxLen == 1 {
+		return "…"
+	}
+
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes)+"…") > maxLen {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
+}
+
+// renderFooter builds a quiet, minimal footer with status and key hints.
 func renderFooter(m *uiModel, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+
 	var statusPart string
 	if m.busy {
 		statusPart = m.spinner.View() + " " + footerStatusStyle.Render(m.status)
@@ -73,31 +181,46 @@ func renderFooter(m *uiModel, width int) string {
 		statusPart = footerStatusStyle.Render("Ready")
 	}
 
+	fullHint := "Enter send · Alt+Enter newline · Esc cancel · Ctrl+O tool · /help"
+	compactHint := "Enter send · Esc cancel · /help"
+
 	var hintPart string
 	if m.pendingDisclosure != nil {
 		if m.viewport.AtBottom() {
-			hintPart = scrollBottomReadyStyle.Render("At Bottom ✓ (Press Y to send / N to reject)")
+			if width >= 44 {
+				hintPart = scrollBottomReadyStyle.Render("At Bottom ✓ (Press Y to send / N to reject)")
+			} else {
+				hintPart = scrollBottomReadyStyle.Render("At Bottom ✓ (Y send / N reject)")
+			}
 		} else {
 			pct := int(m.viewport.ScrollPercent() * 100)
-			hintPart = scrollPercentStyle.Render(fmt.Sprintf("Scroll: %d%% (Scroll to end before Y)", pct))
+			if width >= 44 {
+				hintPart = scrollPercentStyle.Render(fmt.Sprintf("Scroll: %d%% (Scroll to end before Y)", pct))
+			} else {
+				hintPart = scrollPercentStyle.Render(fmt.Sprintf("Scroll: %d%% (Scroll to end)", pct))
+			}
 		}
 	} else if m.awaitingApproval {
-		hintPart = footerKeyPillStyle.Render("Y") + " " + footerKeyHintStyle.Render("approve") + "  " +
-			footerKeyPillStyle.Render("N") + " " + footerKeyHintStyle.Render("reject")
+		hintPart = footerKeyHintStyle.Render("Y approve · N reject")
 	} else {
-		if width >= 65 {
-			hintPart = footerKeyHintStyle.Render("Enter: send | Alt+Enter: newline | Esc: cancel | Ctrl+O: tool | /help")
+		if width >= lipgloss.Width(fullHint) {
+			hintPart = footerKeyHintStyle.Render(fullHint)
 		} else {
-			hintPart = footerKeyHintStyle.Render("Enter: send | Esc: cancel | /help")
+			hintPart = footerKeyHintStyle.Render(compactHint)
 		}
 	}
 
-	if width < 50 {
-		return statusPart + "\n" + hintPart
+	wStatus := lipgloss.Width(statusPart)
+	wHint := lipgloss.Width(hintPart)
+
+	// Single line if both fit comfortably with at least 2 spaces gap
+	if wStatus+wHint+2 <= width {
+		gap := width - wStatus - wHint
+		return statusPart + strings.Repeat(" ", gap) + hintPart
 	}
 
-	gap := max(1, width-lipgloss.Width(statusPart)-lipgloss.Width(hintPart)-2)
-	return footerBarStyle.Width(width).Render(statusPart + strings.Repeat(" ", gap) + hintPart)
+	// Two lines if narrow
+	return statusPart + "\n" + hintPart
 }
 
 // formatToolSummary produces a clear, structured one-line summary of a tool execution.
@@ -203,7 +326,7 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 	}
 }
 
-// renderApprovalSummary enhances git-like diffs visually with red/green/gray styles
+// renderApprovalSummary enhances git-like diffs visually with quiet red/green/gray styles
 // while preserving the exact text content (including prefixes -, +).
 func renderApprovalSummary(summary string, width int) string {
 	if summary == "" {
@@ -264,8 +387,7 @@ func renderMarkdownSafe(rawText string, width int) string {
 				// Close code block
 				inCodeBlock = false
 				codeContent := strings.TrimRight(codeBuffer.String(), "\n")
-				blockWidth := max(20, width-4)
-				renderedBlock := mdCodeBlockStyle.Width(blockWidth).Render(codeContent)
+				renderedBlock := mdCodeBlockStyle.Render(codeContent)
 				if codeLang != "" {
 					b.WriteString(mdCodeLangStyle.Render(" "+codeLang) + "\n")
 				}
@@ -318,7 +440,7 @@ func renderMarkdownSafe(rawText string, width int) string {
 			prefix := trimmed[:3]
 			item := trimmed[3:]
 			itemFormatted := formatInlineMarkdown(item)
-			b.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  "+prefix) + itemFormatted + "\n")
+			b.WriteString(headerMutedStyle.Render("  "+prefix) + itemFormatted + "\n")
 			continue
 		}
 
@@ -328,8 +450,7 @@ func renderMarkdownSafe(rawText string, width int) string {
 
 	// Unclosed code block fallback
 	if inCodeBlock && codeBuffer.Len() > 0 {
-		blockWidth := max(20, width-4)
-		b.WriteString(mdCodeBlockStyle.Width(blockWidth).Render(strings.TrimRight(codeBuffer.String(), "\n")) + "\n")
+		b.WriteString(mdCodeBlockStyle.Render(strings.TrimRight(codeBuffer.String(), "\n")) + "\n")
 	}
 
 	return strings.TrimRight(b.String(), "\n")
@@ -337,12 +458,10 @@ func renderMarkdownSafe(rawText string, width int) string {
 
 // formatInlineMarkdown handles `inline code` and **bold** text.
 func formatInlineMarkdown(s string) string {
-	// Format inline code
 	s = inlineCodeRegex.ReplaceAllStringFunc(s, func(m string) string {
 		inner := m[1 : len(m)-1]
 		return mdInlineCodeStyle.Render(inner)
 	})
-	// Format bold
 	s = boldRegex.ReplaceAllStringFunc(s, func(m string) string {
 		inner := m[2 : len(m)-2]
 		return lipgloss.NewStyle().Bold(true).Render(inner)
@@ -350,58 +469,162 @@ func formatInlineMarkdown(s string) string {
 	return s
 }
 
-// renderMessageCard renders a single message inside a structured, rounded card.
+// wrapIndented splits and wraps text such that the first line is prefixed with prefix
+// and all subsequent lines are prefixed with indent, ensuring no line exceeds totalWidth.
+func wrapIndented(prefix, indent, text string, totalWidth int) string {
+	if totalWidth <= 0 {
+		totalWidth = 80
+	}
+	pw := lipgloss.Width(prefix)
+	avail := max(10, totalWidth-pw)
+
+	rawLines := strings.Split(text, "\n")
+	var wrappedLines []string
+
+	for _, rl := range rawLines {
+		if lipgloss.Width(rl) <= avail {
+			wrappedLines = append(wrappedLines, rl)
+			continue
+		}
+
+		// Word wrap line to avail columns
+		words := strings.Fields(rl)
+		if len(words) == 0 {
+			wrappedLines = append(wrappedLines, "")
+			continue
+		}
+
+		var current strings.Builder
+		for _, w := range words {
+			if current.Len() == 0 {
+				if lipgloss.Width(w) > avail {
+					// Word itself is wider than available width: break into chunks
+					runes := []rune(w)
+					for len(runes) > 0 {
+						chunkLen := min(avail, len(runes))
+						wrappedLines = append(wrappedLines, string(runes[:chunkLen]))
+						runes = runes[chunkLen:]
+					}
+				} else {
+					current.WriteString(w)
+				}
+				continue
+			}
+
+			if lipgloss.Width(current.String())+1+lipgloss.Width(w) <= avail {
+				current.WriteString(" " + w)
+			} else {
+				wrappedLines = append(wrappedLines, current.String())
+				current.Reset()
+				if lipgloss.Width(w) > avail {
+					runes := []rune(w)
+					for len(runes) > 0 {
+						chunkLen := min(avail, len(runes))
+						wrappedLines = append(wrappedLines, string(runes[:chunkLen]))
+						runes = runes[chunkLen:]
+					}
+				} else {
+					current.WriteString(w)
+				}
+			}
+		}
+		if current.Len() > 0 {
+			wrappedLines = append(wrappedLines, current.String())
+		}
+	}
+
+	if len(wrappedLines) == 0 {
+		return prefix
+	}
+
+	var b strings.Builder
+	b.WriteString(prefix + wrappedLines[0])
+	for i := 1; i < len(wrappedLines); i++ {
+		b.WriteString("\n" + indent + wrappedLines[i])
+	}
+	return b.String()
+}
+
+// renderMessageCard renders a single message in a quiet, borderless stream.
 func renderMessageCard(msg Message, width int, isLastTool bool, expanded bool) string {
-	cardWidth := max(20, width-4)
+	if width <= 0 {
+		width = 80
+	}
 
 	switch msg.Role {
 	case "user":
 		content := sanitizeForDisplay(msg.Content)
-		body := userStyle.Render("You: ") + content
-		return userCardStyle.Width(cardWidth).Render(body)
+		prefix := userPrefixStyle.Render(symPrompt + "  ")
+		indent := "   "
+		return wrapIndented(prefix, indent, userTextStyle.Render(content), width)
 
 	case "assistant":
 		var b strings.Builder
 		if strings.TrimSpace(msg.Content) != "" {
-			rendered := renderMarkdownSafe(msg.Content, cardWidth-2)
-			b.WriteString(assistantStyle.Render("NabdCoder: ") + rendered)
+			rendered := renderMarkdownSafe(msg.Content, width-3)
+			prefix := asstPrefixStyle.Render(symIdentity + "  ")
+			indent := "   "
+			b.WriteString(wrapIndented(prefix, indent, rendered, width))
 		}
 		for _, tc := range msg.ToolCalls {
 			if b.Len() > 0 {
 				b.WriteString("\n")
 			}
-			b.WriteString(toolStyle.Render(fmt.Sprintf("Call: %s", sanitizeForDisplay(tc.Function.Name))))
+			bar := toolBarStyle.Render(symBar + "  ")
+			callLine := fmt.Sprintf("call: %s", sanitizeForDisplay(tc.Function.Name))
+			b.WriteString(bar + toolNameStyle.Render(callLine))
 		}
-		return asstCardStyle.Width(cardWidth).Render(b.String())
+		return b.String()
 
 	case "tool":
 		disp := msg.Display
 		if disp == "" {
 			disp = truncate(msg.Content, maxUIDisplayChars)
 		}
-		var content string
+		disp = sanitizeForDisplay(disp)
+		bar := toolBarStyle.Render(symBar + "  ")
+
 		if isLastTool && expanded {
-			// Expanded view showing full / larger output
 			full := sanitizeForDisplay(msg.Content)
 			if len(full) > 4000 {
 				full = full[:4000] + "\n...[output preview capped at 4000 chars]"
 			}
-			content = toolStyle.Render("Tool: "+sanitizeForDisplay(disp)) + "\n" +
-				lipgloss.NewStyle().Foreground(colorMuted).Italic(true).Render("─── Full Output (Ctrl+O to collapse) ───") + "\n" +
-				full
-		} else {
-			content = toolStyle.Render("Tool: "+sanitizeForDisplay(disp)) + "  " +
-				lipgloss.NewStyle().Foreground(colorMuted).Render("[Ctrl+O to expand]")
+			headerText := toolNameStyle.Render(disp) + "  " + toolHintStyle.Render("(Ctrl+O to collapse)")
+			banner := toolHintStyle.Render("─── Full Output (Ctrl+O to collapse) ───")
+
+			var b strings.Builder
+			b.WriteString(wrapIndented(bar, bar, headerText, width) + "\n")
+			b.WriteString(wrapIndented(bar, bar, banner, width))
+
+			fullLines := strings.Split(full, "\n")
+			for _, fl := range fullLines {
+				b.WriteString("\n" + wrapIndented(bar, bar, fl, width))
+			}
+			return b.String()
 		}
-		return toolCardStyle.Width(cardWidth).Render(content)
+
+		toolLine := toolNameStyle.Render(disp) + "  " + toolHintStyle.Render("(Ctrl+O)")
+		return wrapIndented(bar, bar, toolLine, width)
 
 	case "error":
-		body := errorStyle.Render("Error: " + sanitizeForDisplay(msg.Content))
-		return errorCardStyle.Width(cardWidth).Render(body)
+		body := sanitizeForDisplay(msg.Content)
+		bar := errorBarStyle.Render(symBar + "  ")
+		prefix := bar + errorLabelStyle.Render("Error: ")
+		indent := bar
+		return wrapIndented(prefix, indent, errorTextStyle.Render(body), width)
 
 	case "local":
-		body := statusStyle.Render("• ") + sanitizeForDisplay(msg.Content)
-		return localCardStyle.Width(cardWidth).Render(body)
+		body := sanitizeForDisplay(msg.Content)
+		bar := localBarStyle.Render(symBar + "  ")
+		lines := strings.Split(body, "\n")
+		var b strings.Builder
+		for i, l := range lines {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(bar + localTextStyle.Render(l))
+		}
+		return b.String()
 
 	default:
 		return sanitizeForDisplay(msg.Content)

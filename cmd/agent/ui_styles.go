@@ -1,193 +1,112 @@
 package main
 
 import (
+	"os"
+
 	"github.com/charmbracelet/lipgloss"
 )
 
-// UI Color Palette (ANSI 256-color safe for Termux and standard terminal emulators).
+// Minimal, quiet design tokens (Claude Code / Codex CLI style).
+// TrueColor with ANSI256 and ANSI16 fallbacks for Termux and standard terminal emulators.
 var (
-	// Brand / Header colors
-	colorBrandPrimary = lipgloss.Color("39")  // Deep Sky Blue / Cyan
-	colorDarkBg       = lipgloss.Color("236") // Dark Gray for bars
-	colorMuted        = lipgloss.Color("244") // Medium Gray
-	colorLightMuted   = lipgloss.Color("250") // Light Gray text
-
-	// Status & Pill colors
-	colorSuccess = lipgloss.Color("42")  // Spring Green
-	colorWarning = lipgloss.Color("214") // Orange / Amber
-	colorInfo    = lipgloss.Color("75")  // Light Steel Blue
-
-	// Message Role colors
-	colorUserBg      = lipgloss.Color("235")
-	colorUserBorder  = lipgloss.Color("33") // Dodger Blue
-	colorAsstBg      = lipgloss.Color("234")
-	colorAsstBorder  = lipgloss.Color("35") // Emerald Green
-	colorToolBg      = lipgloss.Color("235")
-	colorToolBorder  = lipgloss.Color("208") // Dark Orange
-	colorErrorBg     = lipgloss.Color("52")  // Dark Maroon
-	colorErrorBorder = lipgloss.Color("160") // Bright Crimson
-	colorLocalBg     = lipgloss.Color("236")
-	colorLocalBorder = lipgloss.Color("242")
-
-	// Diff colors
-	colorDiffAddBg  = lipgloss.Color("22")  // Dark Green
-	colorDiffAddFg  = lipgloss.Color("84")  // Mint Green
-	colorDiffDelBg  = lipgloss.Color("52")  // Dark Red
-	colorDiffDelFg  = lipgloss.Color("203") // Coral Red
-	colorDiffHdrFg  = lipgloss.Color("117") // Light Cyan
-	colorDiffInfoFg = lipgloss.Color("245") // Subtle Gray
+	// Base text - conversation text and titles
+	colorFg = lipgloss.CompleteColor{TrueColor: "#E6EDF3", ANSI256: "252", ANSI: "15"}
+	// Secondary - metadata, hints, and footer
+	colorMuted = lipgloss.CompleteColor{TrueColor: "#7D8590", ANSI256: "244", ANSI: "8"}
+	// Subtle - horizontal dividers and input frame
+	colorSubtle = lipgloss.CompleteColor{TrueColor: "#30363D", ANSI256: "238", ANSI: "8"}
+	// Accent - user prompt ❯ and identity ●
+	colorAccent = lipgloss.CompleteColor{TrueColor: "#E3A857", ANSI256: "215", ANSI: "3"}
+	// Assistant - agent response ● and diff +
+	colorAssistant = lipgloss.CompleteColor{TrueColor: "#4ADE80", ANSI256: "78", ANSI: "2"}
+	// Danger - errors, warnings, and diff -
+	colorDanger = lipgloss.CompleteColor{TrueColor: "#F87171", ANSI256: "203", ANSI: "1"}
 )
 
-// Lipgloss styles for header, cards, diffs, and footer.
+// Glyphs with ASCII fallbacks.
+const (
+	glyphIdentity      = "●"
+	glyphIdentityASCII = "*"
+	glyphPrompt        = "❯"
+	glyphPromptASCII   = ">"
+	glyphBar           = "│"
+	glyphBarASCII      = "|"
+	glyphDivider       = "─"
+	glyphDividerASCII  = "-"
+)
+
 var (
-	// Header bar styles
-	headerBarStyle = lipgloss.NewStyle().
-			Padding(0, 1).
-			Background(colorDarkBg)
+	symIdentity = glyphIdentity
+	symPrompt   = glyphPrompt
+	symBar      = glyphBar
+	symDivider  = glyphDivider
+)
 
-	headerLogoStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("15")).
-			Background(colorBrandPrimary).
-			Padding(0, 1)
+func init() {
+	if os.Getenv("TERM") == "dumb" || os.Getenv("NABD_ASCII") == "1" {
+		symIdentity = glyphIdentityASCII
+		symPrompt = glyphPromptASCII
+		symBar = glyphBarASCII
+		symDivider = glyphDividerASCII
+	}
+}
 
-	headerPillStyle = lipgloss.NewStyle().
-			Padding(0, 1).
-			Foreground(lipgloss.Color("255")).
-			Background(lipgloss.Color("239")).
-			Bold(true)
+// Lipgloss styles for quiet minimal agent UI.
+var (
+	// Header styles (quiet hairline header)
+	headerIdentityStyle = lipgloss.NewStyle().Foreground(colorAccent)
+	headerTitleStyle    = lipgloss.NewStyle().Foreground(colorFg).Bold(true)
+	headerMutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
+	headerDividerStyle  = lipgloss.NewStyle().Foreground(colorSubtle)
 
-	headerPillSuccessStyle = lipgloss.NewStyle().
-				Padding(0, 1).
-				Foreground(lipgloss.Color("16")).
-				Background(colorSuccess).
-				Bold(true)
+	// Stream styles (borderless, quiet)
+	userPrefixStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	userTextStyle   = lipgloss.NewStyle().Foreground(colorFg)
+	asstPrefixStyle = lipgloss.NewStyle().Foreground(colorAssistant).Bold(true)
+	toolBarStyle    = lipgloss.NewStyle().Foreground(colorMuted)
+	toolNameStyle   = lipgloss.NewStyle().Foreground(colorFg).Bold(true)
+	toolHintStyle   = lipgloss.NewStyle().Foreground(colorMuted)
+	errorBarStyle   = lipgloss.NewStyle().Foreground(colorDanger)
+	errorLabelStyle = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
+	errorTextStyle  = lipgloss.NewStyle().Foreground(colorFg)
+	localBarStyle   = lipgloss.NewStyle().Foreground(colorSubtle)
+	localTextStyle  = lipgloss.NewStyle().Foreground(colorMuted)
 
-	headerPillWarnStyle = lipgloss.NewStyle().
-				Padding(0, 1).
-				Foreground(lipgloss.Color("16")).
-				Background(colorWarning).
-				Bold(true)
+	// Markdown-lite styling (no filled backgrounds)
+	mdHeading1Style   = lipgloss.NewStyle().Bold(true).Foreground(colorFg).MarginTop(1)
+	mdHeading2Style   = lipgloss.NewStyle().Bold(true).Foreground(colorFg).MarginTop(1)
+	mdHeading3Style   = lipgloss.NewStyle().Bold(true).Foreground(colorMuted).MarginTop(1)
+	mdBulletStyle     = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	mdInlineCodeStyle = lipgloss.NewStyle().Foreground(colorAccent)
+	mdCodeBlockStyle  = lipgloss.NewStyle().Foreground(colorFg).Padding(0, 1)
+	mdCodeLangStyle   = lipgloss.NewStyle().Foreground(colorMuted).Italic(true)
 
-	headerMetricStyle = lipgloss.NewStyle().
-				Foreground(colorLightMuted).
-				Background(lipgloss.Color("238")).
-				Padding(0, 1)
+	// Diff display styles (quiet foregrounds, no filled colored backgrounds)
+	diffAddStyle    = lipgloss.NewStyle().Foreground(colorAssistant)
+	diffDelStyle    = lipgloss.NewStyle().Foreground(colorDanger)
+	diffHeaderStyle = lipgloss.NewStyle().Foreground(colorMuted).Bold(true)
+	diffInfoStyle   = lipgloss.NewStyle().Foreground(colorMuted)
 
-	// Card styles
-	cardBaseStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			Padding(0, 1).
-			MarginBottom(1)
-
-	userCardStyle = cardBaseStyle.
-			BorderForeground(colorUserBorder).
-			Background(colorUserBg)
-
-	asstCardStyle = cardBaseStyle.
-			BorderForeground(colorAsstBorder).
-			Background(colorAsstBg)
-
-	toolCardStyle = cardBaseStyle.
-			BorderForeground(colorToolBorder).
-			Background(colorToolBg)
-
-	errorCardStyle = cardBaseStyle.
-			BorderForeground(colorErrorBorder).
-			Background(colorErrorBg)
-
-	localCardStyle = cardBaseStyle.
-			BorderForeground(colorLocalBorder).
-			Background(colorLocalBg)
-
-	// Markdown-lite styling
-	mdHeading1Style = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(colorBrandPrimary).
-			MarginTop(1).
-			MarginBottom(0)
-
-	mdHeading2Style = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(colorInfo).
-			MarginTop(1).
-			MarginBottom(0)
-
-	mdHeading3Style = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(colorLightMuted).
-			MarginTop(1).
-			MarginBottom(0)
-
-	mdBulletStyle = lipgloss.NewStyle().
-			Foreground(colorBrandPrimary).
-			Bold(true)
-
-	mdInlineCodeStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("222")).
-				Background(lipgloss.Color("237")).
-				Padding(0, 1)
-
-	mdCodeBlockStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("240")).
-				Background(lipgloss.Color("235")).
-				Padding(0, 1).
-				Margin(0, 0, 1, 0)
-
-	mdCodeLangStyle = lipgloss.NewStyle().
-			Foreground(colorMuted).
-			Italic(true)
-
-	// Diff display styles
-	diffAddStyle = lipgloss.NewStyle().
-			Foreground(colorDiffAddFg).
-			Background(colorDiffAddBg)
-
-	diffDelStyle = lipgloss.NewStyle().
-			Foreground(colorDiffDelFg).
-			Background(colorDiffDelBg)
-
-	diffHeaderStyle = lipgloss.NewStyle().
-			Foreground(colorDiffHdrFg).
-			Bold(true)
-
-	diffInfoStyle = lipgloss.NewStyle().
-			Foreground(colorDiffInfoFg)
-
-	// Advisory credential warning alert box
+	// Advisory credential warning alert box (only boxed item in stream)
 	advisoryAlertBoxStyle = lipgloss.NewStyle().
-				Border(lipgloss.ThickBorder()).
-				BorderForeground(colorWarning).
-				Background(lipgloss.Color("234")).
-				Foreground(lipgloss.Color("220")).
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorDanger).
+				Foreground(colorDanger).
 				Padding(0, 1).
 				MarginBottom(1).
 				Bold(true)
 
+	// Composer frame style
+	composerBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorSubtle)
+
 	// Footer styles
-	footerBarStyle = lipgloss.NewStyle().
-			Background(colorDarkBg).
-			Padding(0, 1)
+	footerStatusStyle      = lipgloss.NewStyle().Foreground(colorMuted)
+	footerKeyHintStyle     = lipgloss.NewStyle().Foreground(colorMuted)
+	scrollPercentStyle     = lipgloss.NewStyle().Foreground(colorMuted)
+	scrollBottomReadyStyle = lipgloss.NewStyle().Foreground(colorAssistant)
 
-	footerStatusStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("255")).
-				Bold(true)
-
-	footerKeyHintStyle = lipgloss.NewStyle().
-				Foreground(colorMuted)
-
-	footerKeyPillStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("255")).
-				Background(lipgloss.Color("240")).
-				Padding(0, 1).
-				Bold(true)
-
-	scrollPercentStyle = lipgloss.NewStyle().
-				Foreground(colorInfo).
-				Bold(true)
-
-	scrollBottomReadyStyle = lipgloss.NewStyle().
-				Foreground(colorSuccess).
-				Bold(true)
+	// Approval prompt style
+	approvalPromptStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
 )
