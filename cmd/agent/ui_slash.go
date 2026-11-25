@@ -35,6 +35,10 @@ var slashCommands = []slashCommand{
 		Description: "Copy last reply (/copy code | /copy tool)",
 	},
 	{
+		Name:        "compact",
+		Description: "Compact old tool outputs to free memory",
+	},
+	{
 		Name:        "help",
 		Description: "Show available commands and keyboard shortcuts",
 	},
