@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -105,6 +106,7 @@ type uiModel struct {
 	provider          string
 	searchEnabled     bool
 	autoApprove       AutoApproveMode
+	clipboardFn       func(ctx context.Context, text string, target copyTarget) (clipboardResult, error)
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -232,6 +234,11 @@ func (m uiModel) Init() tea.Cmd {
 type llmResponseMsg struct{ assistantMsg Message }
 type toolExecutedMsg struct{ toolMsg Message }
 type errorMsg struct{ err error }
+type clipboardResultMsg struct {
+	result clipboardResult
+	err    error
+	target copyTarget
+}
 
 func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -554,6 +561,30 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingTools = nil
 		m.status = "Error"
 		m.messages = append(m.messages, Message{Role: "error", Content: msg.err.Error()})
+		m.refresh()
+		return m, nil
+	case clipboardResultMsg:
+		if msg.err != nil {
+			m.status = "Clipboard error"
+			m.messages = append(m.messages, Message{Role: "local", Content: "Clipboard error: " + msg.err.Error()})
+		} else {
+			targetDesc := "last reply"
+			if msg.target == targetCode {
+				targetDesc = "code block"
+			} else if msg.target == targetTool {
+				targetDesc = "tool output"
+			}
+			var statusText string
+			if msg.result.Unconfirmed {
+				statusText = fmt.Sprintf("Clipboard request sent via OSC 52 (%d bytes); terminal acceptance not confirmed", msg.result.Bytes)
+			} else if msg.result.RemoteSSH {
+				statusText = fmt.Sprintf("Copied %s (%d bytes via %s [remote SSH])", targetDesc, msg.result.Bytes, msg.result.Method)
+			} else {
+				statusText = fmt.Sprintf("Copied %s (%d bytes via %s)", targetDesc, msg.result.Bytes, msg.result.Method)
+			}
+			m.status = statusText
+			m.messages = append(m.messages, Message{Role: "local", Content: statusText})
+		}
 		m.refresh()
 		return m, nil
 	}
@@ -989,6 +1020,9 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, nil
 	}
+	if input == "/copy" || input == "/copy code" || input == "/copy tool" || strings.HasPrefix(input, "/copy ") {
+		return m.handleCopyCommand(input)
+	}
 
 	m.messages = append(m.messages, Message{Role: "user", Content: input})
 	m.clearInput()
@@ -1036,6 +1070,64 @@ func (m *uiModel) handleAutoCommand(arg string) (tea.Model, tea.Cmd) {
 	m.messages = append(m.messages, Message{Role: "local", Content: content})
 	m.refresh()
 	return *m, nil
+}
+
+func (m *uiModel) handleCopyCommand(input string) (tea.Model, tea.Cmd) {
+	m.clearInput()
+	var target copyTarget
+	switch input {
+	case "/copy":
+		target = targetReply
+	case "/copy code":
+		target = targetCode
+	case "/copy tool":
+		target = targetTool
+	default:
+		m.messages = append(m.messages, Message{Role: "local", Content: "Usage: /copy, /copy code, or /copy tool"})
+		m.refresh()
+		return *m, nil
+	}
+
+	text, err := findCopyContent(m.messages, target)
+	if err != nil {
+		userMsg := err.Error()
+		switch {
+		case errors.Is(err, errNothingToCopy):
+			userMsg = "Nothing to copy yet."
+		case errors.Is(err, errNoCodeBlock):
+			userMsg = "No code block found in last reply."
+		case errors.Is(err, errNoToolOutput):
+			userMsg = "No tool output to copy."
+		case errors.Is(err, errInvalidUsage):
+			userMsg = "Usage: /copy, /copy code, or /copy tool"
+		}
+		m.messages = append(m.messages, Message{Role: "local", Content: userMsg})
+		m.refresh()
+		return *m, nil
+	}
+
+	if len(text) > maxClipboardSize {
+		m.messages = append(m.messages, Message{Role: "local", Content: "Text exceeds clipboard limit (256 KiB)"})
+		m.refresh()
+		return *m, nil
+	}
+
+	m.status = "Copying to clipboard..."
+	fn := m.clipboardFn
+	if fn == nil {
+		fn = func(ctx context.Context, txt string, _ copyTarget) (clipboardResult, error) {
+			return copyToClipboard(ctx, txt, detectSystemEnv(), nil)
+		}
+	}
+
+	return *m, m.lifecycle.wrap(func() tea.Msg {
+		res, err := fn(m.lifecycle.ctx, text, target)
+		return clipboardResultMsg{
+			result: res,
+			err:    err,
+			target: target,
+		}
+	})
 }
 
 func (m *uiModel) formatStatus() string {
