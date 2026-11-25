@@ -24,8 +24,11 @@ npm install -g rea-agents@6.10.1
 
 ### حساب بصمة التجزئة (SHA-256):
 - **على Linux / Termux:**
+  > [!TIP]
+  > عند تثبيت الحزم عبر `npm install -g`، يكون مسار `which` غالباً رابطاً رمزياً (Symlink). نظراً لأن NabdCoder يرفض الروابط الرمزية أمنياً، استخدم `readlink -f` لحل المسار الحقيقي قبل حساب البصمة:
   ```bash
-  sha256sum $(which rea-mcp || which rea)
+  REA_BIN="$(readlink -f "$(which rea-mcp || which rea)")"
+  sha256sum "$REA_BIN"
   ```
 - **على Windows (PowerShell):**
   ```powershell
@@ -43,18 +46,25 @@ npm install -g rea-agents@6.10.1
 
 | المتغير | النوع | الحالة | الوصف |
 | :--- | :--- | :--- | :--- |
-| `NABD_REA_MCP_BIN` | مسار مطلق | إلزامي للتفعيل | المسار الكامل للملف التنفيذي لخادم REA. يرفض النظام أي مسار نسبي. |
+| `NABD_REA_MCP_BIN` | مسار مطلق | إلزامي للتفعيل | المسار الحقيقي الكامل للملف التنفيذي لخادم REA (يجب حل الروابط الرمزية). يرفض النظام أي مسار نسبي. |
 | `NABD_REA_MCP_SHA256` | نص ست عشري (64 محرفاً) | إلزامي | بصمة SHA-256 للملف التنفيذي لمطابقتها قبل التشغيل. |
 | `NABD_REA_TARGET_DIR` | مسار مطلق | إلزامي | المسار الكامل لمجلد العينات المراد تحليلها (يُربط كـ read-only فقط). |
-| `NABD_REA_MCP_GUARD` | مسار مطلق | اختياري/تلقائي | مسار حارس العمليات `nabd-mcp-guard` (يُكتشف تلقائياً بجانب الثنائي). |
+| `NABD_REA_MCP_GUARD` | مسار مطلق | اختياري/تلقائي | مسار حارس العمليات `nabd-mcp-guard` (يُكتشف تلقائياً بجانب الثنائي إذا كان موجوداً). |
 | `NABD_REA_MCP_GUARD_SHA256` | نص ست عشري | اختياري | بصمة SHA-256 لحارس العمليات للتحقق الإضافي. |
 
 ### مثال الإعداد والتشغيل (Linux / Bash):
 ```bash
-export NABD_REA_MCP_BIN="/usr/local/bin/rea"
-export NABD_REA_MCP_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+# 1. تحديد المسار الحقيقي لـ REA وحساب بصمته
+REA_BIN="$(readlink -f "$(which rea-mcp || which rea)")"
+export NABD_REA_MCP_BIN="$REA_BIN"
+export NABD_REA_MCP_SHA256="$(sha256sum "$REA_BIN" | awk '{print $1}')"
 export NABD_REA_TARGET_DIR="/home/user/analysis/samples"
 
+# 2. في حال لم يكن nabd-mcp-guard في المسار الافتراضي بجانب الوكيل
+# export NABD_REA_MCP_GUARD="/path/to/nabd-mcp-guard"
+# export NABD_REA_MCP_GUARD_SHA256="$(sha256sum "$NABD_REA_MCP_GUARD" | awk '{print $1}')"
+
+# 3. تشغيل الوكيل
 ./nabd-agent
 ```
 
