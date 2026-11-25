@@ -123,6 +123,13 @@ func TestFormatToolSummary(t *testing.T) {
 	if !strings.Contains(sumVerify, "go_verify(./...) -> PASS") {
 		t.Fatalf("unexpected go_verify summary: %s", sumVerify)
 	}
+
+	// repo_map
+	repoMapResult := "=== REPO MAP (path: ., scanned: 12 files, symbols: 45, tests: 6) ===\nmodule github.com/amiraq1/nabd\n"
+	sumRepoMap := formatToolSummary("repo_map", `{"path":"."}`, repoMapResult)
+	if sumRepoMap != "repo_map(.) -> 12 files, 45 symbols (Ctrl+O)" {
+		t.Fatalf("unexpected repo_map summary: %s", sumRepoMap)
+	}
 }
 
 func TestTrimHistoryKeepsToolCallsPaired(t *testing.T) {

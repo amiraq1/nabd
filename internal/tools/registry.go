@@ -1201,6 +1201,16 @@ func (r *Registry) registerOtherTools() {
 		},
 	}
 
+	r.handlers["repo_map"] = ToolSpec{
+		Name:        "repo_map",
+		Description: "Generate a compact, deterministic structural map of Go packages, types, methods, and functions in the workspace using Go AST. Read-only and resource-bounded (12 KiB cap).",
+		ReadOnly:    true,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative directory or file path to map (default .)"},"include_unexported":{"type":"boolean","description":"Include unexported symbols (default false)"},"max_files":{"type":"integer","minimum":1,"maximum":400,"description":"Maximum number of non-test Go files to analyze (default 100, max 400)"}}}`),
+		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return r.repoMap(ctx, args)
+		},
+	}
+
 	r.handlers["mcp_call"] = ToolSpec{
 		Name:        "mcp_call",
 		Description: "Call a tool on an external MCP server via stdio. Starts the server process, calls the tool, then closes it.",
