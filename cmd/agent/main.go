@@ -773,6 +773,12 @@ func (m *uiModel) formatStatus() string {
 		sandboxStr = "Proven (active execution restrictions)"
 	}
 	fmt.Fprintf(&b, "Sandbox: %s\n", sandboxStr)
+	if m.registry != nil && m.registry.IsREAEnabled() {
+		bin, target := m.registry.READetails()
+		fmt.Fprintf(&b, "REA Reverse Engineering: Enabled (bin: %s, target: %s)\n", bin, target)
+	} else {
+		b.WriteString("REA Reverse Engineering: Disabled (opt-in via NABD_REA_MCP_BIN)\n")
+	}
 	fmt.Fprintf(&b, "Iteration: %d / %d\n", m.iteration, m.maxIterations)
 	fmt.Fprintf(&b, "Context tokens: ~%d / %d (~%.1f%%)\n", tokens, budget, float64(tokens)*100.0/float64(budget))
 	fmt.Fprintf(&b, "Messages in history: %d\n", len(m.messages))
@@ -813,6 +819,9 @@ func (m *uiModel) formatTools() string {
 		if i < len(tList)-1 {
 			b.WriteString("\n")
 		}
+	}
+	if m.registry != nil && m.registry.IsREAEnabled() {
+		b.WriteString("\n\n• REA Reverse Engineering tools are active via mcp_call(command: \"rea\", tool: \"<name>\")")
 	}
 	return b.String()
 }

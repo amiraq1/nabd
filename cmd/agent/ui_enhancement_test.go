@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -360,5 +362,93 @@ func TestAdvisoryAlertBoxInDisclosure(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "ADVISORY WARNING") {
 		t.Fatalf("expected advisory alert box in disclosure view, got:\n%s", view)
+	}
+}
+
+func TestFormatToolSummaryREA(t *testing.T) {
+	// REA command formatting
+	summary := formatToolSummary("mcp_call", `{"command":"rea","tool":"binary_overview"}`, "ELF 64-bit LSB executable")
+	expected := "rea:binary_overview(...) -> 25 bytes"
+	if summary != expected {
+		t.Fatalf("expected %q, got %q", expected, summary)
+	}
+
+	// Non-REA command formatting
+	summaryOther := formatToolSummary("mcp_call", `{"command":"other_srv","tool":"lookup"}`, "result text")
+	expectedOther := "mcp_call(other_srv:lookup) -> 11 bytes"
+	if summaryOther != expectedOther {
+		t.Fatalf("expected %q, got %q", expectedOther, summaryOther)
+	}
+
+	// REA with omitted tool field fallback
+	summaryNoTool := formatToolSummary("mcp_call", `{"command":"rea"}`, "res")
+	expectedNoTool := "rea:tool(...) -> 3 bytes"
+	if summaryNoTool != expectedNoTool {
+		t.Fatalf("expected %q, got %q", expectedNoTool, summaryNoTool)
+	}
+}
+
+func TestFormatStatusAndToolsWithREA(t *testing.T) {
+	// 1. REA Disabled by default
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	status := m.formatStatus()
+	if !strings.Contains(status, "REA Reverse Engineering: Disabled (opt-in via NABD_REA_MCP_BIN)") {
+		t.Fatalf("expected disabled REA status, got:\n%s", status)
+	}
+	toolsOut := m.formatTools()
+	if strings.Contains(toolsOut, "REA Reverse Engineering tools are active") {
+		t.Fatalf("expected tools list NOT to contain REA note when disabled, got:\n%s", toolsOut)
+	}
+
+	// 2. REA Enabled via env vars
+	binFile := filepath.Join(dir, "rea-mcp.exe")
+	if err := os.WriteFile(binFile, []byte("#!/bin/sh\necho test\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256Hex(string([]byte("#!/bin/sh\necho test\n")))
+
+	guardFile := filepath.Join(dir, "mock-guard.exe")
+	if err := os.WriteFile(guardFile, []byte("#!/bin/sh\nexec \"$@\"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	guardHash := sha256Hex(string([]byte("#!/bin/sh\nexec \"$@\"\n")))
+
+	targetDir := t.TempDir()
+
+	t.Setenv("NABD_REA_MCP_BIN", binFile)
+	t.Setenv("NABD_REA_MCP_SHA256", hash)
+	t.Setenv("NABD_REA_MCP_GUARD", guardFile)
+	t.Setenv("NABD_REA_MCP_GUARD_SHA256", guardHash)
+	t.Setenv("NABD_REA_TARGET_DIR", targetDir)
+
+	regREA, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = regREA.Close() })
+
+	if !regREA.IsREAEnabled() {
+		t.Fatal("expected REA to be enabled on regREA")
+	}
+
+	mREA := initialModel(regREA, &mockClient{})
+	statusREA := mREA.formatStatus()
+	if !strings.Contains(statusREA, "REA Reverse Engineering: Enabled") {
+		t.Fatalf("expected enabled REA in status, got:\n%s", statusREA)
+	}
+	if !strings.Contains(statusREA, binFile) || !strings.Contains(statusREA, targetDir) {
+		t.Fatalf("expected bin and target in status, got:\n%s", statusREA)
+	}
+
+	toolsOutREA := mREA.formatTools()
+	if !strings.Contains(toolsOutREA, "REA Reverse Engineering tools are active via mcp_call(command: \"rea\", tool: \"<name>\")") {
+		t.Fatalf("expected tools list to contain REA active note, got:\n%s", toolsOutREA)
 	}
 }
