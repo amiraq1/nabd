@@ -259,7 +259,11 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlO {
-			m.expandLastTool = !m.expandLastTool
+			if visibleExpandableToolIndex(m.messages) >= 0 {
+				m.expandLastTool = !m.expandLastTool
+			} else {
+				m.expandLastTool = false
+			}
 			m.refresh()
 			return m, nil
 		}
@@ -786,23 +790,11 @@ func (m *uiModel) refresh() {
 		m.refreshDisclosure()
 		return
 	}
-	lastToolIdx := -1
-	for i := len(m.messages) - 1; i >= 0; i-- {
-		if m.messages[i].Role == "tool" {
-			lastToolIdx = i
-			break
-		}
+	content := renderMessages(m.messages, m.viewport.Width, m.expandLastTool)
+	if content != "" {
+		content += "\n\n"
 	}
-
-	var b strings.Builder
-	for i, msg := range m.messages {
-		if msg.Role == "system" {
-			continue
-		}
-		card := renderMessageCard(msg, m.viewport.Width, i == lastToolIdx, m.expandLastTool)
-		b.WriteString(card + "\n\n")
-	}
-	m.viewport.SetContent(b.String())
+	m.viewport.SetContent(content)
 	m.viewport.GotoBottom()
 }
 

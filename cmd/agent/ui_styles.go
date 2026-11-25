@@ -33,20 +33,70 @@ const (
 	glyphBarASCII      = "|"
 	glyphDivider       = "─"
 	glyphDividerASCII  = "-"
+	glyphCheck         = "✓"
+	glyphCheckASCII    = "+"
+	glyphCross         = "✗"
+	glyphCrossASCII    = "x"
+	glyphEllipsis      = "…"
+	glyphEllipsisASCII = "..."
 )
 
 var (
 	symIdentity = glyphIdentity
 	symPrompt   = glyphPrompt
-	symBar      = glyphBar
 	symDivider  = glyphDivider
 )
 
+func isASCIIMode() bool {
+	return os.Getenv("TERM") == "dumb" || os.Getenv("NABD_ASCII") == "1"
+}
+
+func activeIdentityGlyph() string {
+	if isASCIIMode() {
+		return glyphIdentityASCII
+	}
+	return glyphIdentity
+}
+
+func activePromptGlyph() string {
+	if isASCIIMode() {
+		return glyphPromptASCII
+	}
+	return glyphPrompt
+}
+
+func activeBarGlyph() string {
+	if isASCIIMode() {
+		return glyphBarASCII
+	}
+	return glyphBar
+}
+
+func activeCheckGlyph() string {
+	if isASCIIMode() {
+		return glyphCheckASCII
+	}
+	return glyphCheck
+}
+
+func activeCrossGlyph() string {
+	if isASCIIMode() {
+		return glyphCrossASCII
+	}
+	return glyphCross
+}
+
+func activeEllipsisGlyph() string {
+	if isASCIIMode() {
+		return glyphEllipsisASCII
+	}
+	return glyphEllipsis
+}
+
 func init() {
-	if os.Getenv("TERM") == "dumb" || os.Getenv("NABD_ASCII") == "1" {
+	if isASCIIMode() {
 		symIdentity = glyphIdentityASCII
 		symPrompt = glyphPromptASCII
-		symBar = glyphBarASCII
 		symDivider = glyphDividerASCII
 	}
 }
@@ -62,17 +112,20 @@ var (
 	headerAutoAllStyle      = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
 
 	// Stream styles (borderless, quiet)
-	userPrefixStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	userTextStyle   = lipgloss.NewStyle().Foreground(colorFg)
-	asstPrefixStyle = lipgloss.NewStyle().Foreground(colorAssistant).Bold(true)
-	toolBarStyle    = lipgloss.NewStyle().Foreground(colorMuted)
-	toolNameStyle   = lipgloss.NewStyle().Foreground(colorFg).Bold(true)
-	toolHintStyle   = lipgloss.NewStyle().Foreground(colorMuted)
-	errorBarStyle   = lipgloss.NewStyle().Foreground(colorDanger)
-	errorLabelStyle = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
-	errorTextStyle  = lipgloss.NewStyle().Foreground(colorFg)
-	localBarStyle   = lipgloss.NewStyle().Foreground(colorSubtle)
-	localTextStyle  = lipgloss.NewStyle().Foreground(colorMuted)
+	userPrefixStyle  = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	userTextStyle    = lipgloss.NewStyle().Foreground(colorFg)
+	asstPrefixStyle  = lipgloss.NewStyle().Foreground(colorAssistant).Bold(true)
+	toolBarStyle     = lipgloss.NewStyle().Foreground(colorMuted)
+	toolNameStyle    = lipgloss.NewStyle().Foreground(colorFg).Bold(true)
+	toolHintStyle    = lipgloss.NewStyle().Foreground(colorMuted)
+	toolSuccessStyle = lipgloss.NewStyle().Foreground(colorAssistant)
+	toolErrorStyle   = lipgloss.NewStyle().Foreground(colorDanger)
+	toolPendingStyle = lipgloss.NewStyle().Foreground(colorMuted)
+	errorBarStyle    = lipgloss.NewStyle().Foreground(colorDanger)
+	errorLabelStyle  = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
+	errorTextStyle   = lipgloss.NewStyle().Foreground(colorFg)
+	localBarStyle    = lipgloss.NewStyle().Foreground(colorSubtle)
+	localTextStyle   = lipgloss.NewStyle().Foreground(colorMuted)
 
 	// Markdown-lite styling (no filled backgrounds)
 	mdHeading1Style   = lipgloss.NewStyle().Bold(true).Foreground(colorFg).MarginTop(1)

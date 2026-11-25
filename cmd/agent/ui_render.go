@@ -6,7 +6,9 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -341,11 +343,11 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 			idx := strings.Index(result, "scanned:")
 			if idx >= 0 {
 				if _, err := fmt.Sscanf(result[idx:], "scanned: %d files, symbols: %d", &scannedFiles, &symbols); err == nil {
-					return fmt.Sprintf("repo_map(%s) -> %d files, %d symbols (Ctrl+O)", reqPath, scannedFiles, symbols)
+					return fmt.Sprintf("repo_map(%s) -> %d files, %d symbols", reqPath, scannedFiles, symbols)
 				}
 			}
 		}
-		return fmt.Sprintf("repo_map(%s) -> (Ctrl+O)", reqPath)
+		return fmt.Sprintf("repo_map(%s) -> %d bytes", reqPath, len(result))
 
 	case "go_verify":
 		var p struct {
@@ -568,6 +570,104 @@ func formatInlineMarkdown(s string) string {
 	return s
 }
 
+// splitByVisualWidth splits a single line (potentially containing ANSI CSI
+// sequences and wide Unicode runes) into chunks each at most maxWidth columns
+// wide according to lipgloss.Width, preserving active SGR styling across chunks.
+func splitByVisualWidth(s string, maxWidth int) []string {
+	if maxWidth <= 0 {
+		maxWidth = 1
+	}
+	if lipgloss.Width(s) <= maxWidth {
+		return []string{s}
+	}
+
+	var chunks []string
+	var cur strings.Builder
+	curWidth := 0
+	var activeSGR strings.Builder
+
+	flush := func() {
+		if cur.Len() == 0 {
+			return
+		}
+		if activeSGR.Len() > 0 {
+			cur.WriteString("\x1b[0m")
+		}
+		chunks = append(chunks, cur.String())
+		cur.Reset()
+		if activeSGR.Len() > 0 {
+			cur.WriteString(activeSGR.String())
+		}
+		curWidth = 0
+	}
+
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			end := i + 2
+			for end < len(s) && !(s[end] >= 0x40 && s[end] <= 0x7e) {
+				end++
+			}
+			if end < len(s) {
+				end++
+			}
+			seq := s[i:end]
+			cur.WriteString(seq)
+			if strings.HasSuffix(seq, "m") {
+				if seq == "\x1b[0m" || seq == "\x1b[m" {
+					activeSGR.Reset()
+				} else {
+					activeSGR.WriteString(seq)
+				}
+			}
+			i = end
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(s[i:])
+		rs := s[i : i+size]
+		rw := lipgloss.Width(rs)
+		if curWidth > 0 && curWidth+rw > maxWidth {
+			flush()
+		}
+		cur.WriteString(rs)
+		curWidth += rw
+		i += size
+		_ = r
+	}
+	if cur.Len() > 0 {
+		chunks = append(chunks, cur.String())
+	}
+	return chunks
+}
+
+// updateActiveSGR scans s for CSI SGR sequences (\x1b[...m) and returns the
+// updated active SGR prefix.
+func updateActiveSGR(s, activeSGR string) string {
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			end := i + 2
+			for end < len(s) && !(s[end] >= 0x40 && s[end] <= 0x7e) {
+				end++
+			}
+			if end < len(s) {
+				end++
+			}
+			seq := s[i:end]
+			if strings.HasSuffix(seq, "m") {
+				if seq == "\x1b[0m" || seq == "\x1b[m" {
+					activeSGR = ""
+				} else {
+					activeSGR += seq
+				}
+			}
+			i = end
+			continue
+		}
+		i++
+	}
+	return activeSGR
+}
+
 // wrapIndented splits and wraps text such that the first line is prefixed with prefix
 // and all subsequent lines are prefixed with indent, ensuring no line exceeds totalWidth.
 func wrapIndented(prefix, indent, text string, totalWidth int) string {
@@ -575,18 +675,28 @@ func wrapIndented(prefix, indent, text string, totalWidth int) string {
 		totalWidth = 80
 	}
 	pw := lipgloss.Width(prefix)
-	avail := max(10, totalWidth-pw)
+	iw := lipgloss.Width(indent)
+	avail := max(1, totalWidth-max(pw, iw))
 
 	rawLines := strings.Split(text, "\n")
 	var wrappedLines []string
+	activeSGR := ""
 
 	for _, rl := range rawLines {
 		if lipgloss.Width(rl) <= avail {
-			wrappedLines = append(wrappedLines, rl)
+			line := rl
+			if activeSGR != "" && !strings.HasPrefix(line, "\x1b[") {
+				line = activeSGR + line
+			}
+			activeSGR = updateActiveSGR(rl, activeSGR)
+			if activeSGR != "" && !strings.HasSuffix(line, "\x1b[0m") {
+				line += "\x1b[0m"
+			}
+			wrappedLines = append(wrappedLines, line)
 			continue
 		}
 
-		// Word wrap line to avail columns
+		// Word wrap line to avail columns while preserving active SGR across breaks.
 		words := strings.Fields(rl)
 		if len(words) == 0 {
 			wrappedLines = append(wrappedLines, "")
@@ -594,41 +704,66 @@ func wrapIndented(prefix, indent, text string, totalWidth int) string {
 		}
 
 		var current strings.Builder
+		if activeSGR != "" {
+			current.WriteString(activeSGR)
+		}
+
+		emitCurrent := func() {
+			line := current.String()
+			if activeSGR != "" && !strings.HasSuffix(line, "\x1b[0m") {
+				line += "\x1b[0m"
+			}
+			wrappedLines = append(wrappedLines, line)
+			current.Reset()
+			if activeSGR != "" {
+				current.WriteString(activeSGR)
+			}
+		}
+
 		for _, w := range words {
-			if current.Len() == 0 {
+			if lipgloss.Width(current.String()) == 0 {
 				if lipgloss.Width(w) > avail {
-					// Word itself is wider than available width: break into chunks
-					runes := []rune(w)
-					for len(runes) > 0 {
-						chunkLen := min(avail, len(runes))
-						wrappedLines = append(wrappedLines, string(runes[:chunkLen]))
-						runes = runes[chunkLen:]
+					parts := splitByVisualWidth(activeSGR+w, avail)
+					for k := 0; k < len(parts)-1; k++ {
+						wrappedLines = append(wrappedLines, parts[k])
 					}
+					last := parts[len(parts)-1]
+					current.Reset()
+					current.WriteString(last)
+					activeSGR = updateActiveSGR(w, activeSGR)
 				} else {
 					current.WriteString(w)
+					activeSGR = updateActiveSGR(w, activeSGR)
 				}
 				continue
 			}
 
 			if lipgloss.Width(current.String())+1+lipgloss.Width(w) <= avail {
 				current.WriteString(" " + w)
+				activeSGR = updateActiveSGR(w, activeSGR)
 			} else {
-				wrappedLines = append(wrappedLines, current.String())
-				current.Reset()
+				emitCurrent()
 				if lipgloss.Width(w) > avail {
-					runes := []rune(w)
-					for len(runes) > 0 {
-						chunkLen := min(avail, len(runes))
-						wrappedLines = append(wrappedLines, string(runes[:chunkLen]))
-						runes = runes[chunkLen:]
+					parts := splitByVisualWidth(activeSGR+w, avail)
+					for k := 0; k < len(parts)-1; k++ {
+						wrappedLines = append(wrappedLines, parts[k])
 					}
+					last := parts[len(parts)-1]
+					current.Reset()
+					current.WriteString(last)
+					activeSGR = updateActiveSGR(w, activeSGR)
 				} else {
 					current.WriteString(w)
+					activeSGR = updateActiveSGR(w, activeSGR)
 				}
 			}
 		}
-		if current.Len() > 0 {
-			wrappedLines = append(wrappedLines, current.String())
+		if lipgloss.Width(current.String()) > 0 || current.Len() > len(activeSGR) {
+			line := current.String()
+			if activeSGR != "" && !strings.HasSuffix(line, "\x1b[0m") {
+				line += "\x1b[0m"
+			}
+			wrappedLines = append(wrappedLines, line)
 		}
 	}
 
@@ -644,6 +779,329 @@ func wrapIndented(prefix, indent, text string, totalWidth int) string {
 	return b.String()
 }
 
+const (
+	toolGroupFoldThreshold = 5
+	toolGroupKeepVisible   = 3
+)
+
+// isToolFailure reports whether a tool message represents a failure, rejection,
+// or blocked action based on reliable control-plane and summary signals.
+func isToolFailure(msg Message) bool {
+	contentPrefixes := []string{
+		"Tool output disclosure rejected",
+		"Tool disclosure blocked",
+		"Tool execution denied",
+		"Rejected by user",
+		"Rejected:",
+		"Action rejected",
+		"Cancelled by user",
+		"Error:",
+	}
+	for _, p := range contentPrefixes {
+		if strings.HasPrefix(msg.Content, p) {
+			return true
+		}
+	}
+
+	displayPrefixes := []string{
+		"Tool output disclosure rejected",
+		"Tool disclosure blocked",
+		"Tool execution denied",
+		"Rejected",
+		"Blocked",
+		"Skipped:",
+		"Approval not recorded",
+		"Error:",
+	}
+	for _, p := range displayPrefixes {
+		if strings.HasPrefix(msg.Display, p) {
+			return true
+		}
+	}
+
+	return strings.Contains(msg.Display, "-> FAIL") ||
+		strings.Contains(msg.Display, "-> Error:") ||
+		strings.Contains(msg.Display, "-> Action rejected")
+}
+
+// isExpandableToolOutput reports whether a tool message has authorized,
+// non-rejected, non-blocked output eligible for Ctrl+O expansion.
+func isExpandableToolOutput(msg Message) bool {
+	if !isEligibleToolOutput(msg) {
+		return false
+	}
+	deniedPrefixes := []string{
+		"Tool execution denied",
+		"Action rejected by user",
+		"Tool output disclosure rejected",
+		"Tool disclosure blocked",
+		"Approval not recorded",
+	}
+	for _, p := range deniedPrefixes {
+		if strings.HasPrefix(msg.Content, p) || strings.HasPrefix(msg.Display, p) {
+			return false
+		}
+	}
+	return true
+}
+
+func toolLinePrefixes(glyphRendered string) (prefix, indent string) {
+	bar := activeBarGlyph()
+	prefix = toolBarStyle.Render(bar+" ") + glyphRendered + " "
+	indent = toolBarStyle.Render(bar + "   ")
+	return prefix, indent
+}
+
+func toolStatusPrefix(msg Message) (prefix, indent string) {
+	if isToolFailure(msg) {
+		return toolLinePrefixes(toolErrorStyle.Render(activeCrossGlyph()))
+	}
+	return toolLinePrefixes(toolSuccessStyle.Render(activeCheckGlyph()))
+}
+
+func toolWaitLine(name string, width int) string {
+	prefix, indent := toolLinePrefixes(toolPendingStyle.Render(activeEllipsisGlyph()))
+	return wrapIndented(prefix, indent, toolPendingStyle.Render(sanitizeForDisplay(name)), width)
+}
+
+func resolveToolName(msg Message, toolNamesByID map[string]string) string {
+	if msg.ToolCallID != "" {
+		if name, ok := toolNamesByID[msg.ToolCallID]; ok && name != "" {
+			return sanitizeForDisplay(name)
+		}
+	}
+	d := strings.TrimSpace(msg.Display)
+	d = strings.TrimPrefix(d, "Rejected ")
+	if idx := strings.Index(d, "("); idx > 0 {
+		candidate := strings.TrimSpace(d[:idx])
+		if candidate != "" && !strings.ContainsAny(candidate, " \t\n") {
+			return sanitizeForDisplay(candidate)
+		}
+	}
+	if idx := strings.Index(d, " ->"); idx > 0 {
+		candidate := strings.TrimSpace(d[:idx])
+		if candidate != "" && !strings.ContainsAny(candidate, " \t\n") {
+			return sanitizeForDisplay(candidate)
+		}
+	}
+	return "tool"
+}
+
+func formatFoldSummary(folded []Message, toolNamesByID map[string]string) string {
+	counts := make(map[string]int)
+	for _, msg := range folded {
+		name := resolveToolName(msg, toolNamesByID)
+		counts[name]++
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if counts[names[i]] != counts[names[j]] {
+			return counts[names[i]] > counts[names[j]]
+		}
+		return names[i] < names[j]
+	})
+
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[name], name))
+	}
+	return fmt.Sprintf("+%d earlier tool calls (%s)", len(folded), strings.Join(parts, ", "))
+}
+
+func renderAssistantMessage(msg Message, resolvedIDs map[string]bool, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+	var b strings.Builder
+	if strings.TrimSpace(msg.Content) != "" {
+		rendered := renderMarkdownSafe(msg.Content, max(10, width-3))
+		prefix := asstPrefixStyle.Render(activeIdentityGlyph() + "  ")
+		indent := "   "
+		b.WriteString(wrapIndented(prefix, indent, rendered, width))
+	}
+	for _, tc := range msg.ToolCalls {
+		if tc.ID != "" && resolvedIDs[tc.ID] {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		if tc.ID != "" {
+			b.WriteString(toolWaitLine(tc.Function.Name, width))
+		} else {
+			bar := toolBarStyle.Render(activeBarGlyph() + "  ")
+			callLine := fmt.Sprintf("call: %s", sanitizeForDisplay(tc.Function.Name))
+			b.WriteString(wrapIndented(bar, bar, toolNameStyle.Render(callLine), width))
+		}
+	}
+	return b.String()
+}
+
+func renderToolMessage(msg Message, width int, showCtrlO bool, expanded bool) string {
+	if width <= 0 {
+		width = 80
+	}
+	disp := msg.Display
+	if disp == "" {
+		disp = truncate(msg.Content, maxUIDisplayChars)
+	}
+	disp = sanitizeForDisplay(disp)
+	prefix, indent := toolStatusPrefix(msg)
+	eligible := isExpandableToolOutput(msg)
+
+	if showCtrlO && expanded && eligible {
+		full := sanitizeForDisplay(msg.Content)
+		if len(full) > 4000 {
+			cut := 4000
+			for cut > 0 && !utf8.RuneStart(full[cut]) {
+				cut--
+			}
+			full = full[:cut] + "\n...[output preview capped at 4000 chars]"
+		}
+		headerText := toolNameStyle.Render(disp) + "  " + toolHintStyle.Render("(Ctrl+O to collapse)")
+		bannerText := "─── Full Output ───"
+		if lipgloss.Width(bannerText) > max(1, width-lipgloss.Width(indent)) {
+			bannerText = truncateEnd(bannerText, max(1, width-lipgloss.Width(indent)))
+		}
+		banner := toolHintStyle.Render(bannerText)
+
+		var b strings.Builder
+		b.WriteString(wrapIndented(prefix, indent, headerText, width) + "\n")
+		b.WriteString(wrapIndented(indent, indent, banner, width))
+
+		fullLines := strings.Split(full, "\n")
+		for _, fl := range fullLines {
+			b.WriteString("\n" + wrapIndented(indent, indent, fl, width))
+		}
+		return b.String()
+	}
+
+	toolLine := toolNameStyle.Render(disp)
+	if showCtrlO && eligible {
+		toolLine += "  " + toolHintStyle.Render("(Ctrl+O)")
+	}
+	return wrapIndented(prefix, indent, toolLine, width)
+}
+
+func collectResolvedToolIDs(messages []Message, assistantIdx int) map[string]bool {
+	resolved := make(map[string]bool)
+	for j := assistantIdx + 1; j < len(messages); j++ {
+		r := messages[j].Role
+		if r == "user" || r == "assistant" {
+			break
+		}
+		if r == "tool" && messages[j].ToolCallID != "" {
+			resolved[messages[j].ToolCallID] = true
+		}
+	}
+	return resolved
+}
+
+func buildToolNamesByID(messages []Message) map[string]string {
+	names := make(map[string]string)
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, tc := range msg.ToolCalls {
+			if tc.ID != "" && tc.Function.Name != "" {
+				names[tc.ID] = tc.Function.Name
+			}
+		}
+	}
+	return names
+}
+
+func visibleExpandableToolIndex(messages []Message) int {
+	expandableIdx := -1
+	for i := 0; i < len(messages); {
+		if messages[i].Role != "tool" {
+			i++
+			continue
+		}
+		j := i
+		for j < len(messages) && messages[j].Role == "tool" {
+			j++
+		}
+		visStart := i
+		if j-i > toolGroupFoldThreshold {
+			visStart = j - toolGroupKeepVisible
+		}
+		for k := visStart; k < j; k++ {
+			if isExpandableToolOutput(messages[k]) {
+				expandableIdx = k
+			}
+		}
+		i = j
+	}
+	return expandableIdx
+}
+
+// renderMessages renders the full conversation stream with:
+// - deduplicated completed tool calls and quiet waiting indicators,
+// - compact contiguous tool result groups (no blank lines inside a group),
+// - folding for groups exceeding 5 tool results (keeping the last 3 visible),
+// - status indicators (✓/✗ or ASCII +/x), and
+// - a single (Ctrl+O) hint on the newest visible eligible tool output.
+func renderMessages(messages []Message, width int, expandLastTool bool) string {
+	if width <= 0 {
+		width = 80
+	}
+	toolNamesByID := buildToolNamesByID(messages)
+	expandableIdx := visibleExpandableToolIndex(messages)
+
+	var blocks []string
+	for i := 0; i < len(messages); {
+		msg := messages[i]
+		if msg.Role == "system" {
+			i++
+			continue
+		}
+
+		if msg.Role == "tool" {
+			j := i
+			for j < len(messages) && messages[j].Role == "tool" {
+				j++
+			}
+			group := messages[i:j]
+			var groupLines []string
+			visOffset := 0
+			if len(group) > toolGroupFoldThreshold {
+				cut := len(group) - toolGroupKeepVisible
+				summary := formatFoldSummary(group[:cut], toolNamesByID)
+				prefix, indent := toolLinePrefixes(toolPendingStyle.Render(activeEllipsisGlyph()))
+				groupLines = append(groupLines, wrapIndented(prefix, indent, toolPendingStyle.Render(summary), width))
+				visOffset = cut
+			}
+			for k := visOffset; k < len(group); k++ {
+				globalIdx := i + k
+				isTarget := globalIdx == expandableIdx
+				groupLines = append(groupLines, renderToolMessage(group[k], width, isTarget, isTarget && expandLastTool))
+			}
+			blocks = append(blocks, strings.Join(groupLines, "\n"))
+			i = j
+			continue
+		}
+
+		var rendered string
+		if msg.Role == "assistant" {
+			resolved := collectResolvedToolIDs(messages, i)
+			rendered = renderAssistantMessage(msg, resolved, width)
+		} else {
+			rendered = renderMessageCard(msg, width, false, false)
+		}
+		if rendered != "" {
+			blocks = append(blocks, rendered)
+		}
+		i++
+	}
+
+	return strings.Join(blocks, "\n\n")
+}
+
 // renderMessageCard renders a single message in a quiet, borderless stream.
 func renderMessageCard(msg Message, width int, isLastTool bool, expanded bool) string {
 	if width <= 0 {
@@ -653,75 +1111,33 @@ func renderMessageCard(msg Message, width int, isLastTool bool, expanded bool) s
 	switch msg.Role {
 	case "user":
 		content := sanitizeForDisplay(msg.Content)
-		prefix := userPrefixStyle.Render(symPrompt + "  ")
+		prefix := userPrefixStyle.Render(activePromptGlyph() + "  ")
 		indent := "   "
 		return wrapIndented(prefix, indent, userTextStyle.Render(content), width)
 
 	case "assistant":
-		var b strings.Builder
-		if strings.TrimSpace(msg.Content) != "" {
-			rendered := renderMarkdownSafe(msg.Content, width-3)
-			prefix := asstPrefixStyle.Render(symIdentity + "  ")
-			indent := "   "
-			b.WriteString(wrapIndented(prefix, indent, rendered, width))
-		}
-		for _, tc := range msg.ToolCalls {
-			if b.Len() > 0 {
-				b.WriteString("\n")
-			}
-			bar := toolBarStyle.Render(symBar + "  ")
-			callLine := fmt.Sprintf("call: %s", sanitizeForDisplay(tc.Function.Name))
-			b.WriteString(bar + toolNameStyle.Render(callLine))
-		}
-		return b.String()
+		return renderAssistantMessage(msg, nil, width)
 
 	case "tool":
-		disp := msg.Display
-		if disp == "" {
-			disp = truncate(msg.Content, maxUIDisplayChars)
-		}
-		disp = sanitizeForDisplay(disp)
-		bar := toolBarStyle.Render(symBar + "  ")
-
-		if isLastTool && expanded {
-			full := sanitizeForDisplay(msg.Content)
-			if len(full) > 4000 {
-				full = full[:4000] + "\n...[output preview capped at 4000 chars]"
-			}
-			headerText := toolNameStyle.Render(disp) + "  " + toolHintStyle.Render("(Ctrl+O to collapse)")
-			banner := toolHintStyle.Render("─── Full Output (Ctrl+O to collapse) ───")
-
-			var b strings.Builder
-			b.WriteString(wrapIndented(bar, bar, headerText, width) + "\n")
-			b.WriteString(wrapIndented(bar, bar, banner, width))
-
-			fullLines := strings.Split(full, "\n")
-			for _, fl := range fullLines {
-				b.WriteString("\n" + wrapIndented(bar, bar, fl, width))
-			}
-			return b.String()
-		}
-
-		toolLine := toolNameStyle.Render(disp) + "  " + toolHintStyle.Render("(Ctrl+O)")
-		return wrapIndented(bar, bar, toolLine, width)
+		return renderToolMessage(msg, width, isLastTool, expanded)
 
 	case "error":
 		body := sanitizeForDisplay(msg.Content)
-		bar := errorBarStyle.Render(symBar + "  ")
+		bar := errorBarStyle.Render(activeBarGlyph() + "  ")
 		prefix := bar + errorLabelStyle.Render("Error: ")
 		indent := bar
 		return wrapIndented(prefix, indent, errorTextStyle.Render(body), width)
 
 	case "local":
 		body := sanitizeForDisplay(msg.Content)
-		bar := localBarStyle.Render(symBar + "  ")
+		bar := localBarStyle.Render(activeBarGlyph() + "  ")
 		lines := strings.Split(body, "\n")
 		var b strings.Builder
 		for i, l := range lines {
 			if i > 0 {
 				b.WriteString("\n")
 			}
-			b.WriteString(bar + localTextStyle.Render(l))
+			b.WriteString(wrapIndented(bar, bar, localTextStyle.Render(l), width))
 		}
 		return b.String()
 
