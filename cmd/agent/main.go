@@ -31,7 +31,7 @@ const (
 const baseSystemPrompt = `You are NabdCoder, a senior Go systems engineer and coding agent optimized for the Nabd project and Termux.
 
 Follow this disciplined engineering workflow:
-1. Inspect before modifying: Use list_dir and read_file to inspect code and directory structures before making changes.
+1. Inspect before modifying: Use repo_map to quickly grasp package architecture, exported symbols, and internal dependencies before diving into files. Use list_dir and read_file to inspect specific code and directory structures before making changes.
 2. Structured pagination: Always prefer format: "json" for read_file. Files are returned in pages up to 3584 bytes. When truncated is true, issue another read_file call with offset set to next_offset to continue reading.
 3. Surgical edits: Use edit_file to replace exact blocks. Always include 2-4 lines of unique surrounding context in old_text. Keep each edit concise (under 4000 bytes). For large modifications, make multiple small, syntax-valid edits.
 4. Verify changes: After editing Go code, run go_verify to ensure syntax correctness and that all package tests pass.
@@ -102,6 +102,8 @@ type uiModel struct {
 	busy              bool
 	palette           slashPalette
 	baseHeight        int
+	provider          string
+	searchEnabled     bool
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -152,6 +154,14 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 	destination := "unknown model endpoint"
 	modelName := "unknown"
 	keyStatus := "none"
+	provider := "openai"
+	searchEnabled := false
+	if p, ok := client.(interface{ Provider() string }); ok {
+		provider = p.Provider()
+	}
+	if s, ok := client.(interface{ SearchEnabled() bool }); ok {
+		searchEnabled = s.SearchEnabled()
+	}
 	if endpoint, ok := client.(interface{ BaseURL() string }); ok {
 		destination = endpoint.BaseURL()
 	}
@@ -167,7 +177,7 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 	if u, err := url.Parse(destination); err == nil && u.Host != "" {
 		endpointHost = u.Host
 	}
-	statusBar := fmt.Sprintf("model=%s endpoint=%s key=%s", modelName, endpointHost, keyStatus)
+	statusBar := fmt.Sprintf("provider=%s model=%s endpoint=%s key=%s", provider, modelName, endpointHost, keyStatus)
 
 	sandboxProven := false
 	if reg != nil && reg.Has("mcp_call") {
@@ -178,6 +188,8 @@ func initialModel(reg *tools.Registry, client llm.Client) uiModel {
 		destination:   destination,
 		statusBar:     statusBar,
 		modelName:     modelName,
+		provider:      provider,
+		searchEnabled: searchEnabled,
 		workspace:     workspace,
 		sandboxProven: sandboxProven,
 		lifecycle:     newLifecycle(),
@@ -896,6 +908,14 @@ func (m *uiModel) formatStatus() string {
 	budget := m.historyBudget
 	var b strings.Builder
 	b.WriteString("=== NabdCoder Status ===\n")
+	fmt.Fprintf(&b, "Provider: %s\n", m.provider)
+	if m.provider == "gemini" {
+		searchStatus := "off"
+		if m.searchEnabled {
+			searchStatus = "on"
+		}
+		fmt.Fprintf(&b, "Search Grounding: %s\n", searchStatus)
+	}
 	fmt.Fprintf(&b, "Model: %s\n", m.modelName)
 	fmt.Fprintf(&b, "Destination: %s\n", m.destination)
 	sandboxStr := "Disabled"
@@ -1006,13 +1026,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Config validation error: %v\n", err)
 		os.Exit(2)
 	}
-	client := llm.NewOpenAIClient(cfg)
+	client, err := llm.NewClient(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Client error: %v\n", err)
+		os.Exit(2)
+	}
 	if os.Getenv("NABD_MODEL_CHECK") == "1" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := client.CheckModel(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Model check failed: %v\n", err)
-			os.Exit(2)
+		if checker, ok := client.(interface{ CheckModel(context.Context) error }); ok {
+			if err := checker.CheckModel(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "Model check failed: %v\n", err)
+				os.Exit(2)
+			}
 		}
 	}
 	model := initialModel(reg, client)

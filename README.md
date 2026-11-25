@@ -46,11 +46,15 @@ nabdcoder
 
 كل الإعداد من البيئة، بلا flags على سطر الأوامر:
 
-- `NABD_BASE_URL` — افتراضي `http://127.0.0.1:8080/v1`؛ يُقبل عبر HTTPS أو HTTP على localhost وعناوين loopback فقط.
-- `NABD_MODEL` — افتراضي `local`؛ اسم النموذج المطلوب (غير فارغ، حتى 256 حرفاً، والأحرف المسموح بها فقط `[A-Za-z0-9._:/@-]`).
+- `NABD_PROVIDER` — مزود النموذج (`openai` أو `gemini`؛ الافتراضي `openai` غير حساس لحالة الأحرف).
+- `NABD_BASE_URL` — رابط المزوّد الأساسي (افتراضي `http://127.0.0.1:8080/v1` لـ OpenAI، و`https://generativelanguage.googleapis.com/v1beta` لـ Gemini)؛ يُقبل عبر HTTPS أو HTTP على localhost وعناوين loopback فقط.
+- `NABD_MODEL` — اسم النموذج المطلوب (افتراضي `local` لـ OpenAI، و`gemini-2.5-flash` لـ Gemini؛ حتى 256 حرفاً مسموحاً `[A-Za-z0-9._:/@-]`). عند استخدام Gemini تُقبل صيغتا `gemini-x` و`models/gemini-x`.
 - `NABD_MODEL_CHECK=1` — فحص اختياري للنموذج عند الإقلاع عبر `GET {base}/models` (مهلة 10 ثوانٍ، بلا redirects، وحد استجابة 4MiB). يقترح أقرب 3 أسماء عند غياب النموذج، ويتجاوز الفحص بتحذير إذا رد المزوّد بـ 404.
-- `NABD_API_KEY` — مفتاح API (طول بين 8 و512 حرفاً، ASCII قابل للطباعة فقط بلا مسافات داخلية أو أحرف تحكم لمنع header injection). مطلوب للاتصال بمزوّد HTTPS بعيد، واختياري لخوادم loopback المحلية؛ لا تُرسل ترويسة `Authorization` عند خلوه ولا توجد قيمة افتراضية.
-- `NABD_API_KEY_FILE` — مسار ملف يُقرأ منه المفتاح بديلاً عن المتغير؛ يُرفض وجودهما معاً بخطأ صريح. يُشترط ألا يكون symlink، وألا يتجاوز 4KiB، وصلاحياته 0600 أو أضيق على أنظمة Unix. تُقتطع المسافات والأسطر المحيطة تلقائياً.
+- `NABD_API_KEY` — مفتاح API لـ OpenAI (أو احتياطي لـ Gemini إن لم يُحدد مفتاح مخصص له). طول بين 8 و512 حرفاً، ASCII قابل للطباعة فقط.
+- `NABD_API_KEY_FILE` — مسار ملف يُقرأ منه مفتاح OpenAI بديلاً عن المتغير؛ يُرفض وجودهما معاً بخطأ صريح. يُشترط ألا يكون symlink، وألا يتجاوز 4KiB، وصلاحياته 0600 أو أضيق على أنظمة Unix.
+- `NABD_GEMINI_API_KEY` — مفتاح مخصص لـ Gemini API؛ يُرسل حصراً عبر ترويسة `x-goog-api-key` ولا يظهر أبداً في الروابط أو مسارات الأخطاء.
+- `NABD_GEMINI_API_KEY_FILE` — مسار ملف مفتاح Gemini API بديلاً عن `NABD_GEMINI_API_KEY`؛ يُرفض وجودهما معاً بخطأ صريح ويمر بنفس شروط الأمان والصلاحيات.
+- `NABD_GEMINI_SEARCH` — تفعيل البحث عبر Google Search Grounding عند استخدام مزوّد Gemini (`1` للتفعيل؛ معطّل افتراضياً). *ملاحظة: تفعيل البحث يرسل استعلامات البحث إلى Google وقد تترتب عليه تكلفة إضافية بحسب خطة حسابك.*
 - `NABD_TIMEOUT` — مهلة اتصال النموذج (مثل `90s`؛ افتراضي `180s`، النطاق المسموح `5s`–`600s`).
 - `NABD_MAX_TOKENS` — الحد الأقصى للرموز المولّدة (افتراضي `2048`، النطاق المسموح `1`–`131072`).
 - `NABD_TEMPERATURE` — درجة حرارة التوليد (افتراضي `0.2`، النطاق المسموح `0`–`2`؛ تُحترم القيمة `0` بدقة ولا تُستبدل بالافتراضي).
@@ -58,6 +62,27 @@ nabdcoder
 - `NABD_EXEC_SANDBOX=1` — موافقة صريحة على محاولة تفعيل التنفيذ الخارجي. لا يُفعّل شيء حتى ينجح `sandbox.Prove`؛ على Termux/Windows أو بدون bubblewrap تبقى الأداتان معطّلتين.
 - `NABD_AUDIT_ANCHOR` — قيمة سرية تُحفظ خارج السجل وتُستخدم كمرساة لسلسلة hash؛ بدونها لا يمكن اكتشاف إعادة حساب السلسلة من قبل مستخدم محلي.
 - `NABD_SHADOW_RETENTION_INTERVAL` — فاصل التنظيف الدوري (افتراضي 24h)؛ قاعدة الاحتفاظ 7 أيام/20 نسخة لكل مسار.
+
+### أمثلة التشغيل
+
+#### 1. التشغيل عبر مزوّد OpenAI-compatible:
+```bash
+export NABD_PROVIDER=openai
+export NABD_BASE_URL="https://api.openai.com/v1"
+export NABD_MODEL="gpt-4o"
+export NABD_API_KEY="sk-..."
+nabdcoder
+```
+
+#### 2. التشغيل عبر مزوّد Google Gemini Native:
+```bash
+export NABD_PROVIDER=gemini
+export NABD_MODEL="gemini-2.5-flash"
+export NABD_GEMINI_API_KEY="AIzaSy..."
+# اختياري: تفعيل البحث المباشر في Google
+export NABD_GEMINI_SEARCH=1
+nabdcoder
+```
 
 ## الأدوات وأوامر TUI
 

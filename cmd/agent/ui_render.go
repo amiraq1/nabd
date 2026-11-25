@@ -291,6 +291,26 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 		}
 		return fmt.Sprintf("list_dir(%s) -> %d entries", dirPath, entries)
 
+	case "repo_map":
+		var p struct {
+			Path string `json:"path"`
+		}
+		_ = json.Unmarshal([]byte(rawArgs), &p)
+		reqPath := p.Path
+		if reqPath == "" {
+			reqPath = "."
+		}
+		if strings.HasPrefix(result, "=== REPO MAP") {
+			var scannedFiles, symbols int
+			idx := strings.Index(result, "scanned:")
+			if idx >= 0 {
+				if _, err := fmt.Sscanf(result[idx:], "scanned: %d files, symbols: %d", &scannedFiles, &symbols); err == nil {
+					return fmt.Sprintf("repo_map(%s) -> %d files, %d symbols (Ctrl+O)", reqPath, scannedFiles, symbols)
+				}
+			}
+		}
+		return fmt.Sprintf("repo_map(%s) -> (Ctrl+O)", reqPath)
+
 	case "go_verify":
 		var p struct {
 			Pkg string `json:"pkg"`
