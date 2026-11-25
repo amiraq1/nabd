@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -260,6 +261,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.messages = append(m.messages, *m.pendingDisclosure)
+				m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, false)
 				m.pendingDisclosure = nil
 				m.pendingTools = m.pendingTools[1:]
 				m.refresh()
@@ -470,6 +472,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case llmResponseMsg:
 		m.finishRequest()
 		m.messages = append(m.messages, msg.assistantMsg)
+		m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
 		m.iteration++
 		if len(msg.assistantMsg.ToolCalls) == 0 {
 			m.busy = false
@@ -541,6 +544,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				_ = m.registry.LogDisclosure(m.pendingTools[0].Function.Name, sha256Hex(msg.toolMsg.Content), string(m.autoApprove), true)
 			}
 			m.messages = append(m.messages, msg.toolMsg)
+			m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
 			if len(m.pendingTools) > 0 {
 				m.pendingTools = m.pendingTools[1:]
 			}
@@ -970,6 +974,7 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	}
 
 	m.history = append(m.history, input)
+	m.history = prunePromptHistory(m.history, defaultPromptHistoryLimit)
 	m.historyIdx = len(m.history)
 	m.historyDraft = ""
 
@@ -1023,7 +1028,11 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	if input == "/copy" || input == "/copy code" || input == "/copy tool" || strings.HasPrefix(input, "/copy ") {
 		return m.handleCopyCommand(input)
 	}
+	if input == "/compact" {
+		return m.handleCompactCommand()
+	}
 
+	m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
 	m.messages = append(m.messages, Message{Role: "user", Content: input})
 	m.clearInput()
 	m.busy = true
@@ -1130,6 +1139,32 @@ func (m *uiModel) handleCopyCommand(input string) (tea.Model, tea.Cmd) {
 	})
 }
 
+func (m *uiModel) handleCompactCommand() (tea.Model, tea.Cmd) {
+	m.clearInput()
+	if m.busy || m.awaitingApproval || m.pendingDisclosure != nil {
+		m.messages = append(m.messages, Message{
+			Role:    "local",
+			Content: "Cannot compact while an operation or approval is in progress.",
+		})
+		m.refresh()
+		return *m, nil
+	}
+
+	compacted, reduced := compactToolOutputs(m.messages)
+	runtime.GC()
+	m.refresh()
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	heapAllocMB := float64(ms.HeapAlloc) / (1024 * 1024)
+
+	content := fmt.Sprintf("Compacted %d tool outputs (~%s reduced in session buffer). HeapAlloc: %.1f MiB.",
+		compacted, formatBytes(reduced), heapAllocMB)
+	m.messages = append(m.messages, Message{Role: "local", Content: content})
+	m.refresh()
+	return *m, nil
+}
+
 func (m *uiModel) formatStatus() string {
 	tokens := estimateMessages(m.messages)
 	budget := m.historyBudget
@@ -1160,6 +1195,7 @@ func (m *uiModel) formatStatus() string {
 	fmt.Fprintf(&b, "Iteration: %d / %d\n", m.iteration, m.maxIterations)
 	fmt.Fprintf(&b, "Context tokens: ~%d / %d (~%.1f%%)\n", tokens, budget, float64(tokens)*100.0/float64(budget))
 	fmt.Fprintf(&b, "Messages in history: %d\n", len(m.messages))
+	b.WriteString(formatMemoryStatus() + "\n")
 	if m.registry != nil {
 		tList := m.registry.OpenAITools()
 		var names []string
@@ -1227,6 +1263,11 @@ func main() {
 	if err := ensureInteractive(os.Stdin); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+
+	if _, err := applyMemoryLimitFromEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
+		os.Exit(2)
 	}
 
 	autoMode, err := LoadAutoApproveFromEnv()
