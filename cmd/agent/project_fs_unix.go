@@ -102,16 +102,26 @@ func scanCommandsDirNoFollow(
 			return false, err
 		}
 		nextDir, openErr := openDirComponentNoFollow(int(curDir.Fd()), part)
-		_ = curDir.Close()
 		if openErr != nil {
 			if errors.Is(openErr, unix.ELOOP) {
+				_ = curDir.Close()
 				return false, fmt.Errorf("%w: %s", errProjectSymlink, part)
 			}
 			if errors.Is(openErr, unix.ENOTDIR) {
+				var st unix.Stat_t
+				// Linux openat(O_DIRECTORY|O_NOFOLLOW) returns ENOTDIR on a symlink to dir;
+				// inspect the unfollowed component via pinned dirfd to report symlinks accurately.
+				if fErr := unix.Fstatat(int(curDir.Fd()), part, &st, unix.AT_SYMLINK_NOFOLLOW); fErr == nil && (uint32(st.Mode)&unix.S_IFMT) == unix.S_IFLNK {
+					_ = curDir.Close()
+					return false, fmt.Errorf("%w: %s", errProjectSymlink, part)
+				}
+				_ = curDir.Close()
 				return false, fmt.Errorf("%w: %s", errProjectNotDirectory, part)
 			}
+			_ = curDir.Close()
 			return false, openErr
 		}
+		_ = curDir.Close()
 		curDir = nextDir
 	}
 	defer curDir.Close()
