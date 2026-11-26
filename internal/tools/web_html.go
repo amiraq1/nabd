@@ -7,6 +7,7 @@ import (
 	"html"
 	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 )
@@ -118,35 +119,61 @@ func countInvalidUTF8Bytes(data []byte) int {
 }
 
 // extractHTMLText performs bounded finite-state HTML scanning using standard library only.
-// It is a text extractor (not a DOM sanitizer like x/net/html); extracted content remains untrusted.
+// It is a text extractor (not a full HTML5 DOM tokenizer/sanitizer like golang.org/x/net/html);
+// malformed markup edge cases may still render unexpectedly, and extracted content remains untrusted.
 func extractHTMLText(raw string) (title string, text string) {
 	var bodyBuf strings.Builder
 	var titleBuf strings.Builder
 
 	inTitle := false
-	skipTag := "" // active skip element name ("script", "style", "noscript", "template", "svg")
+	skipTag := ""  // active skip element name ("script", "style", "noscript", "template", "svg", "iframe", "noembed", "noframes", "xmp")
+	skipDepth := 0 // nesting depth for nestable skip tags like svg/template
 
 	n := len(raw)
 	i := 0
 	for i < n {
-		// Inside a skipped block (<script>, <style>, etc.), look only for its closing tag
+		// Inside a skipped block, advance until the matching closing tag.
 		if skipTag != "" {
-			if raw[i] == '<' && i+2 < n && raw[i+1] == '/' {
-				endIdx, tagName, _ := scanTag(raw, i)
-				if tagName == "/"+skipTag {
-					skipTag = ""
+			if raw[i] == '<' && i+1 < n {
+				// For nestable elements (svg, template), track nested opening tags.
+				if (skipTag == "svg" || skipTag == "template") && isASCIIAlpha(raw[i+1]) {
+					endIdx, tagName, selfClosing, foundClose := scanTag(raw, i)
+					if foundClose {
+						if tagName == skipTag && !selfClosing {
+							skipDepth++
+						}
+						i = endIdx
+						continue
+					}
 				}
-				i = endIdx
-				continue
+				if i+2 < n && raw[i+1] == '/' && isASCIIAlpha(raw[i+2]) {
+					endIdx, tagName, _, foundClose := scanTag(raw, i)
+					if foundClose {
+						if tagName == "/"+skipTag {
+							skipDepth--
+							if skipDepth <= 0 {
+								skipTag = ""
+								skipDepth = 0
+							}
+						}
+						i = endIdx
+						continue
+					}
+				}
 			}
 			i++
 			continue
 		}
 
-		if raw[i] == '<' {
-			// Comment <!-- ... -->
+		if raw[i] == '<' && isTagStart(raw, i) {
+			// Comment <!-- ... --> (also tolerates HTML5 --!>)
 			if strings.HasPrefix(raw[i:], "<!--") {
 				closeIdx := strings.Index(raw[i+4:], "-->")
+				altClose := strings.Index(raw[i+4:], "--!>")
+				if altClose >= 0 && (closeIdx < 0 || altClose < closeIdx) {
+					i = i + 4 + altClose + 4
+					continue
+				}
 				if closeIdx < 0 {
 					break // unclosed comment to EOF
 				}
@@ -168,14 +195,31 @@ func extractHTMLText(raw string) (title string, text string) {
 			if i+1 < n && (raw[i+1] == '!' || raw[i+1] == '?') {
 				closeIdx := strings.IndexByte(raw[i+1:], '>')
 				if closeIdx < 0 {
-					break
+					// Treat an unclosed '<' in plain text safely rather than swallowing EOF.
+					if inTitle {
+						titleBuf.WriteByte('<')
+					} else {
+						bodyBuf.WriteByte('<')
+					}
+					i++
+					continue
 				}
 				i = i + 1 + closeIdx + 1
 				continue
 			}
 
 			// Regular HTML open/close tag
-			endIdx, tagName, selfClosing := scanTag(raw, i)
+			endIdx, tagName, selfClosing, foundClose := scanTag(raw, i)
+			if !foundClose {
+				// Unclosed '<' without '>' to EOF (e.g. "if a<b"): keep literal '<' text.
+				if inTitle {
+					titleBuf.WriteByte('<')
+				} else {
+					bodyBuf.WriteByte('<')
+				}
+				i++
+				continue
+			}
 			i = endIdx
 
 			switch tagName {
@@ -183,17 +227,22 @@ func extractHTMLText(raw string) (title string, text string) {
 				if !selfClosing {
 					inTitle = true
 				}
-			case "/title":
+			case "/title", "/head", "body":
 				inTitle = false
-			case "script", "style", "noscript", "template", "svg":
+			case "script", "style", "noscript", "template", "svg", "iframe", "noembed", "noframes", "xmp":
 				if !selfClosing {
 					skipTag = tagName
+					skipDepth = 1
 				}
 			case "p", "/p", "div", "/div", "section", "/section", "article", "/article",
 				"header", "/header", "footer", "/footer", "nav", "/nav", "main", "/main",
 				"aside", "/aside", "h1", "/h1", "h2", "/h2", "h3", "/h3", "h4", "/h4", "h5", "/h5", "h6", "/h6",
 				"li", "/li", "tr", "/tr", "br", "hr", "blockquote", "/blockquote", "pre", "/pre", "table", "/table",
 				"td", "th":
+				// Unclosed <title> must not swallow document body blocks.
+				if inTitle {
+					inTitle = false
+				}
 				appendBlockSep(&bodyBuf, tagName)
 			}
 			continue
@@ -217,6 +266,24 @@ func extractHTMLText(raw string) (title string, text string) {
 	return decodedTitle, decodedBody
 }
 
+func isASCIIAlpha(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isTagStart(raw string, i int) bool {
+	if i+1 >= len(raw) {
+		return false
+	}
+	next := raw[i+1]
+	if isASCIIAlpha(next) || next == '!' || next == '?' {
+		return true
+	}
+	if next == '/' && i+2 < len(raw) && isASCIIAlpha(raw[i+2]) {
+		return true
+	}
+	return false
+}
+
 func appendBlockSep(b *strings.Builder, tagName string) {
 	if tagName == "td" || tagName == "th" {
 		s := b.String()
@@ -233,8 +300,8 @@ func appendBlockSep(b *strings.Builder, tagName string) {
 
 // scanTag parses <tagName attrs...> handling single/double quotes safely.
 // Returns the index right after '>', lowercased tag name (prefixed with '/' if closing),
-// and whether the tag was self-closing ('/>').
-func scanTag(raw string, start int) (nextIdx int, tagName string, selfClosing bool) {
+// whether the tag was self-closing ('/>'), and whether a closing '>' was found.
+func scanTag(raw string, start int) (nextIdx int, tagName string, selfClosing bool, foundClose bool) {
 	n := len(raw)
 	i := start + 1 // skip '<'
 	var nameBuf strings.Builder
@@ -259,7 +326,7 @@ func scanTag(raw string, start int) (nextIdx int, tagName string, selfClosing bo
 		}
 		if c == '>' {
 			selfClosing = (lastNonSpace == '/')
-			return i + 1, strings.ToLower(nameBuf.String()), selfClosing
+			return i + 1, strings.ToLower(nameBuf.String()), selfClosing, true
 		}
 		if readingName {
 			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '-' || c == '_' {
@@ -277,7 +344,7 @@ func scanTag(raw string, start int) (nextIdx int, tagName string, selfClosing bo
 		}
 		i++
 	}
-	return n, strings.ToLower(nameBuf.String()), false
+	return n, strings.ToLower(nameBuf.String()), false, false
 }
 
 // sanitizeExtractedWebText strips terminal escape sequences, control characters,
@@ -375,6 +442,23 @@ func clipValidUTF8(s string, maxBytes int) (string, bool) {
 	return s[:cut], true
 }
 
+// sanitizeSearchResultURL checks that a provider-supplied result URL uses
+// http:// or https:// without userinfo or control characters; invalid URLs are
+// replaced rather than returned verbatim as clickable links.
+func sanitizeSearchResultURL(raw string) string {
+	clean := sanitizeExtractedWebText(raw)
+	if clean == "" {
+		return ""
+	}
+	u, err := url.Parse(clean)
+	if err != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) ||
+		u.User != nil || u.Hostname() == "" {
+		return "[invalid-url]"
+	}
+	clipped, _ := clipValidUTF8(clean, 512)
+	return clipped
+}
+
 func buildSearchOutput(provider string, items []webSearchItem, providerTruncated bool) (string, error) {
 	out := webSearchOutput{
 		SecurityNotice: untrustedWebBanner,
@@ -385,7 +469,7 @@ func buildSearchOutput(provider string, items []webSearchItem, providerTruncated
 
 	for _, it := range items {
 		title, _ := clipValidUTF8(sanitizeExtractedWebText(it.Title), 200)
-		urlStr, _ := clipValidUTF8(sanitizeExtractedWebText(it.URL), 512)
+		urlStr := sanitizeSearchResultURL(it.URL)
 		snippet, _ := clipValidUTF8(sanitizeExtractedWebText(it.Snippet), 500)
 		if title == "" && urlStr == "" && snippet == "" {
 			continue

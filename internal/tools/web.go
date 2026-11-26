@@ -15,22 +15,26 @@ import (
 )
 
 const (
-	WebSearchProviderEnv   = "NABD_WEB_SEARCH"
-	WebBraveAPIKeyEnv      = "NABD_BRAVE_API_KEY"
-	WebTavilyAPIKeyEnv     = "NABD_TAVILY_API_KEY"
-	WebSearXNGURLEnv       = "NABD_SEARXNG_URL"
-	WebFirecrawlAPIKeyEnv  = "NABD_FIRECRAWL_API_KEY"
-	WebFirecrawlBaseURLEnv = "NABD_FIRECRAWL_BASE_URL"
+	WebSearchProviderEnv      = "NABD_WEB_SEARCH"
+	WebBraveAPIKeyEnv         = "NABD_BRAVE_API_KEY"
+	WebTavilyAPIKeyEnv        = "NABD_TAVILY_API_KEY"
+	WebSearXNGURLEnv          = "NABD_SEARXNG_URL"
+	WebFirecrawlAPIKeyEnv     = "NABD_FIRECRAWL_API_KEY"
+	WebFirecrawlAPIKeyFileEnv = "NABD_FIRECRAWL_API_KEY_FILE"
+	WebFirecrawlBaseURLEnv    = "NABD_FIRECRAWL_BASE_URL"
 
 	defaultBraveEndpoint    = "https://api.search.brave.com/res/v1/web/search"
 	defaultTavilyEndpoint   = "https://api.tavily.com/search"
 	defaultFirecrawlBaseURL = "https://api.firecrawl.dev"
 
+	maxWebKeyFileBytes      = 4096
+	maxWebAPIKeyBytes       = 512
 	maxSearchQueryRunes     = 400
 	maxSearchQueryBytes     = 1024
 	defaultSearchMaxResults = 5
 	minSearchMaxResults     = 1
 	maxSearchMaxResults     = 10
+	maxSearchParsedItems    = 50
 	maxProviderErrorSnippet = 180
 )
 
@@ -60,8 +64,8 @@ func LoadWebConfigFromEnv() (*WebConfig, error) {
 	switch raw {
 	case "brave":
 		key := strings.TrimSpace(os.Getenv(WebBraveAPIKeyEnv))
-		if key == "" {
-			return nil, fmt.Errorf("%s=brave requires %s to be set", WebSearchProviderEnv, WebBraveAPIKeyEnv)
+		if err := validateWebAPIKey(WebBraveAPIKeyEnv, key); err != nil {
+			return nil, fmt.Errorf("%s=brave: %w", WebSearchProviderEnv, err)
 		}
 		return &WebConfig{
 			Provider: "brave",
@@ -71,8 +75,8 @@ func LoadWebConfigFromEnv() (*WebConfig, error) {
 
 	case "tavily":
 		key := strings.TrimSpace(os.Getenv(WebTavilyAPIKeyEnv))
-		if key == "" {
-			return nil, fmt.Errorf("%s=tavily requires %s to be set", WebSearchProviderEnv, WebTavilyAPIKeyEnv)
+		if err := validateWebAPIKey(WebTavilyAPIKeyEnv, key); err != nil {
+			return nil, fmt.Errorf("%s=tavily: %w", WebSearchProviderEnv, err)
 		}
 		return &WebConfig{
 			Provider: "tavily",
@@ -100,8 +104,23 @@ func LoadWebConfigFromEnv() (*WebConfig, error) {
 
 	case "firecrawl":
 		key := strings.TrimSpace(os.Getenv(WebFirecrawlAPIKeyEnv))
-		if key == "" {
-			return nil, fmt.Errorf("%s=firecrawl requires %s to be set", WebSearchProviderEnv, WebFirecrawlAPIKeyEnv)
+		keyFile := strings.TrimSpace(os.Getenv(WebFirecrawlAPIKeyFileEnv))
+		if key != "" && keyFile != "" {
+			return nil, fmt.Errorf("both %s and %s are set; specify only one", WebFirecrawlAPIKeyEnv, WebFirecrawlAPIKeyFileEnv)
+		}
+		if keyFile != "" {
+			loaded, err := readWebKeyFile(WebFirecrawlAPIKeyFileEnv, keyFile)
+			if err != nil {
+				return nil, err
+			}
+			key = loaded
+		} else {
+			if key == "" {
+				return nil, fmt.Errorf("%s=firecrawl requires %s or %s to be set", WebSearchProviderEnv, WebFirecrawlAPIKeyEnv, WebFirecrawlAPIKeyFileEnv)
+			}
+			if err := validateWebAPIKey(WebFirecrawlAPIKeyEnv, key); err != nil {
+				return nil, fmt.Errorf("%s=firecrawl: %w", WebSearchProviderEnv, err)
+			}
 		}
 		baseURL := strings.TrimSpace(os.Getenv(WebFirecrawlBaseURLEnv))
 		if baseURL == "" {
@@ -127,12 +146,65 @@ func LoadWebConfigFromEnv() (*WebConfig, error) {
 	}
 }
 
+func validateWebAPIKey(envName, key string) error {
+	if key == "" {
+		return fmt.Errorf("%s must be set and non-empty", envName)
+	}
+	if len(key) > maxWebAPIKeyBytes {
+		return fmt.Errorf("%s length exceeds %d-byte limit", envName, maxWebAPIKeyBytes)
+	}
+	for i := 0; i < len(key); i++ {
+		b := key[i]
+		if b < 33 || b > 126 {
+			return fmt.Errorf("%s contains invalid whitespace or control character", envName)
+		}
+	}
+	return nil
+}
+
+func readWebKeyFile(envName, path string) (string, error) {
+	if strings.ContainsAny(path, "\x00\r\n") {
+		return "", fmt.Errorf("invalid %s path: contains NUL or newline", envName)
+	}
+	f, err := openSafeWebKeyFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", envName, err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxWebKeyFileBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", envName, err)
+	}
+	if len(data) > maxWebKeyFileBytes {
+		return "", fmt.Errorf("reading %s: file exceeds %d-byte limit", envName, maxWebKeyFileBytes)
+	}
+	key := strings.TrimSpace(strings.TrimRight(string(data), "\r\n"))
+	if err := validateWebAPIKey(envName, key); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
 // WebSearchProvider returns the active search provider name or "disabled".
 func (r *Registry) WebSearchProvider() string {
 	if r == nil || r.webConfig == nil || !r.Has("web_search") {
 		return "disabled"
 	}
 	return r.webConfig.Provider
+}
+
+// WebSearchDestinationHost returns the sanitized endpoint host (and optional
+// non-default port) for the active search provider, or "" when disabled.
+func (r *Registry) WebSearchDestinationHost() string {
+	if r == nil || r.webConfig == nil || !r.Has("web_search") {
+		return ""
+	}
+	u, err := url.Parse(r.webConfig.Endpoint)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // IsWebSearchEnabled reports whether web_search and web_fetch are configured and registered.
@@ -178,26 +250,44 @@ type webSearchArgs struct {
 	MaxResults *int   `json:"max_results"`
 }
 
-func parseWebSearchArgs(raw json.RawMessage) (string, int, error) {
-	var p webSearchArgs
+func decodeStrictJSONObject(raw json.RawMessage, dst any) error {
+	if len(raw) > maxApprovalJSONBytes {
+		return fmt.Errorf("arguments exceed %d-byte limit", maxApprovalJSONBytes)
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&p); err != nil {
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return errors.New("unexpected trailing JSON data")
+	}
+	return nil
+}
+
+const maxApprovalJSONBytes = 16 << 10
+
+func parseWebSearchArgs(raw json.RawMessage) (string, int, error) {
+	var p webSearchArgs
+	if err := decodeStrictJSONObject(raw, &p); err != nil {
 		return "", 0, fmt.Errorf("invalid web_search arguments: %w", err)
 	}
 
 	if !utf8.ValidString(p.Query) {
 		return "", 0, errors.New("query must be valid UTF-8")
 	}
-	if strings.ContainsAny(p.Query, "\x00\r\n") {
-		return "", 0, errors.New("query contains invalid control characters")
+	if len(p.Query) > maxSearchQueryBytes {
+		return "", 0, fmt.Errorf("query length %d bytes exceeds %d-byte limit", len(p.Query), maxSearchQueryBytes)
+	}
+	for _, r := range p.Query {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return "", 0, errors.New("query contains invalid control characters")
+		}
 	}
 	q := strings.TrimSpace(p.Query)
 	if q == "" {
 		return "", 0, errors.New("query cannot be empty")
-	}
-	if len(q) > maxSearchQueryBytes {
-		return "", 0, fmt.Errorf("query length %d bytes exceeds %d-byte limit", len(q), maxSearchQueryBytes)
 	}
 	if runeCount := utf8.RuneCountInString(q); runeCount > maxSearchQueryRunes {
 		return "", 0, fmt.Errorf("query length %d characters exceeds %d-character limit", runeCount, maxSearchQueryRunes)
@@ -223,12 +313,13 @@ func (r *Registry) executeWebSearch(ctx context.Context, rawArgs json.RawMessage
 		return "", err
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, webRequestTimeout)
+	reqCtx, cancel := context.WithTimeout(ctx, webDirectTimeout)
 	defer cancel()
 
 	cfg := r.webConfig
 	secretKey := cfg.APIKey.raw()
-	client := createSearchHTTPClient(cfg.netHooks)
+	client := createSearchHTTPClient(cfg.netHooks, webDirectTimeout)
+	defer client.CloseIdleConnections()
 
 	var items []webSearchItem
 	var providerErr error
@@ -247,7 +338,7 @@ func (r *Registry) executeWebSearch(ctx context.Context, rawArgs json.RawMessage
 	}
 
 	if providerErr != nil {
-		return "", sanitizeNetworkError(providerErr, secretKey, query)
+		return "", sanitizeSearchError(providerErr, secretKey, query)
 	}
 
 	truncated := false
@@ -304,8 +395,11 @@ func executeBraveSearch(ctx context.Context, client *http.Client, endpoint, apiK
 		return nil, fmt.Errorf("invalid brave search JSON response: %w", err)
 	}
 
-	items := make([]webSearchItem, 0, len(parsed.Web.Results))
+	items := make([]webSearchItem, 0, min(len(parsed.Web.Results), maxSearchParsedItems))
 	for _, res := range parsed.Web.Results {
+		if len(items) >= maxSearchParsedItems {
+			break
+		}
 		items = append(items, webSearchItem{
 			Title:   res.Title,
 			URL:     res.URL,
@@ -370,8 +464,11 @@ func executeTavilySearch(ctx context.Context, client *http.Client, endpoint, api
 		return nil, fmt.Errorf("invalid tavily search JSON response: %w", err)
 	}
 
-	items := make([]webSearchItem, 0, len(parsed.Results))
+	items := make([]webSearchItem, 0, min(len(parsed.Results), maxSearchParsedItems))
 	for _, res := range parsed.Results {
+		if len(items) >= maxSearchParsedItems {
+			break
+		}
 		items = append(items, webSearchItem{
 			Title:   res.Title,
 			URL:     res.URL,
@@ -428,8 +525,11 @@ func executeSearXNGSearch(ctx context.Context, client *http.Client, baseURL, que
 		return nil, fmt.Errorf("invalid searxng JSON response: %w", err)
 	}
 
-	items := make([]webSearchItem, 0, len(parsed.Results))
+	items := make([]webSearchItem, 0, min(len(parsed.Results), maxSearchParsedItems))
 	for _, res := range parsed.Results {
+		if len(items) >= maxSearchParsedItems {
+			break
+		}
 		items = append(items, webSearchItem{
 			Title:   res.Title,
 			URL:     res.URL,
@@ -493,8 +593,11 @@ func executeFirecrawlSearch(ctx context.Context, client *http.Client, baseURL, a
 		return nil, fmt.Errorf("firecrawl search failed: %s", sanitizeErrorText(parsed.Error, apiKey, query))
 	}
 
-	items := make([]webSearchItem, 0, len(parsed.Data))
+	items := make([]webSearchItem, 0, min(len(parsed.Data), maxSearchParsedItems))
 	for _, res := range parsed.Data {
+		if len(items) >= maxSearchParsedItems {
+			break
+		}
 		snippet := res.Description
 		if strings.TrimSpace(snippet) == "" && res.Markdown != "" {
 			snippet, _ = clipValidUTF8(res.Markdown, 400)
@@ -518,27 +621,26 @@ func (r *Registry) executeWebFetch(ctx context.Context, rawArgs json.RawMessage)
 	}
 
 	var p webFetchArgs
-	dec := json.NewDecoder(bytes.NewReader(rawArgs))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&p); err != nil {
+	if err := decodeStrictJSONObject(rawArgs, &p); err != nil {
 		return "", fmt.Errorf("invalid web_fetch arguments: %w", err)
 	}
 
-	targetURL, err := validateExternalURL(p.URL)
-	if err != nil {
-		return "", sanitizeNetworkError(err)
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, webRequestTimeout)
-	defer cancel()
-
 	cfg := r.webConfig
 	secretKey := cfg.APIKey.raw()
+
+	targetURL, err := validateExternalURL(p.URL)
+	if err != nil {
+		return "", sanitizeNetworkError(err, secretKey)
+	}
+
 	safeDisplayURL := redactURLWithoutQuery(targetURL.String())
 
 	if cfg.Provider == "firecrawl" {
-		// Mandatory pre-flight SSRF DNS check BEFORE passing target URL to Firecrawl /v1/scrape.
-		// Ensures internal/private DNS targets are NEVER forwarded to external scraping servers.
+		reqCtx, cancel := context.WithTimeout(ctx, webFirecrawlScrapeTimeout)
+		defer cancel()
+
+		// Conservative pre-flight local SSRF/DNS check BEFORE sending target URL to Firecrawl.
+		// Reduces risk only; Nabd cannot enforce DNS pinning, redirects, or subresource SSRF inside Firecrawl.
 		var resolver ipResolver
 		if cfg.netHooks != nil {
 			resolver = cfg.netHooks.resolver
@@ -549,8 +651,13 @@ func (r *Registry) executeWebFetch(ctx context.Context, rawArgs json.RawMessage)
 		return executeFirecrawlScrape(reqCtx, cfg, targetURL.String(), safeDisplayURL)
 	}
 
+	reqCtx, cancel := context.WithTimeout(ctx, webDirectTimeout)
+	defer cancel()
+
 	// Direct hardened HTTPS fetch for brave / tavily / searxng modes
-	client := createFetchHTTPClient(cfg.netHooks)
+	client := createFetchHTTPClient(cfg.netHooks, webDirectTimeout)
+	defer client.CloseIdleConnections()
+
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL.String(), nil)
 	if err != nil {
 		return "", sanitizeNetworkError(err, secretKey)
@@ -610,7 +717,9 @@ func executeFirecrawlScrape(ctx context.Context, cfg *WebConfig, fullTargetURL, 
 	}
 
 	// Uses createSearchHTTPClient so redirects on Firecrawl endpoint bearing API key are blocked
-	client := createSearchHTTPClient(cfg.netHooks)
+	client := createSearchHTTPClient(cfg.netHooks, webFirecrawlScrapeTimeout)
+	defer client.CloseIdleConnections()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBytes))
 	if err != nil {
 		return "", sanitizeNetworkError(err, secretKey)
@@ -633,6 +742,9 @@ func executeFirecrawlScrape(ctx context.Context, cfg *WebConfig, fullTargetURL, 
 	if err != nil {
 		return "", sanitizeNetworkError(err, secretKey)
 	}
+	if sourceTruncated {
+		return "", fmt.Errorf("firecrawl scrape response exceeds %d-byte limit", maxDecompressedBodyBytes)
+	}
 
 	var parsed struct {
 		Success bool   `json:"success"`
@@ -640,8 +752,10 @@ func executeFirecrawlScrape(ctx context.Context, cfg *WebConfig, fullTargetURL, 
 		Data    struct {
 			Markdown string `json:"markdown"`
 			Metadata struct {
-				Title     string `json:"title"`
-				SourceURL string `json:"sourceURL"`
+				Title      string `json:"title"`
+				SourceURL  string `json:"sourceURL"`
+				StatusCode int    `json:"statusCode"`
+				Error      string `json:"error"`
 			} `json:"metadata"`
 		} `json:"data"`
 	}
@@ -654,6 +768,12 @@ func executeFirecrawlScrape(ctx context.Context, cfg *WebConfig, fullTargetURL, 
 			errMsg = "scrape failed"
 		}
 		return "", fmt.Errorf("firecrawl scrape failed: %s", sanitizeErrorText(errMsg, secretKey, ""))
+	}
+	if parsed.Data.Metadata.StatusCode >= 400 && strings.TrimSpace(parsed.Data.Markdown) == "" {
+		return "", fmt.Errorf("firecrawl target returned HTTP %d", parsed.Data.Metadata.StatusCode)
+	}
+	if parsed.Data.Metadata.Error != "" && strings.TrimSpace(parsed.Data.Markdown) == "" {
+		return "", fmt.Errorf("firecrawl target error: %s", sanitizeErrorText(parsed.Data.Metadata.Error, secretKey, ""))
 	}
 
 	if parsed.Data.Metadata.SourceURL != "" {
@@ -675,7 +795,8 @@ func formatProviderHTTPError(provider string, resp *http.Response, secretKey, se
 }
 
 func sanitizeErrorText(raw, secretKey, sensitiveQuery string) string {
-	s := redactSecrets(raw, secretKey, sensitiveQuery)
+	s := redactSecrets(raw, secretKey)
+	s = redactSensitiveQuery(s, sensitiveQuery)
 	s = sanitizeExtractedWebText(s)
 	s = strings.ReplaceAll(s, "\n", " ")
 	s, _ = clipValidUTF8(s, maxProviderErrorSnippet)
