@@ -3,6 +3,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -266,6 +267,19 @@ func TestGoVerifySandboxHidesWorkspaceSecrets(t *testing.T) {
 
 	for rel, sum := range before {
 		path := filepath.Join(workspace, filepath.FromSlash(rel))
+		if rel == ".nabd/audit.log" {
+			// The host audit log is append-only by design: the approved run
+			// records itself there, so only its original prefix must survive.
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Errorf("%s: %v", rel, readErr)
+				continue
+			}
+			if !bytes.HasPrefix(data, []byte(fixtures[rel])) {
+				t.Errorf("%s lost its original prefix on the host", rel)
+			}
+			continue
+		}
 		got, err := sha256File(path)
 		if err != nil {
 			t.Errorf("%s: %v", rel, err)
