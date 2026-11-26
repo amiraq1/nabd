@@ -48,11 +48,29 @@ type Entry struct {
 
 // Store persists backups inside an already-jailed workspace root.
 type Store struct {
-	root            *os.Root
-	mu              sync.Mutex
-	now             func() time.Time
-	retentionCancel context.CancelFunc
-	retentionDone   chan struct{}
+	root          *os.Root
+	mu            sync.Mutex
+	retentionMu   sync.Mutex
+	now           func() time.Time
+	retention     *retentionState
+	retentionDone chan struct{}
+}
+
+type retentionState struct {
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	cancel   context.CancelFunc
+	done     chan struct{}
+	wg       sync.WaitGroup
+}
+
+func (r *retentionState) stop() {
+	r.stopOnce.Do(func() {
+		if r.cancel != nil {
+			r.cancel()
+		}
+		close(r.stopCh)
+	})
 }
 
 // Open creates a store bound to root. It does not write anything until the
@@ -71,33 +89,73 @@ func (s *Store) StartRetention(ctx context.Context, interval time.Duration) {
 	if s == nil || interval <= 0 {
 		return
 	}
-	s.StopRetention()
-	runCtx, cancel := context.WithCancel(ctx)
-	s.retentionCancel = cancel
-	s.retentionDone = make(chan struct{})
-	done := s.retentionDone
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			_ = s.Cleanup(s.now())
-			select {
-			case <-runCtx.Done():
-				return
-			case <-ticker.C:
+	for {
+		s.retentionMu.Lock()
+		prev := s.retention
+		if prev == nil {
+			runCtx, cancel := context.WithCancel(ctx)
+			state := &retentionState{
+				stopCh: make(chan struct{}),
+				cancel: cancel,
+				done:   make(chan struct{}),
 			}
+			state.wg.Add(1)
+			s.retention = state
+			s.retentionDone = state.done
+			s.retentionMu.Unlock()
+
+			go s.runRetentionLoop(runCtx, interval, state)
+			return
 		}
-	}()
+		s.retentionMu.Unlock()
+
+		prev.stop()
+		prev.wg.Wait()
+
+		s.retentionMu.Lock()
+		if s.retention == prev {
+			s.retention = nil
+		}
+		s.retentionMu.Unlock()
+	}
 }
 
-// StopRetention stops the background cleanup loop.
+func (s *Store) runRetentionLoop(runCtx context.Context, interval time.Duration, state *retentionState) {
+	defer state.wg.Done()
+	defer close(state.done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		_ = s.Cleanup(s.now())
+		select {
+		case <-runCtx.Done():
+			return
+		case <-state.stopCh:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// StopRetention signals the background cleanup loop to stop and waits for it
+// to exit. It is idempotent and safe for concurrent callers.
 func (s *Store) StopRetention() {
-	if s == nil || s.retentionCancel == nil {
+	if s == nil {
 		return
 	}
-	s.retentionCancel()
-	s.retentionCancel = nil
+	s.retentionMu.Lock()
+	state := s.retention
+	s.retentionMu.Unlock()
+	if state == nil {
+		return
+	}
+	state.stop()
+	state.wg.Wait()
+	s.retentionMu.Lock()
+	if s.retention == state {
+		s.retention = nil
+	}
+	s.retentionMu.Unlock()
 }
 
 // Cleanup applies the retention quota now and reports removal failures.

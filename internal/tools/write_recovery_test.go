@@ -104,6 +104,14 @@ func TestAuditDetailEscapesBidiControls(t *testing.T) {
 	}
 }
 
+func TestAuditDetailEscapesC1Controls(t *testing.T) {
+	got := sanitizeAuditDetail("safe\u0085\u009B31mevil")
+	if strings.Contains(got, "\u0085") || strings.Contains(got, "\u009b") ||
+		!strings.Contains(got, "\\u0085") || !strings.Contains(got, "\\u009B") {
+		t.Fatalf("audit detail did not escape C1 controls: %q", got)
+	}
+}
+
 func TestExecutingEventSurvivesResultLoggingGap(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "a.txt"), "old\n", 0o600)

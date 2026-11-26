@@ -100,6 +100,7 @@ func (b *linuxBackend) Wrap(ctx context.Context, p Profile, executable string, a
 	bwrapArgs := buildBwrapArgs(p, limiter, abs, args...)
 
 	cmd := exec.CommandContext(ctx, b.bwrap, bwrapArgs...)
+	cmd.Env = bwrapHostEnv()
 	cmd.WaitDelay = 2 * time.Second
 	return cmd, nil
 }

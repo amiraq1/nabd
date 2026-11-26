@@ -109,6 +109,10 @@ func TestSanitizeForDisplay(t *testing.T) {
 		{"nul-and-bel", "a\x00b\x07c", "abc"},
 		{"keeps-newline-tab", "a\tb\nc", "a\tb\nc"},
 		{"c1-control", "a\u0085b", "ab"},
+		{"c1-csi", "a\u009b31mb", "a31mb"},
+		{"zero-width-and-bom", "a\u200b\u200c\u200d\u2060\ufeffb", "ab"},
+		{"unicode-tags", "مرحبا\U000E0001\U000E0041\U000E007Fhello", "مرحباhello"},
+		{"arabic-and-english-preserved", "مرحبا بالعالم - Hello Nabd 123", "مرحبا بالعالم - Hello Nabd 123"},
 		{"lone-esc", "\x1bx", ""},
 	}
 	for _, tc := range cases {
@@ -126,6 +130,25 @@ func TestSanitizeForDisplay(t *testing.T) {
 	invalid := sanitizeForDisplay(string([]byte{0xff, 0xfe, 'a'}))
 	if !utf8.ValidString(invalid) {
 		t.Fatalf("invalid UTF-8 was not repaired: %q", invalid)
+	}
+}
+
+func TestPrepareApprovalRejectsZeroWidthAndTagRunes(t *testing.T) {
+	_, m := testModel(t)
+	for _, tc := range []struct {
+		name string
+		args string
+	}{
+		{"zero_width_space", `{"command":"safe\u200Bcmd","tool":"test"}`},
+		{"bom", `{"command":"safe\uFEFFcmd","tool":"test"}`},
+		{"unicode_tag", `{"command":"safe\U000E0041cmd","tool":"test"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			call := testToolCall("mcp_call", tc.args)
+			if _, err := prepareApprovalPreview(m.registry, call); err == nil {
+				t.Fatalf("expected %s to fail closed during approval preview", tc.name)
+			}
+		})
 	}
 }
 

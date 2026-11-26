@@ -747,6 +747,36 @@ func TestHeaderResponsiveLines(t *testing.T) {
 	}
 }
 
+func TestHeaderAndWelcomeSanitizeWorkspaceAndModel(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.modelName = "gpt-4o\x1b[31m\u009b2J\u200B"
+	m.workspace = "/tmp/ws\x1b[31mRed\x1b[0m\u009b2J\nspoof\u200B\U000E0041"
+
+	header := stripTestANSI(renderHeader(&m, 120))
+	welcome := stripTestANSI(renderWelcomeScreen(&m, 80, 20))
+	for name, rendered := range map[string]string{"header": header, "welcome": welcome} {
+		if strings.ContainsRune(rendered, 0x1b) {
+			t.Fatalf("%s leaked ESC sequence: %q", name, rendered)
+		}
+		if strings.Contains(rendered, "\u009b") || strings.Contains(rendered, "\u200b") || strings.Contains(rendered, "\U000E0041") {
+			t.Fatalf("%s leaked C1/zero-width/tag rune: %q", name, rendered)
+		}
+		if strings.Contains(rendered, "\nspoof") {
+			t.Fatalf("%s allowed newline injection: %q", name, rendered)
+		}
+	}
+	if len(strings.Split(header, "\n")) != 2 {
+		t.Fatalf("header line count = %d, want 2: %q", len(strings.Split(header, "\n")), header)
+	}
+}
+
 func TestNoBordersAroundMessages(t *testing.T) {
 	boxRunes := []string{"╭", "╮", "╰", "╯", "┌", "┐", "└", "┘"}
 

@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/amiraq1/nabd/internal/safefs"
 )
 
 const (
@@ -162,22 +164,38 @@ func validateWebAPIKey(envName, key string) error {
 	return nil
 }
 
+var webKeyFilePolicy = safefs.OpenPolicy{
+	MaxBytes:          maxWebKeyFileBytes,
+	RequireOwner:      true,
+	StrictPrivateMode: true,
+	RejectExecutable:  true,
+}
+
+func openSafeWebKeyFile(path string) (*os.File, os.FileInfo, error) {
+	f, info, err := safefs.OpenFileNoFollow(path, webKeyFilePolicy)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateWebKeyFilePlatform(f, path); err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	return f, info, nil
+}
+
 func readWebKeyFile(envName, path string) (string, error) {
 	if strings.ContainsAny(path, "\x00\r\n") {
 		return "", fmt.Errorf("invalid %s path: contains NUL or newline", envName)
 	}
-	f, err := openSafeWebKeyFile(path)
+	f, info, err := openSafeWebKeyFile(path)
 	if err != nil {
 		return "", fmt.Errorf("reading %s: %w", envName, err)
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxWebKeyFileBytes+1))
+	data, err := safefs.ReadBoundedRegular(f, info, maxWebKeyFileBytes)
 	if err != nil {
 		return "", fmt.Errorf("reading %s: %w", envName, err)
-	}
-	if len(data) > maxWebKeyFileBytes {
-		return "", fmt.Errorf("reading %s: file exceeds %d-byte limit", envName, maxWebKeyFileBytes)
 	}
 	key := strings.TrimSpace(strings.TrimRight(string(data), "\r\n"))
 	if err := validateWebAPIKey(envName, key); err != nil {

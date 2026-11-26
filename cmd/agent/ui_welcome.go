@@ -64,12 +64,7 @@ func renderWelcomeSpan(style lipgloss.Style, text string) string {
 }
 
 func sanitizeWelcomeField(s string) string {
-	clean := sanitizeForDisplay(s)
-	clean = strings.ReplaceAll(clean, "\r\n", " ")
-	clean = strings.ReplaceAll(clean, "\n", " ")
-	clean = strings.ReplaceAll(clean, "\r", " ")
-	clean = strings.ReplaceAll(clean, "\t", " ")
-	return strings.TrimSpace(clean)
+	return sanitizeSingleLineDisplay(s)
 }
 
 func truncateWelcomeEnd(s string, maxLen int) string {

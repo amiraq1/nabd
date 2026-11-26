@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -67,5 +69,62 @@ func TestRetentionLoopStopsAndIsCancellable(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("retention loop did not stop on cancellation")
 	}
+	store.StopRetention()
+}
+
+func TestStopRetentionIsIdempotentConcurrentAndWaitsForExit(t *testing.T) {
+	var nilStore *Store
+	nilStore.StopRetention()
+
+	store, _ := openTestStore(t)
+	store.StopRetention()
+
+	inCleanup := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	var calls int32
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store.now = func() time.Time {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			close(inCleanup)
+			<-releaseCleanup
+		}
+		return base
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store.StartRetention(ctx, time.Hour)
+	done := store.retentionDone
+	<-inCleanup
+
+	const callers = 8
+	var stopReturned int32
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			store.StopRetention()
+			atomic.AddInt32(&stopReturned, 1)
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if n := atomic.LoadInt32(&stopReturned); n != 0 {
+		close(releaseCleanup)
+		wg.Wait()
+		t.Fatalf("%d StopRetention callers returned before retention goroutine exited", n)
+	}
+
+	close(releaseCleanup)
+	wg.Wait()
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("retentionDone channel not closed after StopRetention returned")
+	}
+
+	store.StopRetention()
 	store.StopRetention()
 }

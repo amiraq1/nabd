@@ -87,6 +87,9 @@ func TestLinuxSandboxProofFailsWithoutProbe(t *testing.T) {
 }
 
 func TestLinuxWrapConstructsConfinedCommand(t *testing.T) {
+	t.Setenv("NABD_API_KEY", "secret-api-key")
+	t.Setenv("NABD_AUDIT_ANCHOR", "secret-audit-anchor")
+	t.Setenv("NABD_FIRECRAWL_API_KEY", "secret-firecrawl-key")
 	b := requireBwrap(t)
 	setupHelpers(t)
 	dir := t.TempDir()
@@ -119,6 +122,16 @@ func TestLinuxWrapConstructsConfinedCommand(t *testing.T) {
 	}
 	if strings.Contains(joined, "NABD_API_KEY") {
 		t.Errorf("parent secrets leaked into sandbox arguments")
+	}
+	if cmd.Env == nil {
+		t.Fatal("expected explicit cmd.Env on bwrap command, got nil (inherits parent environment)")
+	}
+	for _, entry := range cmd.Env {
+		if strings.HasPrefix(entry, "NABD_API_KEY=") ||
+			strings.HasPrefix(entry, "NABD_AUDIT_ANCHOR=") ||
+			strings.HasPrefix(entry, "NABD_FIRECRAWL_API_KEY=") {
+			t.Errorf("parent secret leaked into bwrap host cmd.Env: %s", entry)
+		}
 	}
 	profile.WritableWorkspace = true
 	cmd, err = b.Wrap(context.Background(), profile, "/bin/true")

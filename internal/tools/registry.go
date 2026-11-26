@@ -625,8 +625,9 @@ func (r *Registry) undoLocked(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	detail := sanitizeAuditDetail(entry.Path)
 	if info.Mode()&os.ModeSymlink != 0 {
-		_ = r.logEvent(audit.Event{Event: "denied", Tool: "undo", Detail: entry.Path, Reason: "symlink"})
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: "undo", Detail: detail, Reason: "symlink"})
 		return "", fmt.Errorf("refusing to undo a symlink: %s", entry.Path)
 	}
 
@@ -636,18 +637,22 @@ func (r *Registry) undoLocked(relPath string) (string, error) {
 	}
 	currentHash := hashBytes(current)
 	if currentHash != entry.SHA256After {
-		_ = r.logEvent(audit.Event{Event: "denied", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path, Reason: "file changed since the edit"})
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: "undo", ArgsSHA256: currentHash, Detail: detail, Reason: "file changed since the edit"})
 		return "", fmt.Errorf("refusing undo: %s changed since the edit", entry.Path)
 	}
 
-	if err := r.logEvent(audit.Event{Event: "requested", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path}); err != nil {
+	if err := r.logEvent(audit.Event{Event: "requested", Tool: "undo", ArgsSHA256: currentHash, Detail: detail}); err != nil {
 		return "", err
+	}
+	if err := r.logEvent(audit.Event{Event: "executing", Tool: "undo", ArgsSHA256: currentHash, Detail: detail}); err != nil {
+		_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: detail})
+		return "", fmt.Errorf("cannot record undo execution in audit log: %w", err)
 	}
 	var syncWarning string
 	if err := r.atomicWriteChecked(currentPath, backup, os.FileMode(entry.Mode), currentHash); err != nil {
 		var uncertain *commitUncertainError
 		if !errors.As(err, &uncertain) {
-			_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: entry.Path})
+			_ = r.logEvent(audit.Event{Event: "failed", Tool: "undo", ArgsSHA256: currentHash, Detail: detail})
 			return "", err
 		}
 		syncWarning = "; warning: " + err.Error()
@@ -655,7 +660,7 @@ func (r *Registry) undoLocked(relPath string) (string, error) {
 	if err := r.shadow.MarkUndone(entry.ID); err != nil {
 		return "", fmt.Errorf("restored %s but could not update shadow metadata: %w", entry.Path, err)
 	}
-	_ = r.logEvent(audit.Event{Event: "applied", Tool: "undo", ArgsSHA256: currentHash, ResultSHA256: entry.SHA256Before, Detail: entry.Path})
+	_ = r.logEvent(audit.Event{Event: "applied", Tool: "undo", ArgsSHA256: currentHash, ResultSHA256: entry.SHA256Before, Detail: detail})
 	return fmt.Sprintf("Restored %s from shadow %s%s", entry.Path, entry.ID, syncWarning), nil
 }
 
@@ -1141,7 +1146,7 @@ func sanitizeAuditDetail(s string) string {
 	s = strings.ToValidUTF8(s, "\uFFFD")
 	var b strings.Builder
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f || r == '\u061c' || r == '\u200e' || r == '\u200f' ||
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == '\u061c' || r == '\u200e' || r == '\u200f' ||
 			(r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u206f') {
 			fmt.Fprintf(&b, "\\u%04X", r)
 			continue

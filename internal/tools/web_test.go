@@ -894,12 +894,41 @@ func TestWebFirecrawlKeyFileAndTimeouts(t *testing.T) {
 			t.Fatal("expected symlink rejection for key file")
 		}
 	})
+	t.Run("intermediate directory symlink rejected on unix", func(t *testing.T) {
+		if os.PathSeparator == '\\' {
+			t.Skip("POSIX directory symlink test runs on Unix")
+		}
+		realSub := filepath.Join(keyDir, "real_sub")
+		if err := os.MkdirAll(realSub, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		targetKey := filepath.Join(realSub, "fc.key")
+		if err := os.WriteFile(targetKey, []byte("fc-nested-secret\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(targetKey, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		symSub := filepath.Join(keyDir, "sym_sub")
+		if err := os.Symlink(realSub, symSub); err != nil {
+			t.Skipf("symlink creation unsupported: %v", err)
+		}
+		clearWebEnv(t)
+		t.Setenv(WebSearchProviderEnv, "firecrawl")
+		t.Setenv(WebFirecrawlAPIKeyFileEnv, filepath.Join(symSub, "fc.key"))
+		if _, err := LoadWebConfigFromEnv(); err == nil {
+			t.Fatal("expected intermediate symlink rejection for key file")
+		}
+	})
 	t.Run("loose permissions rejected on unix", func(t *testing.T) {
 		if os.PathSeparator == '\\' {
 			t.Skip("POSIX 0600 permissions are not enforced on Windows")
 		}
 		loosePath := filepath.Join(keyDir, "loose.key")
 		if err := os.WriteFile(loosePath, []byte("fc-loose-key\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(loosePath, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		clearWebEnv(t)

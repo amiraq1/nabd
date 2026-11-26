@@ -29,13 +29,6 @@ type mcpProcess struct {
 // because it may contain sensitive data.
 var mcpProcessStderrHook func(*exec.Cmd)
 
-func startMCPProcess(ctx context.Context, guard, dir, target string) (*mcpProcess, *os.File, *os.File, error) {
-	cmd := exec.Command(guard, target)
-	cmd.Dir = dir
-	cmd.Env = mcpEnvironment()
-	return startMCPProcessWithCmd(ctx, cmd)
-}
-
 // startMCPProcessWithCmd starts a caller-supplied command (for example one
 // built by the sandbox backend) with the same bounded, killable stdio wiring.
 func startMCPProcessWithCmd(ctx context.Context, cmd *exec.Cmd) (*mcpProcess, *os.File, *os.File, error) {

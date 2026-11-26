@@ -59,6 +59,39 @@ func buildBwrapArgs(p Profile, limiter, absTarget string, args ...string) []stri
 	return bwrapArgs
 }
 
+var bwrapAllowedHostEnv = []string{
+	"PATH",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"TZ",
+	"TMPDIR",
+}
+
+// bwrapHostEnv builds a minimal non-secret environment for the bwrap binary itself
+// so host secrets (NABD_API_KEY, NABD_AUDIT_ANCHOR, NABD_FIRECRAWL_API_KEY, etc.)
+// are never inherited by bubblewrap even before --clearenv executes.
+func bwrapHostEnv() []string {
+	return filterBwrapHostEnv(os.LookupEnv)
+}
+
+func filterBwrapHostEnv(lookup func(string) (string, bool)) []string {
+	env := make([]string, 0, len(bwrapAllowedHostEnv)+1)
+	hasPath := false
+	for _, key := range bwrapAllowedHostEnv {
+		if val, ok := lookup(key); ok {
+			if key == "PATH" {
+				hasPath = true
+			}
+			env = append(env, key+"="+val)
+		}
+	}
+	if !hasPath {
+		env = append(env, "PATH=/usr/bin:/bin")
+	}
+	return env
+}
+
 func validateWorkspaceMasksNoFollow(workDir string, dirs, files []string) error {
 	for _, rel := range dirs {
 		if err := verifyRelativeTargetNoFollow(workDir, rel, true); err != nil {

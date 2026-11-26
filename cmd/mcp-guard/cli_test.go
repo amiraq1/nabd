@@ -12,10 +12,60 @@ import (
 )
 
 var (
-	builtGuardOnce sync.Once
-	builtGuardPath string
-	builtGuardErr  error
+	builtGuardOnce  sync.Once
+	builtGuardPath  string
+	builtGuardErr   error
+	builtTargetOnce sync.Once
+	builtTargetPath string
+	builtTargetErr  error
 )
+
+func getTestTargetBinary(t *testing.T) string {
+	t.Helper()
+	builtTargetOnce.Do(func() {
+		binName := "test-mcp-target"
+		if runtime.GOOS == "windows" {
+			binName += ".exe"
+		}
+		dir, err := os.MkdirTemp("", "guard-target-*")
+		if err != nil {
+			builtTargetErr = err
+			return
+		}
+		src := filepath.Join(dir, "main.go")
+		code := `package main
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+func main() {
+	if len(os.Args) >= 3 && os.Args[1] == "--exit" {
+		code, _ := strconv.Atoi(os.Args[2])
+		os.Exit(code)
+	}
+	fmt.Println(strings.Join(os.Args[1:], " "))
+}
+`
+		if err := os.WriteFile(src, []byte(code), 0o600); err != nil {
+			builtTargetErr = err
+			return
+		}
+		dest := filepath.Join(dir, binName)
+		cmd := exec.Command("go", "build", "-trimpath", "-o", dest, src)
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			builtTargetErr = fmt.Errorf("build target: %w\n%s", err, string(out))
+			return
+		}
+		builtTargetPath = dest
+	})
+	if builtTargetErr != nil {
+		t.Fatalf("failed to build test target binary: %v", builtTargetErr)
+	}
+	return builtTargetPath
+}
 
 func getGuardBinary(t *testing.T) string {
 	t.Helper()

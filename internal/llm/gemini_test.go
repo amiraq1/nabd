@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -618,5 +621,92 @@ func TestGeminiContextCancellation(t *testing.T) {
 	_, err := client.Chat(ctx, Request{Messages: []Message{{Role: "user", Content: "hi"}}})
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context error, got %v", err)
+	}
+}
+
+func TestGeminiCheckModelRejectsInsecureBaseURL(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://example.com/v1beta",
+		"http://10.0.0.5/v1beta",
+		"javascript://127.0.0.1",
+		"://invalid-url",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			client := NewGeminiClient(Config{
+				Provider: "gemini",
+				BaseURL:  rawURL,
+				Model:    "gemini-2.5-flash",
+				APIKey:   "gemini-test-key",
+			})
+			if err := client.CheckModel(context.Background()); err == nil {
+				t.Fatalf("expected CheckModel to reject %q, got nil", rawURL)
+			}
+		})
+	}
+}
+
+func TestGeminiLoopbackDialerRejectsNonLoopbackIP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"models":[{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"},"finishReason":"STOP"}]}`))
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localhostURL := "http://localhost:" + u.Port()
+
+	badClient := NewGeminiClient(Config{
+		Provider: "gemini",
+		BaseURL:  localhostURL,
+		Model:    "gemini-2.5-flash",
+		Timeout:  2 * time.Second,
+	})
+	badClient.resolver = staticLoopbackResolver{ips: []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}}
+	if err := badClient.CheckModel(context.Background()); !errors.Is(err, errNonLoopbackAddress) {
+		t.Fatalf("expected CheckModel to reject non-loopback IP, got: %v", err)
+	}
+	if _, err := badClient.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}}); !errors.Is(err, errNonLoopbackAddress) {
+		t.Fatalf("expected Chat to reject non-loopback IP, got: %v", err)
+	}
+}
+
+func TestGeminiParseResponseToolCallLimitsAndEmptyName(t *testing.T) {
+	makePayload := func(count int, name string) []byte {
+		var parts strings.Builder
+		for i := 0; i < count; i++ {
+			if i > 0 {
+				parts.WriteByte(',')
+			}
+			fmt.Fprintf(&parts, `{"functionCall":{"name":%q,"args":{"path":"a.go"}}}`, name)
+		}
+		return []byte(fmt.Sprintf(`{"candidates":[{"content":{"role":"model","parts":[%s]},"finishReason":"STOP"}]}`, parts.String()))
+	}
+
+	// 64 tool calls must succeed.
+	resp, err := parseGeminiResponse(makePayload(maxToolCalls, "read_file"))
+	if err != nil {
+		t.Fatalf("expected %d tool calls to succeed, got: %v", maxToolCalls, err)
+	}
+	if len(resp.Message.ToolCalls) != maxToolCalls {
+		t.Fatalf("got %d tool calls, want %d", len(resp.Message.ToolCalls), maxToolCalls)
+	}
+
+	// 65 tool calls must be rejected.
+	if _, err := parseGeminiResponse(makePayload(maxToolCalls+1, "read_file")); err == nil || !strings.Contains(err.Error(), "too many tool calls") {
+		t.Fatalf("expected 65 tool calls to be rejected, got: %v", err)
+	}
+
+	// Empty or whitespace-only function name must be rejected.
+	for _, badName := range []string{"", "   ", "\t\n"} {
+		if _, err := parseGeminiResponse(makePayload(1, badName)); err == nil || !strings.Contains(err.Error(), "invalid tool call") {
+			t.Fatalf("expected empty/whitespace tool name %q to be rejected, got: %v", badName, err)
+		}
 	}
 }
