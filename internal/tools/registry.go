@@ -310,13 +310,13 @@ func (r *Registry) Has(name string) bool {
 // check: the last failure (nil when the most recent sweep succeeded), when it
 // happened, how many sweeps failed in a row, and when the last fully
 // successful sweep finished. Messages name store entries, not host paths.
-func (r *Registry) ShadowCleanupStatus() (lastErr error, lastAt time.Time, consecutiveFailures int, lastSuccess time.Time) {
+func (r *Registry) ShadowCleanupStatus() (lastAt time.Time, consecutiveFailures int, lastSuccess time.Time, lastErr error) {
 	if r == nil || r.shadow == nil {
-		return nil, time.Time{}, 0, time.Time{}
+		return time.Time{}, 0, time.Time{}, nil
 	}
-	lastErr, lastAt = r.shadow.LastCleanupError()
+	lastAt, lastErr = r.shadow.LastCleanupError()
 	consecutiveFailures, lastSuccess = r.shadow.CleanupFailures()
-	return lastErr, lastAt, consecutiveFailures, lastSuccess
+	return lastAt, consecutiveFailures, lastSuccess, lastErr
 }
 
 // Disable removes tools from the registry. Disabled tools are neither

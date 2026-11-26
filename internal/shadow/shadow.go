@@ -203,13 +203,13 @@ func (s *Store) cleanupLocked(now time.Time) error {
 // the sweep that produced it. A failure stays sticky until a later sweep
 // succeeds, so one undeletable file cannot be mistaken for a healthy store.
 // Messages reference store entries, never absolute host paths.
-func (s *Store) LastCleanupError() (error, time.Time) {
+func (s *Store) LastCleanupError() (time.Time, error) {
 	if s == nil {
-		return nil, time.Time{}
+		return time.Time{}, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cleanup.err, s.cleanup.at
+	return s.cleanup.at, s.cleanup.err
 }
 
 // CleanupFailures reports how many consecutive sweeps failed and when the last

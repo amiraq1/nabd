@@ -1446,7 +1446,7 @@ func (m *uiModel) formatStatus() string {
 	var b strings.Builder
 	b.WriteString("=== NabdCoder Status ===\n")
 	fmt.Fprintf(&b, "Auto-approve: %s\n", m.autoApprove)
-	if cleanupErr, at, failures, lastSuccess := m.registry.ShadowCleanupStatus(); cleanupErr != nil {
+	if at, failures, lastSuccess, cleanupErr := m.registry.ShadowCleanupStatus(); cleanupErr != nil {
 		fmt.Fprintf(&b, "Shadow cleanup: FAILING (%d consecutive) at %s: %s\n", failures, at.UTC().Format("2006-01-02T15:04:05Z"), clip(sanitizeForDisplay(cleanupErr.Error()), 160))
 	} else {
 		last := lastSuccess

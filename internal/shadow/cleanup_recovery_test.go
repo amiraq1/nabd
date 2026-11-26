@@ -228,7 +228,7 @@ func TestCleanupFailureIsReportedAndCleared(t *testing.T) {
 		t.Fatal("expected a cleanup failure")
 	}
 
-	lastErr, at := store.LastCleanupError()
+	at, lastErr := store.LastCleanupError()
 	if !errors.Is(lastErr, injected) {
 		t.Fatalf("LastCleanupError = %v, want the injected failure", lastErr)
 	}
@@ -243,7 +243,7 @@ func TestCleanupFailureIsReportedAndCleared(t *testing.T) {
 	if err := store.Cleanup(now); err != nil {
 		t.Fatalf("cleanup after clearing the failure failed: %v", err)
 	}
-	if lastErr, _ := store.LastCleanupError(); lastErr != nil {
+	if _, lastErr := store.LastCleanupError(); lastErr != nil {
 		t.Fatalf("failure stayed sticky after a successful sweep: %v", lastErr)
 	}
 	if failures, success := store.CleanupFailures(); failures != 0 || success.IsZero() {
@@ -285,7 +285,7 @@ func TestBackupReportsCleanupFailureWithoutFailing(t *testing.T) {
 	if got.ID != entry.ID || string(data) != "before-2" {
 		t.Fatalf("Latest = %+v %q, want the new entry", got, data)
 	}
-	if lastErr, _ := store.LastCleanupError(); !errors.Is(lastErr, injected) {
+	if _, lastErr := store.LastCleanupError(); !errors.Is(lastErr, injected) {
 		t.Fatalf("cleanup failure was not reported: %v", lastErr)
 	}
 }
