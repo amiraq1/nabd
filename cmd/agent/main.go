@@ -161,7 +161,6 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 	sp.Style = lipgloss.NewStyle().Foreground(colorAccent)
 
 	vp := viewport.New(80, 20)
-	vp.SetContent("NabdCoder ready — secure tools + Termux memory limits\n")
 
 	sysPrompt := buildSystemPrompt(reg)
 
@@ -245,7 +244,7 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 		})
 	}
 
-	return uiModel{
+	m := uiModel{
 		destination:   destination,
 		statusBar:     statusBar,
 		modelName:     modelName,
@@ -273,6 +272,8 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 		palette:       pal,
 		projectCtx:    projectCtx,
 	}
+	m.refresh()
+	return m
 }
 
 func (m uiModel) Init() tea.Cmd {
@@ -835,6 +836,11 @@ func (m *uiModel) refresh() {
 		m.refreshDisclosure()
 		return
 	}
+	if shouldShowWelcome(m) {
+		m.viewport.SetContent(renderWelcomeScreen(m, m.viewport.Width, m.viewport.Height))
+		m.viewport.GotoTop()
+		return
+	}
 	content := renderMessages(m.messages, m.viewport.Width, m.expandLastTool)
 	if content != "" {
 		content += "\n\n"
@@ -1044,16 +1050,20 @@ func (m *uiModel) maxPaletteRows() int {
 }
 
 func (m *uiModel) adjustViewportHeight() {
+	prevHeight := m.viewport.Height
 	if m.baseHeight <= 0 {
 		m.baseHeight = max(1, m.viewport.Height)
 	}
 	if !m.palette.open || len(m.palette.filtered) == 0 {
 		m.viewport.Height = max(1, m.baseHeight)
-		return
+	} else {
+		maxRows := m.maxPaletteRows()
+		paletteHeight := min(len(m.palette.filtered), maxRows) + 3
+		m.viewport.Height = max(1, m.baseHeight-paletteHeight)
 	}
-	maxRows := m.maxPaletteRows()
-	paletteHeight := min(len(m.palette.filtered), maxRows) + 3
-	m.viewport.Height = max(1, m.baseHeight-paletteHeight)
+	if m.viewport.Height != prevHeight && m.pendingDisclosure == nil && shouldShowWelcome(m) {
+		m.refresh()
+	}
 }
 
 func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
