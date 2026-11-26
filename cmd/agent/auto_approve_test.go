@@ -236,15 +236,18 @@ func TestAutoApprove_Command(t *testing.T) {
 		t.Fatalf("unexpected /auto response: %s", lastMsg)
 	}
 
-	// 2. /auto all changes mode and displays warning
+	// 2. /auto all must wait for an explicit confirmation and explain the bypass
 	nextM, _ = m.handleAutoCommand("all")
 	m = nextM.(uiModel)
-	if m.autoApprove != AutoApproveAll {
-		t.Fatalf("expected mode = all, got %s", m.autoApprove)
+	if m.autoApprove != AutoApproveOff {
+		t.Fatalf("mode changed before the user confirmed /auto all: %s", m.autoApprove)
+	}
+	if m.autoConfirm == nil {
+		t.Fatal("expected /auto all to raise a pending confirmation")
 	}
 	lastMsg = m.messages[len(m.messages)-1].Content
-	if !strings.Contains(lastMsg, "WARNING") {
-		t.Fatalf("expected warning when setting all mode: %s", lastMsg)
+	if !strings.Contains(lastMsg, "bypasses") {
+		t.Fatalf("expected the confirmation to explain what it bypasses: %s", lastMsg)
 	}
 
 	// 3. /auto readonly changes mode

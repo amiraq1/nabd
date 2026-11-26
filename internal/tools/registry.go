@@ -273,6 +273,22 @@ func (r *Registry) RequiresApproval(name string) bool {
 	return !spec.ReadOnly
 }
 
+// manuallyApprovedTools must be approved by a human on every call, including
+// when an auto-approval mode would otherwise cover the call. The guarantee is
+// scoped to exactly these tools: it says nothing about whether other tools
+// start subprocesses under their own policy.
+var manuallyApprovedTools = map[string]struct{}{
+	"go_verify": {},
+	"mcp_call":  {},
+}
+
+// RequiresManualApproval reports whether auto-approval is refused for this
+// tool. Callers must fall back to an interactive decision instead of guessing.
+func (r *Registry) RequiresManualApproval(name string) bool {
+	_, ok := manuallyApprovedTools[name]
+	return ok
+}
+
 // IsReadOnly reports whether a registered tool is marked ReadOnly.
 func (r *Registry) IsReadOnly(name string) bool {
 	spec, ok := r.handlers[name]
@@ -288,6 +304,19 @@ func (r *Registry) NeedsApproval(name string) bool { return r.RequiresApproval(n
 func (r *Registry) Has(name string) bool {
 	_, ok := r.handlers[name]
 	return ok
+}
+
+// ShadowCleanupStatus reports retention-sweep health for the UI and any health
+// check: the last failure (nil when the most recent sweep succeeded), when it
+// happened, how many sweeps failed in a row, and when the last fully
+// successful sweep finished. Messages name store entries, not host paths.
+func (r *Registry) ShadowCleanupStatus() (lastAt time.Time, consecutiveFailures int, lastSuccess time.Time, lastErr error) {
+	if r == nil || r.shadow == nil {
+		return time.Time{}, 0, time.Time{}, nil
+	}
+	lastAt, lastErr = r.shadow.LastCleanupError()
+	consecutiveFailures, lastSuccess = r.shadow.CleanupFailures()
+	return lastAt, consecutiveFailures, lastSuccess, lastErr
 }
 
 // Disable removes tools from the registry. Disabled tools are neither
@@ -937,6 +966,12 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 	hash := hashBytes(rawArgs)
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: r.toolDetail(name, rawArgs)}); err != nil {
 		return Approval{}, err
+	}
+	// Single enforcement point for every auto-approval entry point: a tool that
+	// needs a human decision cannot be authorized by a mode string.
+	if autoTag != "" && r.RequiresManualApproval(name) {
+		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "manual approval required"})
+		return Approval{}, fmt.Errorf("tool %q always requires a manual approval; auto-approval (%q) is refused", name, autoTag)
 	}
 	token, err := newApprovalToken()
 	if err != nil {

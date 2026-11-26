@@ -1162,6 +1162,11 @@ func formatHelpWithProject(snap projectContextSnapshot) string {
 	}
 	b.WriteString("  undo [path]     - Restore file from shadow backup\n")
 	b.WriteString("  exit, quit      - Exit NabdCoder\n\n")
+	b.WriteString("Auto-approval (NABD_AUTO_APPROVE or /auto):\n")
+	b.WriteString("  off      - every tool approval and disclosure needs a manual decision (default)\n")
+	b.WriteString("  readonly - read-only tool output is disclosed automatically unless the advisory secret heuristic matches; that heuristic is not a guarantee\n")
+	b.WriteString("  all      - needs an explicit y to enable; bypasses approvals and disclosure review, except go_verify and mcp_call which always need a manual approval\n")
+	b.WriteString("  A mode change never authorizes tool calls that were already requested.\n\n")
 	if snap.Disabled {
 		b.WriteString("Project Commands: disabled via NABD_NO_PROJECT_RULES=1\n\n")
 	} else if len(snap.Commands) > 0 {
