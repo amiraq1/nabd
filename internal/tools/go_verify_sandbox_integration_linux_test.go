@@ -4,6 +4,8 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"os"
@@ -105,6 +107,17 @@ func TestSandboxBoundaries(t *testing.T) {
 }
 `
 
+// sha256File digests an arbitrary workspace file. digestFile is the allowlist
+// digest, which requires the executable bit, so it cannot be used on fixtures.
+func sha256File(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // sandboxGoVerifySetup opens the execution gate on a throwaway workspace. It
 // fails closed: a missing bwrap or a failed proof aborts the test instead of
 // silently exercising the unsandboxed path.
@@ -184,7 +197,7 @@ func TestGoVerifySandboxHidesWorkspaceSecrets(t *testing.T) {
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		sum, err := digestFile(path)
+		sum, err := sha256File(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +257,7 @@ func TestGoVerifySandboxHidesWorkspaceSecrets(t *testing.T) {
 
 	for rel, sum := range before {
 		path := filepath.Join(workspace, filepath.FromSlash(rel))
-		got, err := digestFile(path)
+		got, err := sha256File(path)
 		if err != nil {
 			t.Errorf("%s: %v", rel, err)
 			continue
