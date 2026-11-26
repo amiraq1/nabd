@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"go/format"
+	"io"
 	"io/fs"
 	"os"
 	"strings"
@@ -30,25 +31,23 @@ type ApprovalPreview struct {
 }
 
 // PreviewApproval computes the approval payload for a tool call without writing
-// anything. edit_file gets a unified diff and a content hash; other tools keep
-// their raw arguments.
+// anything. edit_file gets a unified diff and content hash, create_file gets a
+// full new-file preview and output hash, and other tools keep raw arguments.
 func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (ApprovalPreview, error) {
-	if name != "edit_file" {
+	switch name {
+	case "edit_file":
+		return r.previewEditApproval(rawArgs)
+	case "create_file":
+		return r.previewCreateApproval(rawArgs)
+	default:
 		return ApprovalPreview{Display: string(rawArgs)}, nil
 	}
+}
 
-	var p struct {
-		Path    string `json:"path"`
-		OldText string `json:"old_text"`
-		NewText string `json:"new_text"`
-	}
-	if len(rawArgs) > 0 {
-		if err := json.Unmarshal(rawArgs, &p); err != nil {
-			return ApprovalPreview{}, fmt.Errorf("invalid arguments: %w", err)
-		}
-	}
-	if p.OldText == "" {
-		return ApprovalPreview{}, fmt.Errorf("old_text cannot be empty")
+func (r *Registry) previewEditApproval(rawArgs json.RawMessage) (ApprovalPreview, error) {
+	p, err := parseEditParams(rawArgs)
+	if err != nil {
+		return ApprovalPreview{}, err
 	}
 
 	safePath, err := r.resolveSafePath(p.Path)
@@ -65,14 +64,13 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 		if info.Size() > maxEditBytes {
 			return ApprovalPreview{}, fmt.Errorf("file is too large to edit (%d bytes; limit %d)", info.Size(), maxEditBytes)
 		}
+	} else if errors.Is(statErr, fs.ErrNotExist) {
+		return ApprovalPreview{}, fmt.Errorf("file does not exist: %s; use create_file", p.Path)
 	}
 	content, readErr := readBounded(r.root, safePath, maxEditBytes)
 	if readErr != nil {
 		if errors.Is(readErr, fs.ErrNotExist) {
-			return ApprovalPreview{
-				Display: fmt.Sprintf("File %s does not exist at approval time; no diff available (edit_file will fail).", p.Path),
-				State:   state,
-			}, nil
+			return ApprovalPreview{}, fmt.Errorf("file does not exist: %s; use create_file", p.Path)
 		}
 		return ApprovalPreview{}, readErr
 	}
@@ -87,6 +85,37 @@ func (r *Registry) PreviewApproval(name string, rawArgs json.RawMessage) (Approv
 	}
 	state.OutputHash = hashBytes(updated)
 	return ApprovalPreview{Display: unifiedDiff(content, updated, p.Path), State: state}, nil
+}
+
+func (r *Registry) previewCreateApproval(rawArgs json.RawMessage) (ApprovalPreview, error) {
+	p, err := parseCreateParams(rawArgs)
+	if err != nil {
+		return ApprovalPreview{}, err
+	}
+
+	safePath, err := r.resolveSafePath(p.Path)
+	if err != nil {
+		return ApprovalPreview{}, err
+	}
+	parts, err := validateCreatePathBounds(safePath)
+	if err != nil {
+		return ApprovalPreview{}, err
+	}
+	if err := r.inspectCreateTarget(parts, p.Path); err != nil {
+		return ApprovalPreview{}, err
+	}
+
+	contentBytes := []byte(*p.Content)
+	if err := validateGoSyntaxIfNeeded(safePath, contentBytes, "create"); err != nil {
+		return ApprovalPreview{}, err
+	}
+
+	state := ApprovalState{
+		Path:       safePath,
+		Exists:     false,
+		OutputHash: hashBytes(contentBytes),
+	}
+	return ApprovalPreview{Display: newFilePreview(contentBytes, p.Path), State: state}, nil
 }
 
 type editParams struct {
@@ -106,6 +135,45 @@ func parseEditParams(rawArgs json.RawMessage) (editParams, error) {
 		return p, fmt.Errorf("old_text cannot be empty")
 	}
 	return p, nil
+}
+
+type createParams struct {
+	Path    string  `json:"path"`
+	Content *string `json:"content"`
+}
+
+func parseCreateParams(rawArgs json.RawMessage) (createParams, error) {
+	var p createParams
+	if len(bytes.TrimSpace(rawArgs)) == 0 {
+		return p, fmt.Errorf("invalid arguments: empty")
+	}
+	dec := json.NewDecoder(bytes.NewReader(rawArgs))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return p, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return p, fmt.Errorf("invalid arguments: unexpected trailing data")
+	}
+	if p.Content == nil {
+		return p, fmt.Errorf("content is required")
+	}
+	if len(*p.Content) > maxCreateBytes {
+		return p, fmt.Errorf("file content is too large (%d bytes; limit %d)", len(*p.Content), maxCreateBytes)
+	}
+	return p, nil
+}
+
+func validateGoSyntaxIfNeeded(safePath string, content []byte, op string) error {
+	if !strings.HasSuffix(strings.ToLower(safePath), ".go") {
+		return nil
+	}
+	// Parse and validate without gofmt: automatic formatting could alter
+	// unrelated bytes outside what the user reviewed and approved.
+	if _, err := format.Source(content); err != nil {
+		return fmt.Errorf("%s rejected due to Go syntax error:\n%v", op, err)
+	}
+	return nil
 }
 
 // editBeforeRenameHook is a test-only seam; production leaves it nil.
@@ -159,12 +227,8 @@ func applyEdit(contentBytes []byte, displayPath, safePath, oldText, newText stri
 	updated = append(updated, contentBytes[:start]...)
 	updated = append(updated, replacement...)
 	updated = append(updated, contentBytes[end:]...)
-	if strings.HasSuffix(safePath, ".go") {
-		// Parse and validate without gofmt: automatic formatting could alter
-		// unrelated bytes outside the approved replacement.
-		if _, err := format.Source(updated); err != nil {
-			return nil, fmt.Errorf("edit rejected due to Go syntax error:\n%v", err)
-		}
+	if err := validateGoSyntaxIfNeeded(safePath, updated, "edit"); err != nil {
+		return nil, err
 	}
 	if len(updated) > maxEditBytes {
 		return nil, fmt.Errorf("edited file too large (limit %d bytes)", maxEditBytes)
@@ -185,10 +249,16 @@ func (r *Registry) verifyEditState(p editParams, state ApprovalState) ([]byte, s
 		return nil, "", fmt.Errorf("missing approval state")
 	}
 	if state.Path != safePath {
-		return nil, "", fmt.Errorf("file changed since approval: path mismatch")
+		return nil, "", fmt.Errorf("approval path mismatch")
+	}
+	if !state.Exists {
+		return nil, "", fmt.Errorf("file does not exist: %s; use create_file", p.Path)
 	}
 	info, err := r.root.Lstat(safePath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, "", fmt.Errorf("file no longer exists since approval: %s", p.Path)
+		}
 		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
@@ -196,12 +266,48 @@ func (r *Registry) verifyEditState(p editParams, state ApprovalState) ([]byte, s
 	}
 	content, err := readBounded(r.root, safePath, maxEditBytes)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, "", fmt.Errorf("file no longer exists since approval: %s", p.Path)
+		}
 		return nil, "", fmt.Errorf("file changed since approval: %s: %w", p.Path, err)
 	}
-	if !state.Exists || hashBytes(content) != state.Hash {
+	if hashBytes(content) != state.Hash {
 		return nil, "", fmt.Errorf("file changed since approval: %s", p.Path)
 	}
 	return content, safePath, nil
+}
+
+// verifyCreateState verifies that a create_file target remains absent, path-safe,
+// and bound to the exact approved output hash.
+func (r *Registry) verifyCreateState(p createParams, state ApprovalState) ([]byte, string, error) {
+	safePath, err := r.resolveSafePath(p.Path)
+	if err != nil {
+		return nil, "", err
+	}
+	parts, err := validateCreatePathBounds(safePath)
+	if err != nil {
+		return nil, "", err
+	}
+	if state.Path == "" {
+		return nil, "", fmt.Errorf("missing approval state")
+	}
+	if state.Path != safePath {
+		return nil, "", fmt.Errorf("approval path mismatch")
+	}
+	if state.Exists || state.Hash != "" {
+		return nil, "", fmt.Errorf("invalid approval state for new file: %s", p.Path)
+	}
+	if err := r.inspectCreateTarget(parts, p.Path); err != nil {
+		return nil, "", err
+	}
+	contentBytes := []byte(*p.Content)
+	if err := validateGoSyntaxIfNeeded(safePath, contentBytes, "create"); err != nil {
+		return nil, "", err
+	}
+	if state.OutputHash == "" || hashBytes(contentBytes) != state.OutputHash {
+		return nil, "", fmt.Errorf("output differs from approved preview")
+	}
+	return contentBytes, safePath, nil
 }
 
 func splitDiffLines(s string) []string {
@@ -213,6 +319,36 @@ func splitDiffLines(s string) []string {
 		lines = lines[:len(lines)-1]
 	}
 	return lines
+}
+
+func writePreviewLine(b *strings.Builder, prefix, line string) {
+	eol := "NONE"
+	if strings.HasSuffix(line, "\r\n") {
+		line = strings.TrimSuffix(line, "\r\n")
+		eol = "CRLF"
+	} else if strings.HasSuffix(line, "\n") {
+		line = strings.TrimSuffix(line, "\n")
+		eol = "LF"
+	}
+	fmt.Fprintf(b, "%s%s [EOL=%s]\n", prefix, line, eol)
+	if eol == "NONE" {
+		b.WriteString("\\ No newline at end of file\n")
+	}
+}
+
+func newFilePreview(content []byte, path string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "--- /dev/null\n+++ b/%s\n", path)
+	if len(content) == 0 {
+		b.WriteString("(empty file, 0 bytes)\n")
+		return b.String()
+	}
+	lines := splitDiffLines(string(content))
+	fmt.Fprintf(&b, "@@ -0,0 +1,%d @@\n", len(lines))
+	for _, line := range lines {
+		writePreviewLine(&b, "+", line)
+	}
+	return b.String()
 }
 
 // unifiedDiff renders a human-reviewable diff. It uses a common prefix/suffix
@@ -256,31 +392,17 @@ func unifiedDiff(oldContent, newContent []byte, path string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "--- a/%s\n+++ b/%s\n", path, path)
 	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", startOld+1, endOld-startOld, startNew+1, endNew-startNew)
-	writeLine := func(prefix, line string) {
-		eol := "NONE"
-		if strings.HasSuffix(line, "\r\n") {
-			line = strings.TrimSuffix(line, "\r\n")
-			eol = "CRLF"
-		} else if strings.HasSuffix(line, "\n") {
-			line = strings.TrimSuffix(line, "\n")
-			eol = "LF"
-		}
-		fmt.Fprintf(&b, "%s%s [EOL=%s]\n", prefix, line, eol)
-		if eol == "NONE" {
-			b.WriteString("\\ No newline at end of file\n")
-		}
-	}
 	for _, line := range oldLines[startOld:prefix] {
-		writeLine(" ", line)
+		writePreviewLine(&b, " ", line)
 	}
 	for _, line := range oldLines[prefix : len(oldLines)-suffix] {
-		writeLine("-", line)
+		writePreviewLine(&b, "-", line)
 	}
 	for _, line := range newLines[prefix : len(newLines)-suffix] {
-		writeLine("+", line)
+		writePreviewLine(&b, "+", line)
 	}
 	for _, line := range oldLines[len(oldLines)-suffix : endOld] {
-		writeLine(" ", line)
+		writePreviewLine(&b, " ", line)
 	}
 	return b.String()
 }

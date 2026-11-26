@@ -73,7 +73,7 @@ func TestPolicyMCP(t *testing.T) {
 	for _, tool := range listed.Tools {
 		names[tool.Name] = true
 	}
-	for _, name := range []string{"edit_file", "go_verify", "mcp_call"} {
+	for _, name := range []string{"create_file", "edit_file", "go_verify", "mcp_call"} {
 		if names[name] {
 			t.Errorf("%s exposed", name)
 		}
@@ -84,9 +84,10 @@ func TestPolicyMCP(t *testing.T) {
 		}
 	}
 	args := map[string]map[string]any{
-		"edit_file": {"path": "sample.txt", "old_text": "before", "new_text": "after"},
-		"go_verify": {"pkg": "."},
-		"mcp_call":  {"command": script, "tool": "anything"},
+		"create_file": {"path": "new.txt", "content": "hello"},
+		"edit_file":   {"path": "sample.txt", "old_text": "before", "new_text": "after"},
+		"go_verify":   {"pkg": "."},
+		"mcp_call":    {"command": script, "tool": "anything"},
 	}
 	for name, a := range args {
 		result, err := call(t, c, name, a)

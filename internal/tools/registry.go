@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -29,6 +30,10 @@ const (
 	maxReadBytes         = 512 << 10
 	maxReadPageBytes     = 3584
 	maxEditBytes         = 2 << 20
+	maxCreateBytes       = maxEditBytes
+	maxCreateDepth       = 15
+	maxCreatePathBytes   = 512
+	maxPathSegmentBytes  = 255
 	maxListEntries       = 1000
 	maxListScan          = 4096
 	maxVerifyOutputBytes = 64 << 10
@@ -710,52 +715,103 @@ var syncParentDirectoryHook func(*os.File) error
 // parentRenameHook is a test-only seam for simulating replacement failures.
 var parentRenameHook func() error
 
+// publishNewFileHook is a test-only seam for simulating exclusive-create
+// primitives on restricted filesystems. Production leaves it nil.
+var publishNewFileHook func(parent *os.Root, dir *os.File, tmp, base string) error
+
+type atomicWriteOpts struct {
+	mode         os.FileMode
+	preserveMode bool
+	expectedHash string
+	createNew    bool
+	parentRoot   *os.Root
+}
+
 func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode, expectedHash string) error {
-	// Keep a handle to the same parent for staging, checking, rename and sync.
-	parent, err := r.root.OpenRoot(filepath.Dir(rel))
-	if err != nil {
-		return fmt.Errorf("open parent: %w", err)
+	return r.atomicWrite(rel, data, atomicWriteOpts{
+		mode:         mode,
+		preserveMode: true,
+		expectedHash: expectedHash,
+	})
+}
+
+func (r *Registry) atomicWrite(rel string, data []byte, opts atomicWriteOpts) error {
+	// Keep a handle to the same parent for staging, checking, publish and sync.
+	parent := opts.parentRoot
+	if parent == nil {
+		var err error
+		parent, err = r.root.OpenRoot(filepath.Dir(rel))
+		if err != nil {
+			return fmt.Errorf("open parent: %w", err)
+		}
+		defer parent.Close()
 	}
-	defer parent.Close()
 	dir, err := parent.Open(".")
 	if err != nil {
 		return fmt.Errorf("open parent for sync: %w", err)
 	}
 	defer dir.Close()
+
 	base := filepath.Base(rel)
 	tmp := ".nabd-tmp-" + randomHex(8)
-	f, err := parent.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
+	f, err := parent.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, opts.mode.Perm())
 	if err != nil {
 		return fmt.Errorf("create temporary file: %w", err)
 	}
 	_, writeErr := f.Write(data)
-	modeErr := f.Chmod(mode.Perm())
+	var modeErr error
+	if opts.preserveMode {
+		modeErr = f.Chmod(opts.mode.Perm())
+	}
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := errors.Join(writeErr, modeErr, syncErr, closeErr); err != nil {
 		_ = parent.Remove(tmp)
 		return fmt.Errorf("write temporary file: %w", err)
 	}
-	if expectedHash != "" {
+
+	if opts.expectedHash != "" {
 		if editBeforeRenameHook != nil {
 			editBeforeRenameHook()
 		}
 		info, statErr := parent.Lstat(base)
 		current, readErr := readBounded(parent, base, maxEditBytes)
-		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != expectedHash {
+		if errors.Is(statErr, fs.ErrNotExist) || errors.Is(readErr, fs.ErrNotExist) {
+			_ = parent.Remove(tmp)
+			return fmt.Errorf("file no longer exists since approval: %s", rel)
+		}
+		if statErr != nil || readErr != nil || info.Mode()&os.ModeSymlink != 0 || hashBytes(current) != opts.expectedHash {
 			_ = parent.Remove(tmp)
 			return fmt.Errorf("file changed since approval: %s", rel)
 		}
+	} else if opts.createNew {
+		if editBeforeRenameHook != nil {
+			editBeforeRenameHook()
+		}
+		if _, statErr := parent.Lstat(base); statErr == nil {
+			_ = parent.Remove(tmp)
+			return fmt.Errorf("file already exists: %s", rel)
+		} else if !errors.Is(statErr, fs.ErrNotExist) {
+			_ = parent.Remove(tmp)
+			return fmt.Errorf("inspect target %s: %w", rel, statErr)
+		}
 	}
+
 	if parentRenameHook != nil {
 		if err := parentRenameHook(); err != nil {
 			_ = parent.Remove(tmp)
 			return fmt.Errorf("replace %s: %w", rel, err)
 		}
 	}
-	if err := parent.Rename(tmp, base); err != nil {
-		_ = parent.Remove(tmp)
-		return fmt.Errorf("replace %s: %w", rel, err)
+	if opts.createNew {
+		if err := publishNewFile(parent, dir, tmp, base, rel); err != nil {
+			return err
+		}
+	} else {
+		if err := parent.Rename(tmp, base); err != nil {
+			_ = parent.Remove(tmp)
+			return fmt.Errorf("replace %s: %w", rel, err)
+		}
 	}
 	syncDir := syncParentDirectory
 	if syncParentDirectoryHook != nil {
@@ -763,6 +819,67 @@ func (r *Registry) atomicWriteChecked(rel string, data []byte, mode os.FileMode,
 	}
 	if err := syncDir(dir); err != nil {
 		return &commitUncertainError{err: err}
+	}
+	return nil
+}
+
+func publishNewFile(parent *os.Root, dir *os.File, tmp, base, rel string) error {
+	if publishNewFileHook != nil {
+		err := publishNewFileHook(parent, dir, tmp, base)
+		if err == nil {
+			return nil
+		}
+		if isExistErr(err) {
+			_ = parent.Remove(tmp)
+			return fmt.Errorf("file already exists: %s", rel)
+		}
+		if !isUnsupportedExclusiveRename(err) && !isUnsupportedHardLink(err) {
+			_ = parent.Remove(tmp)
+			return fmt.Errorf("create %s: %w", rel, err)
+		}
+		return fallbackExclusiveRename(parent, tmp, base, rel)
+	}
+
+	if err := tryRenameNoReplace(dir, tmp, base); err == nil {
+		return nil
+	} else if isExistErr(err) {
+		_ = parent.Remove(tmp)
+		return fmt.Errorf("file already exists: %s", rel)
+	} else if !isUnsupportedExclusiveRename(err) {
+		_ = parent.Remove(tmp)
+		return fmt.Errorf("create %s: %w", rel, err)
+	}
+
+	if err := parent.Link(tmp, base); err == nil {
+		if rmErr := parent.Remove(tmp); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+			return fmt.Errorf("created %s but could not remove temp file: %w", rel, rmErr)
+		}
+		return nil
+	} else if isExistErr(err) {
+		_ = parent.Remove(tmp)
+		return fmt.Errorf("file already exists: %s", rel)
+	} else if !isUnsupportedHardLink(err) {
+		_ = parent.Remove(tmp)
+		return fmt.Errorf("create %s: %w", rel, err)
+	}
+
+	return fallbackExclusiveRename(parent, tmp, base, rel)
+}
+
+func fallbackExclusiveRename(parent *os.Root, tmp, base, rel string) error {
+	// Filesystems without RENAME_NOREPLACE or hard links (e.g., Android /sdcard FUSE
+	// or FAT32) fall back to a final Lstat check before Rename; an external writer
+	// racing in this narrow window cannot be blocked atomically by the kernel.
+	if _, err := parent.Lstat(base); err == nil {
+		_ = parent.Remove(tmp)
+		return fmt.Errorf("file already exists: %s", rel)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		_ = parent.Remove(tmp)
+		return fmt.Errorf("inspect target %s: %w", rel, err)
+	}
+	if err := parent.Rename(tmp, base); err != nil {
+		_ = parent.Remove(tmp)
+		return fmt.Errorf("create %s: %w", rel, err)
 	}
 	return nil
 }
@@ -817,13 +934,13 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "no approver configured"})
 		return fmt.Sprintf("Error: tool %q requires approval, but no approver is configured", name)
 	}
-	var editState *ApprovalState
-	if name == "edit_file" {
+	var previewState *ApprovalState
+	if isFileApprovalTool(name) {
 		preview, err := r.PreviewApproval(name, rawArgs)
 		if err != nil {
 			return r.failedResult(name, hash, err)
 		}
-		editState = &preview.State
+		previewState = &preview.State
 	}
 	if !r.approve(name, string(rawArgs)) {
 		_ = r.logEvent(audit.Event{Event: "denied", Tool: name, ArgsSHA256: hash, Reason: "denied by approver"})
@@ -832,17 +949,54 @@ func (r *Registry) Run(ctx context.Context, name string, rawArgs json.RawMessage
 	if err := r.logEvent(audit.Event{Event: "approved", Tool: name, ArgsSHA256: hash}); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
-	if editState != nil {
-		p, err := parseEditParams(rawArgs)
+	if previewState != nil {
+		var err error
+		ctx, err = r.verifyAndBindFileApproval(ctx, name, rawArgs, *previewState)
 		if err != nil {
 			return r.failedResult(name, hash, err)
 		}
-		if _, _, err := r.verifyEditState(p, *editState); err != nil {
-			return r.failedResult(name, hash, err)
-		}
-		ctx = context.WithValue(ctx, editApprovalKey{}, *editState)
 	}
 	return r.execute(ctx, spec, name, rawArgs, hash)
+}
+
+func isFileApprovalTool(name string) bool {
+	return name == "edit_file" || name == "create_file"
+}
+
+func (r *Registry) prepareApprovalState(name string, rawArgs json.RawMessage) (*ApprovalState, error) {
+	if !isFileApprovalTool(name) {
+		return nil, nil
+	}
+	preview, err := r.PreviewApproval(name, rawArgs)
+	if err != nil {
+		return nil, err
+	}
+	return &preview.State, nil
+}
+
+func (r *Registry) verifyAndBindFileApproval(ctx context.Context, name string, rawArgs json.RawMessage, state ApprovalState) (context.Context, error) {
+	switch name {
+	case "edit_file":
+		p, err := parseEditParams(rawArgs)
+		if err != nil {
+			return ctx, err
+		}
+		if _, _, err := r.verifyEditState(p, state); err != nil {
+			return ctx, err
+		}
+		return context.WithValue(ctx, editApprovalKey{}, state), nil
+	case "create_file":
+		p, err := parseCreateParams(rawArgs)
+		if err != nil {
+			return ctx, err
+		}
+		if _, _, err := r.verifyCreateState(p, state); err != nil {
+			return ctx, err
+		}
+		return context.WithValue(ctx, createApprovalKey{}, state), nil
+	default:
+		return ctx, nil
+	}
 }
 
 // RecordDenied records a user rejection without storing raw arguments.
@@ -862,29 +1016,13 @@ func (r *Registry) RecordDenied(name string, rawArgs json.RawMessage) error {
 // this exact tool call. The audit write is mandatory: if it fails, no token is
 // issued and nothing can execute.
 func (r *Registry) Approve(name string, rawArgs json.RawMessage) (Approval, error) {
-	var state *ApprovalState
-	var previewErr error
-	if name == "edit_file" {
-		preview, err := r.PreviewApproval(name, rawArgs)
-		previewErr = err
-		if err == nil {
-			state = &preview.State
-		}
-	}
+	state, previewErr := r.prepareApprovalState(name, rawArgs)
 	return r.approveWithState(name, rawArgs, state, previewErr, "", "")
 }
 
 // ApproveAuto records an explicit approval with an auto-approval mode tag in the audit log.
 func (r *Registry) ApproveAuto(name string, rawArgs json.RawMessage, mode string) (Approval, error) {
-	var state *ApprovalState
-	var previewErr error
-	if name == "edit_file" {
-		preview, err := r.PreviewApproval(name, rawArgs)
-		previewErr = err
-		if err == nil {
-			state = &preview.State
-		}
-	}
+	state, previewErr := r.prepareApprovalState(name, rawArgs)
 	return r.approveWithState(name, rawArgs, state, previewErr, "", mode)
 }
 
@@ -908,16 +1046,16 @@ func (r *Registry) ApproveWithIdentityAuto(name string, rawArgs json.RawMessage,
 
 // ApprovePreview binds a single-use token to the file state shown in the UI.
 func (r *Registry) ApprovePreview(name string, rawArgs json.RawMessage, state ApprovalState) (Approval, error) {
-	if name != "edit_file" {
-		return Approval{}, fmt.Errorf("preview state is only valid for edit_file")
+	if !isFileApprovalTool(name) {
+		return Approval{}, fmt.Errorf("preview state is only valid for edit_file or create_file")
 	}
 	return r.approveWithState(name, rawArgs, &state, nil, "", "")
 }
 
 // ApprovePreviewAuto binds a single-use token to preview state with an auto-approval mode tag.
 func (r *Registry) ApprovePreviewAuto(name string, rawArgs json.RawMessage, state ApprovalState, mode string) (Approval, error) {
-	if name != "edit_file" {
-		return Approval{}, fmt.Errorf("preview state is only valid for edit_file")
+	if !isFileApprovalTool(name) {
+		return Approval{}, fmt.Errorf("preview state is only valid for edit_file or create_file")
 	}
 	return r.approveWithState(name, rawArgs, &state, nil, "", mode)
 }
@@ -1020,21 +1158,18 @@ func (r *Registry) RunApproved(ctx context.Context, name string, rawArgs json.Ra
 		return "Error: approval token is invalid or expired"
 	}
 
-	if name == "edit_file" {
+	if isFileApprovalTool(name) {
 		if pending.preflightErr != nil {
 			return r.failedResult(name, hash, pending.preflightErr)
 		}
 		if pending.state == nil {
 			return r.failedResult(name, hash, fmt.Errorf("missing approval state"))
 		}
-		p, err := parseEditParams(rawArgs)
-		if err != nil {
-			return r.failedResult(name, hash, err)
+		var bindErr error
+		ctx, bindErr = r.verifyAndBindFileApproval(ctx, name, rawArgs, *pending.state)
+		if bindErr != nil {
+			return r.failedResult(name, hash, bindErr)
 		}
-		if _, _, err = r.verifyEditState(p, *pending.state); err != nil {
-			return r.failedResult(name, hash, err)
-		}
-		ctx = context.WithValue(ctx, editApprovalKey{}, *pending.state)
 	}
 	return r.execute(ctx, spec, name, rawArgs, hash)
 }
@@ -1046,6 +1181,7 @@ func (r *Registry) failedResult(name, hash string, err error) string {
 }
 
 type editApprovalKey struct{}
+type createApprovalKey struct{}
 
 func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawArgs json.RawMessage, hash string) string {
 	// Record the decision to execute before side effects happen. If the final
@@ -1131,16 +1267,29 @@ func (r *Registry) logEvent(event audit.Event) error {
 
 func (r *Registry) toolDetail(name string, rawArgs json.RawMessage) string {
 	var p struct {
-		Path    string `json:"path"`
-		Pkg     string `json:"pkg"`
-		Command string `json:"command"`
-		Query   string `json:"query"`
-		URL     string `json:"url"`
+		Path    string  `json:"path"`
+		Content *string `json:"content"`
+		Pkg     string  `json:"pkg"`
+		Command string  `json:"command"`
+		Query   string  `json:"query"`
+		URL     string  `json:"url"`
 	}
 	_ = json.Unmarshal(rawArgs, &p)
 
 	var detail string
 	switch name {
+	case "create_file":
+		pathPart := sanitizeAuditDetail(p.Path)
+		if p.Content != nil {
+			contentBytes := []byte(*p.Content)
+			suffix := fmt.Sprintf(" size=%d sha256=%s", len(contentBytes), hashBytes(contentBytes))
+			maxPath := 200 - len(suffix)
+			if maxPath < 20 {
+				maxPath = 20
+			}
+			return clipUTF8(pathPart, maxPath) + suffix
+		}
+		detail = p.Path
 	case "edit_file", "read_file", "list_dir":
 		detail = p.Path
 	case "go_verify":
@@ -1167,12 +1316,23 @@ func (r *Registry) toolDetail(name string, rawArgs json.RawMessage) string {
 		detail = "."
 	}
 	if name == "mcp_call" && len(detail) > 80 {
-		detail = detail[:80]
+		detail = clipUTF8(detail, 80)
 	}
-	if len(detail) > 200 {
-		detail = detail[:200]
+	return clipUTF8(sanitizeAuditDetail(detail), 200)
+}
+
+func clipUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
 	}
-	return sanitizeAuditDetail(detail)
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // sanitizeAuditDetail makes control and bidirectional characters visible so
@@ -1192,21 +1352,243 @@ func sanitizeAuditDetail(s string) string {
 }
 
 func (r *Registry) registerDefaults() {
+	r.registerCreateTool()
 	r.registerEditTool()
 	r.registerOtherTools()
 	r.registerWebTools()
 }
 
+func (r *Registry) registerCreateTool() {
+	r.handlers["create_file"] = ToolSpec{
+		Name:        "create_file",
+		Description: "Create a new file inside the workspace, creating missing parent directories safely. Fails closed if the file already exists (use edit_file for existing files). Validates Go syntax before saving. Keep content under 4000 bytes (the approval limit); for larger files, create a minimal skeleton and extend it with edit_file.",
+		ReadOnly:    false,
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path within workspace"},"content":{"type":"string","description":"Full content of the new file"}},"required":["path","content"]}`),
+		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return r.withProcessLock(func() (string, error) { return r.executeCreate(ctx, args) })
+		},
+	}
+}
+
 func (r *Registry) registerEditTool() {
 	r.handlers["edit_file"] = ToolSpec{
 		Name:        "edit_file",
-		Description: "Replace an exact block of text in a file. Validates Go syntax before saving without reformatting unrelated bytes. Keep edits under 4000 bytes (the approval limit). Provide 2-4 lines of unique surrounding context in old_text to avoid ambiguous matches. For large changes, apply multiple smaller syntax-valid edits.",
+		Description: "Replace an exact block of text in an existing file. Validates Go syntax before saving without reformatting unrelated bytes. Keep edits under 4000 bytes (the approval limit). Provide 2-4 lines of unique surrounding context in old_text to avoid ambiguous matches. For large changes, apply multiple smaller syntax-valid edits. For new files, use create_file.",
 		ReadOnly:    false,
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Relative file path within workspace"},"old_text":{"type":"string","description":"Exact existing block to replace, including 2-4 lines of surrounding context for uniqueness"},"new_text":{"type":"string","description":"Replacement block"}},"required":["path","old_text","new_text"]}`),
 		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
 			return r.withProcessLock(func() (string, error) { return r.executeEdit(ctx, args) })
 		},
 	}
+}
+
+// PathAbsent reports whether relPath does not currently exist (including as
+// a dangling symlink) and has no symlink or non-directory parent components.
+func (r *Registry) PathAbsent(relPath string) (bool, error) {
+	rel, err := r.resolveSafePath(relPath)
+	if err != nil {
+		return false, err
+	}
+	parts, err := validateCreatePathBounds(rel)
+	if err != nil {
+		return false, err
+	}
+	if err := r.inspectCreateTarget(parts, relPath); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+func validateCreatePathBounds(rel string) ([]string, error) {
+	if rel == "." {
+		return nil, fmt.Errorf("file path cannot be workspace root")
+	}
+	if len(rel) > maxCreatePathBytes {
+		return nil, fmt.Errorf("path is too long (%d bytes; limit %d)", len(rel), maxCreatePathBytes)
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts)-1 > maxCreateDepth {
+		return nil, fmt.Errorf("path nesting too deep (%d parent directories; limit %d)", len(parts)-1, maxCreateDepth)
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, fmt.Errorf("invalid path component %q", part)
+		}
+		if len(part) > maxPathSegmentBytes {
+			return nil, fmt.Errorf("path component too long (%d bytes; limit %d)", len(part), maxPathSegmentBytes)
+		}
+	}
+	return parts, nil
+}
+
+func (r *Registry) inspectCreateTarget(parts []string, displayPath string) error {
+	parentRoot, _, err := r.walkCreateParents(parts, displayPath, false)
+	if err != nil {
+		return err
+	}
+	if parentRoot == nil {
+		return nil
+	}
+	defer parentRoot.Close()
+	return ensureCreateTargetAbsent(parentRoot, parts[len(parts)-1], displayPath)
+}
+
+func ensureCreateTargetAbsent(parentRoot *os.Root, base, displayPath string) error {
+	info, err := parentRoot.Lstat(base)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("creating over symlinks is not supported: %s", displayPath)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("path is a directory: %s", displayPath)
+		}
+		return fmt.Errorf("file already exists: %s; use edit_file", displayPath)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("inspect %s: %w", displayPath, err)
+	}
+	return nil
+}
+
+func (r *Registry) walkCreateParents(parts []string, _ string, createDirs bool) (parentRoot *os.Root, created []string, err error) {
+	curRoot, err := r.root.OpenRoot(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf("open workspace root: %w", err)
+	}
+	closeOnErr := true
+	defer func() {
+		if closeOnErr && curRoot != nil {
+			_ = curRoot.Close()
+		}
+	}()
+
+	curRel := ""
+	for _, part := range parts[:len(parts)-1] {
+		if curRel == "" {
+			curRel = part
+		} else {
+			curRel += "/" + part
+		}
+		info, lerr := curRoot.Lstat(part)
+		if lerr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, created, fmt.Errorf("symlink path components are not allowed: %s", curRel)
+			}
+			if !info.IsDir() {
+				return nil, created, fmt.Errorf("parent path is not a directory: %s", curRel)
+			}
+		} else if errors.Is(lerr, fs.ErrNotExist) {
+			if !createDirs {
+				return nil, nil, nil
+			}
+			if mkErr := curRoot.Mkdir(part, 0o755); mkErr == nil {
+				created = append(created, curRel)
+			} else if errors.Is(mkErr, fs.ErrExist) {
+				info, lerr = curRoot.Lstat(part)
+				if lerr != nil {
+					return nil, created, fmt.Errorf("inspect parent %s: %w", curRel, lerr)
+				}
+				if info.Mode()&os.ModeSymlink != 0 {
+					return nil, created, fmt.Errorf("symlink path components are not allowed: %s", curRel)
+				}
+				if !info.IsDir() {
+					return nil, created, fmt.Errorf("parent path is not a directory: %s", curRel)
+				}
+			} else {
+				return nil, created, fmt.Errorf("create parent directory %s: %w", curRel, mkErr)
+			}
+		} else {
+			return nil, created, fmt.Errorf("inspect parent %s: %w", curRel, lerr)
+		}
+
+		nextRoot, oerr := curRoot.OpenRoot(part)
+		if oerr != nil {
+			return nil, created, fmt.Errorf("open parent directory %s: %w", curRel, oerr)
+		}
+		if verr := verifyOpenedDirNoFollow(curRoot, part, nextRoot); verr != nil {
+			_ = nextRoot.Close()
+			return nil, created, verr
+		}
+		_ = curRoot.Close()
+		curRoot = nextRoot
+	}
+
+	closeOnErr = false
+	return curRoot, created, nil
+}
+
+func (r *Registry) rollbackCreatedDirs(created []string) {
+	for i := len(created) - 1; i >= 0; i-- {
+		_ = r.root.Remove(created[i])
+	}
+}
+
+// executeCreate creates a brand-new file while holding the in-process write
+// mutex. Cross-process exclusion is applied by the caller.
+func (r *Registry) executeCreate(ctx context.Context, args json.RawMessage) (string, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	p, err := parseCreateParams(args)
+	if err != nil {
+		return "", err
+	}
+	rel, err := r.resolveSafePath(p.Path)
+	if err != nil {
+		return "", err
+	}
+	parts, err := validateCreatePathBounds(rel)
+	if err != nil {
+		return "", err
+	}
+	contentBytes := []byte(*p.Content)
+	if err := validateGoSyntaxIfNeeded(rel, contentBytes, "create"); err != nil {
+		return "", err
+	}
+
+	if state, ok := ctx.Value(createApprovalKey{}).(ApprovalState); ok {
+		if state.Path != rel || state.Exists || state.Hash != "" {
+			return "", fmt.Errorf("approval path mismatch")
+		}
+		if state.OutputHash == "" || hashBytes(contentBytes) != state.OutputHash {
+			return "", fmt.Errorf("output differs from approved preview")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	parentRoot, createdDirs, err := r.walkCreateParents(parts, p.Path, true)
+	if err != nil {
+		r.rollbackCreatedDirs(createdDirs)
+		return "", err
+	}
+	defer parentRoot.Close()
+
+	if err := ensureCreateTargetAbsent(parentRoot, parts[len(parts)-1], p.Path); err != nil {
+		r.rollbackCreatedDirs(createdDirs)
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		r.rollbackCreatedDirs(createdDirs)
+		return "", err
+	}
+
+	err = r.atomicWrite(rel, contentBytes, atomicWriteOpts{
+		mode:         0o644,
+		preserveMode: false,
+		createNew:    true,
+		parentRoot:   parentRoot,
+	})
+	if err != nil {
+		var uncertain *commitUncertainError
+		if errors.As(err, &uncertain) {
+			return fmt.Sprintf("Successfully created %s; warning: %s", p.Path, err), nil
+		}
+		r.rollbackCreatedDirs(createdDirs)
+		return "", err
+	}
+	return fmt.Sprintf("Successfully created %s", p.Path), nil
 }
 
 // executeEdit performs the edit while holding the in-process write mutex.
@@ -1235,6 +1617,9 @@ func (r *Registry) executeEdit(ctx context.Context, args json.RawMessage) (strin
 	}
 	info, err := r.root.Lstat(rel)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("file does not exist: %s; use create_file", p.Path)
+		}
 		return "", err
 	}
 	if info.IsDir() {
@@ -1249,10 +1634,16 @@ func (r *Registry) executeEdit(ctx context.Context, args json.RawMessage) (strin
 
 	contentBytes, err := readBounded(r.root, rel, maxEditBytes)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("file does not exist: %s; use create_file", p.Path)
+		}
 		return "", err
 	}
 	if state, ok := ctx.Value(editApprovalKey{}).(ApprovalState); ok {
-		if state.Path != rel || !state.Exists || hashBytes(contentBytes) != state.Hash {
+		if !state.Exists {
+			return "", fmt.Errorf("file does not exist: %s; use create_file", p.Path)
+		}
+		if state.Path != rel || hashBytes(contentBytes) != state.Hash {
 			return "", fmt.Errorf("file changed since approval: %s", p.Path)
 		}
 	}

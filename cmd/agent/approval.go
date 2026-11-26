@@ -20,6 +20,7 @@ type approvalPreview struct {
 	Summary        string
 	GuardPath      string
 	GuardSHA       string
+	GuardAbsent    bool
 	IdentitySHA256 string
 	State          tools.ApprovalState
 }
@@ -27,6 +28,10 @@ type approvalPreview struct {
 func (m *uiModel) approvalStillValid() bool {
 	if m.approval.GuardPath == "" {
 		return true
+	}
+	if m.approval.GuardAbsent {
+		absent, err := m.registry.PathAbsent(m.approval.GuardPath)
+		return err == nil && absent
 	}
 	sum, err := m.registry.FileDigest(m.approval.GuardPath)
 	if err != nil {
@@ -66,6 +71,27 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		b.WriteString(prefixBlock(p.NewText, "+ "))
 		preview.Summary = clip(sanitizeForDisplay(b.String()), maxApprovalChars)
 		return preview
+
+	case "create_file":
+		var p struct {
+			Path    string  `json:"path"`
+			Content *string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &p); err != nil {
+			return approvalPreview{Summary: clip(sanitizeForDisplay("arguments: "+tc.Function.Arguments), maxApprovalChars)}
+		}
+		content := ""
+		if p.Content != nil {
+			content = *p.Content
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "path: %s\nstatus: new file (does not exist)\nsize: %d bytes\ncontent sha256: %s",
+			sanitizeForDisplay(p.Path), len(content), sha256Hex(content))
+		return approvalPreview{
+			Summary:     b.String(),
+			GuardPath:   p.Path,
+			GuardAbsent: true,
+		}
 
 	case "mcp_call":
 		var p struct {
@@ -138,16 +164,22 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, error) {
 	raw := tc.Function.Arguments
 	if len(raw) > maxApprovalArgs {
+		if tc.Function.Name == "create_file" {
+			return approvalPreview{}, fmt.Errorf("arguments are %d bytes, above the %d-byte approval limit; create a smaller file first and extend it with edit_file", len(raw), maxApprovalArgs)
+		}
 		return approvalPreview{}, fmt.Errorf("arguments are %d bytes, above the %d-byte approval limit; split into smaller edits and retry", len(raw), maxApprovalArgs)
 	}
 	p := buildApprovalPreview(reg, tc)
-	if tc.Function.Name == "edit_file" {
+	if tc.Function.Name == "edit_file" || tc.Function.Name == "create_file" {
 		preview, err := reg.PreviewApproval(tc.Function.Name, json.RawMessage(raw))
 		if err != nil {
 			return approvalPreview{}, err
 		}
 		if sanitizeForDisplay(preview.Display) != preview.Display {
 			return approvalPreview{}, fmt.Errorf("approval diff contains undisplayable control characters")
+		}
+		if sanitizeForDisplay(p.Summary) != p.Summary {
+			return approvalPreview{}, fmt.Errorf("approval preview contains undisplayable control characters")
 		}
 		p.State = preview.State
 		p.Summary += "\n" + preview.Display
@@ -188,6 +220,9 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 		}
 	}
 	if len(p.Summary) > maxApprovalArgs {
+		if tc.Function.Name == "create_file" {
+			return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; create a smaller file first and extend it with edit_file", maxApprovalArgs)
+		}
 		return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; split the request", maxApprovalArgs)
 	}
 	return p, nil

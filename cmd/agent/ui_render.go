@@ -297,7 +297,7 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 		}
 		return fmt.Sprintf("read_file(%s) -> %d bytes", displayPath, len(result))
 
-	case "edit_file":
+	case "edit_file", "create_file":
 		var p struct {
 			Path string `json:"path"`
 		}
@@ -306,10 +306,10 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 		if displayPath == "" {
 			displayPath = "file"
 		}
-		if strings.HasPrefix(result, "Successfully updated") {
-			return fmt.Sprintf("edit_file(%s) -> %s", displayPath, result)
+		if strings.HasPrefix(result, "Successfully ") {
+			return fmt.Sprintf("%s(%s) -> %s", name, displayPath, result)
 		}
-		return fmt.Sprintf("edit_file(%s) -> %s", displayPath, truncate(result, 80))
+		return fmt.Sprintf("%s(%s) -> %s", name, displayPath, truncate(result, 80))
 
 	case "list_dir":
 		var p struct {
@@ -443,6 +443,8 @@ func renderApprovalSummary(summary string, width int) string {
 		case strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++"):
 			b.WriteString(diffHeaderStyle.Render(line))
 		case strings.HasPrefix(line, "path:") || strings.HasPrefix(line, "base sha256:") ||
+			strings.HasPrefix(line, "status:") || strings.HasPrefix(line, "size:") ||
+			strings.HasPrefix(line, "content sha256:") ||
 			strings.HasPrefix(line, "old sha256:") || strings.HasPrefix(line, "new sha256:") ||
 			strings.HasPrefix(line, "arguments sha256:") || strings.HasPrefix(line, "pkg:") ||
 			strings.HasPrefix(line, "command:") || strings.HasPrefix(line, "tool:") ||
