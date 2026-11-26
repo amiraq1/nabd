@@ -32,7 +32,10 @@ jobs:
     env:
       # Dedicated build output directory, outside the checkout, so no binary can
       # be committed by accident and the artifact contains only intended files.
-      DIST: ${{ runner.temp }}/nabd-dist
+      # The `runner` context is not available in job-level env (only step-level),
+      # so this is resolved from the workspace's parent directory instead of
+      # ${{ runner.temp }}; on hosted runners that is RUNNER_TEMP's parent.
+      DIST: ${{ github.workspace }}/../nabd-dist
     strategy:
       fail-fast: false
       matrix:
