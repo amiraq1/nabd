@@ -182,19 +182,17 @@ func TestF18CRLFPreserved(t *testing.T) {
 func TestF18MissingFileExplicit(t *testing.T) {
 	dir := t.TempDir()
 	m := f18Submit(t, f18Model(t, dir), f18Call(`{"path":"missing.txt","old_text":"a","new_text":"b"}`))
-	if !m.awaitingApproval {
-		t.Fatal("missing file was not surfaced as an explicit approval state")
+	if m.awaitingApproval {
+		t.Fatal("missing file edit_file should fail early before requesting approval")
 	}
-	view := m.View()
-	if !strings.Contains(view, "does not exist") {
-		t.Fatalf("approval view lacks the missing-file notice: %q", view)
-	}
-
-	m = f18Approve(t, m)
 	if _, err := os.Stat(filepath.Join(dir, "missing.txt")); err == nil {
 		t.Fatal("edit_file created a missing file")
 	}
-	if reply := f18Reply(m, "call_f18"); !strings.Contains(reply, "Error") {
-		t.Fatalf("expected an error reply for the missing file, got %q", reply)
+	reply := f18Reply(m, "call_f18")
+	if strings.Contains(reply, "file changed since approval") {
+		t.Fatalf("misleading error reply for missing file: %q", reply)
+	}
+	if !strings.Contains(reply, "does not exist") || !strings.Contains(reply, "create_file") {
+		t.Fatalf("expected explicit missing-file + create_file guidance, got %q", reply)
 	}
 }

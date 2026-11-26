@@ -35,18 +35,15 @@ func TestF18PreviewApprovalState(t *testing.T) {
 
 func TestF18PreviewApprovalMissingFile(t *testing.T) {
 	r := mustRegistry(t, t.TempDir())
-	preview, err := r.PreviewApproval("edit_file", json.RawMessage(`{"path":"missing.txt","old_text":"a","new_text":"b"}`))
-	if err != nil {
-		t.Fatal(err)
+	_, err := r.PreviewApproval("edit_file", json.RawMessage(`{"path":"missing.txt","old_text":"a","new_text":"b"}`))
+	if err == nil {
+		t.Fatal("expected PreviewApproval to reject missing file early")
 	}
-	if preview.State.Exists {
-		t.Fatal("expected Exists=false for a missing file")
+	if strings.Contains(err.Error(), "file changed since approval") {
+		t.Fatalf("misleading error: %v", err)
 	}
-	if preview.State.Hash != "" {
-		t.Fatalf("expected an empty hash, got %d chars", len(preview.State.Hash))
-	}
-	if !strings.Contains(preview.Display, "does not exist") {
-		t.Fatalf("missing explicit notice: %q", preview.Display)
+	if !strings.Contains(err.Error(), "does not exist") || !strings.Contains(err.Error(), "create_file") {
+		t.Fatalf("missing explicit notice and guidance: %v", err)
 	}
 }
 

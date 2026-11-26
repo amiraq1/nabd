@@ -53,7 +53,8 @@
 ### 5.1 احتواء المسارات
 
 - `os.Root` على جذر الـworkspace لكل عمليات الملفات، مع رفض `..` والمسارات المطلقة وvolume-relative وNUL.
-- `edit_file` و`undo` يرفضان symlinks.
+- `create_file` و`edit_file` و`undo` يرفضون symlinks (بما فيها الروابط المعلّقة عند الهدف والمجلدات الوسيطة لـ`create_file` مع التحقق بـ`O_NOFOLLOW` ومطابقة `SameFile` على Unix).
+- حدود إنشاء المجلدات الأب في `create_file`: حد أقصى 15 مستوى أب، و512 بايت للمسار النسبي، و255 بايت لكل مكوّن، مع تراجع بأفضل جهد عن المجلدات التي أنشأتها العملية وحدها عند فشل الكتابة قبل النشر.
 - على Linux/Android تُفتح ملفات القراءة وكل مكوّنات مسارها بـ`O_NOFOLLOW`.
 - **حدود**: هذا لا يجعل كل عمليات الكتابة مقاومة لسباقات الروابط أو إعادة تسمية المجلدات، ولا ينطبق الضمان نفسه على المنصات الأخرى.
 
@@ -65,6 +66,7 @@
 
 ### 5.3 بوابة الموافقة
 
+- `create_file` تعرض المحتوى الكامل مع ترويسة المسار والحجم وSHA-256، وتربط الرمز بحالة عدم الوجود وبصمة المحتوى الكامل؛ يفشل مغلقاً إذا وُجد الملف مسبقاً أو ظهر في الفاصل، ويحترم `umask` بلا بت تنفيذ، ولا ينشئ نسخة `shadow`.
 - `edit_file` يعرض diff وSHA-256 للمحتوى قبل/بعد، ويُعاد فحص hash الأساس قبل التنفيذ.
 - `RunApproved` يتطلب token أحادي الاستخدام مربوطاً بالأداة و`args_sha256` (و`identity` لـ`mcp_call`/`web_fetch`)، صالح 5 دقائق.
 - `Run` بدون approver يفشل مغلقاً.
@@ -134,8 +136,8 @@ Profile المُنفَّذ على Linux:
 - **شبكة كود الاختبار**: `GOPROXY=off` يمنع تنزيل وحدات Go فقط؛ في غياب العزل يستطيع كود الاختبار فتح sockets.
 - **`mcp_call`**: الحارس seccomp يحجب `setsid` و`setpgid` (بعد التحقق من المعمارية وضبط البت 30)، وهذا لا يمنع كل الانفصالات ولا يعد عزلاً للملفات أو الشبكة بحد ذاته. هوية الملف التنفيذي والحارس مرتبطة بالموافقة، ويبقى نافذ قصير يمكن فيه مستخدم محلي تبديل ملف بعد التحقق (لا `fexecve`).
 - **تسريب المحتوى إلى LLM**: أي أداة تُفصح عن مخرجاتها ترسلها للـendpoint؛ إن كان بعيداً خرجت البيانات من الجهاز.
-- **TOCTOU داخل الجذر**: بين preview والتنفيذ قد يتغيّر محتوى الملف؛ hash guard يخفف ولا يوجد قفل CAS ذري مقابل كاتب خارجي.
-- **حدود الحجم**: صفحة قراءة 3584 بايت، تعديل ونسخته الاحتياطية 2MiB، سجل `go_verify` يحتفظ بـ64KiB من بدايته ونهايته، ووسائط الموافقة 4000 بايت.
+- **TOCTOU داخل الجذر**: بين preview والتنفيذ قد يتغيّر محتوى الملف؛ hash guard يخفف ولا يوجد قفل CAS ذري مقابل كاتب خارجي. في `create_file` يُستعمل `RENAME_NOREPLACE` (على Linux/Android) أو `os.Root.Link` (على باقي المنصات) للنشر الحصري الذري؛ أما على أنظمة الملفات التي لا تدعمهما (`ENOTSUP`/`ENOSYS`/`EPERM` مثل `/sdcard` أو FAT32) فتتراجع الأداة إلى فحص `Lstat` أخير داخل `withProcessLock` ثم `Rename` (بينما يبقى `EEXIST` فشلاً مغلقاً دائماً)، ما يترك نافذة سباق ميكروثانية أمام كاتب خارجي في تلك الأنظمة فقط.
+- **حدود الحجم**: صفحة قراءة 3584 بايت، إنشاء/تعديل ونسخة shadow الاحتياطية 2MiB، سجل `go_verify` يحتفظ بـ64KiB من بدايته ونهايته، ووسائط الموافقة ومعاينتها 4000 بايت، وعمق مجلدات `create_file` حتى 15 مستوى أب (512 بايت للمسار النسبي).
 - **لا حدود معدل أو حصص** لاستدعاءات الأدوات أو الـLLM.
 
 ## 7. فروق المنصات
@@ -151,7 +153,8 @@ Profile المُنفَّذ على Linux:
 ## 8. سيناريوهات واختبارات
 
 - هروب مسار/abs/UNC/NUL → `TestJailRejectsEscapes`, `TestResolveSafePathRejectsEscapes`.
-- symlink خارج الجذر → `TestJailRejectsSymlinkEscape`, `TestEditThroughSymlinkedParentRejected`.
+- symlink خارج الجذر أو بمكوّن وسيط/معلّق → `TestJailRejectsSymlinkEscape`, `TestEditThroughSymlinkedParentRejected`, `TestCreateFileSecurityRejections`.
+- إنشاء ملفات جديدة وسلامة المجلدات الأب والتراجع وTOCTOU → `TestCreateBugRegressionEditMissingFile`, `TestCreateFileInEmptyWorkspaceAndSubdirs`, `TestCreateFileTOCTOUAppearsBetweenPreviewAndExec`, `TestCreateFileContentAndPathBinding`, `TestCreateFileRejectsExistingFile`, `TestCreateFileGoSyntaxValidation`, `TestCreateFileConcurrentSamePath`, `TestCreateFileRollbackCreatedParentsOnFailure`.
 - قراءة أسرار بالاسم → `TestSensitivePathsDenied`.
 - تجاوز البوابة بلا approver → `TestRunFailsClosedWithoutApprover`.
 - تجاوز الموافقة عبر الوضع التلقائي → `TestAutoApprovalIsRefusedForManualApprovalTools`, `TestAutoApproveAllDoesNotBypassManualTools`.

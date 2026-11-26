@@ -35,7 +35,7 @@ const baseSystemPrompt = `You are NabdCoder, a senior Go systems engineer and co
 Follow this disciplined engineering workflow:
 1. Inspect before modifying: Use repo_map to quickly grasp package architecture, exported symbols, and internal dependencies before diving into files. Use list_dir and read_file to inspect specific code and directory structures before making changes.
 2. Structured pagination: Always prefer format: "json" for read_file. Files are returned in pages up to 3584 bytes. When truncated is true, issue another read_file call with offset set to next_offset to continue reading.
-3. Surgical edits: Use edit_file to replace exact blocks. Always include 2-4 lines of unique surrounding context in old_text. Keep each edit concise (under 4000 bytes). For large modifications, make multiple small, syntax-valid edits.
+3. Creating and editing files: Use create_file to create a new file (it safely creates missing parent directories and fails if the file already exists). Use edit_file only on existing files to replace exact blocks, including 2-4 lines of unique surrounding context in old_text. Keep each call concise (under 4000 bytes); for large new files, create a minimal skeleton with create_file then extend it with edit_file. Never retry an identical failing call; follow error guidance (e.g., use create_file vs use edit_file).
 4. Verify changes: After editing Go code, run go_verify to ensure syntax correctness and that all package tests pass.
 5. Respect user boundaries: If the user denies a tool approval, gracefully acknowledge the refusal and propose alternative solutions without repeating the rejected call.
 
@@ -385,39 +385,10 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key == "y" || key == "yes" {
 				m.awaitingApproval = false
 				if !m.approvalStillValid() {
-					m.pendingTools = m.pendingTools[1:]
-					m.approval = approvalPreview{}
-					m.messages = append(m.messages, Message{
-						Role:       "tool",
-						ToolCallID: tc.ID,
-						Content:    "Error: file changed since approval preview; re-read it and retry.",
-						Display:    "Blocked: file changed after preview",
-					})
-					m.refresh()
+					m.appendPreviewInvalidError(tc)
 					return m.advance()
 				}
-				var approval tools.Approval
-				var err error
-				if tc.Function.Name == "edit_file" {
-					approval, err = m.registry.ApprovePreview(tc.Function.Name, json.RawMessage(tc.Function.Arguments), m.approval.State)
-				} else if tc.Function.Name == "mcp_call" {
-					var p struct {
-						Command string `json:"command"`
-					}
-					if jsonErr := json.Unmarshal([]byte(tc.Function.Arguments), &p); jsonErr != nil {
-						err = jsonErr
-					} else {
-						var identity string
-						identity, err = m.registry.MCPIdentity(p.Command)
-						if err == nil {
-							approval, err = m.registry.ApproveWithIdentity(tc.Function.Name, json.RawMessage(tc.Function.Arguments), identity)
-						}
-					}
-				} else if tc.Function.Name == "web_fetch" {
-					approval, err = m.registry.ApproveWithIdentity(tc.Function.Name, json.RawMessage(tc.Function.Arguments), m.approval.IdentitySHA256)
-				} else {
-					approval, err = m.registry.Approve(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
-				}
+				approval, err := m.issueApproval(tc, "")
 				if err != nil {
 					m.pendingTools = m.pendingTools[1:]
 					m.approval = approvalPreview{}
@@ -758,39 +729,10 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 		if m.autoApprove == AutoApproveAll && m.toolQueueMode == AutoApproveAll && !m.registry.RequiresManualApproval(next.Function.Name) {
 			m.approval = preview
 			if !m.approvalStillValid() {
-				m.pendingTools = m.pendingTools[1:]
-				m.approval = approvalPreview{}
-				m.messages = append(m.messages, Message{
-					Role:       "tool",
-					ToolCallID: next.ID,
-					Content:    "Error: file changed since approval preview; re-read it and retry.",
-					Display:    "Blocked: file changed after preview",
-				})
-				m.refresh()
+				m.appendPreviewInvalidError(next)
 				return m.advance()
 			}
-			var approval tools.Approval
-			var approveErr error
-			if next.Function.Name == "edit_file" {
-				approval, approveErr = m.registry.ApprovePreviewAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), m.approval.State, "all")
-			} else if next.Function.Name == "mcp_call" {
-				var p struct {
-					Command string `json:"command"`
-				}
-				if jsonErr := json.Unmarshal([]byte(next.Function.Arguments), &p); jsonErr != nil {
-					approveErr = jsonErr
-				} else {
-					var identity string
-					identity, approveErr = m.registry.MCPIdentity(p.Command)
-					if approveErr == nil {
-						approval, approveErr = m.registry.ApproveWithIdentityAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), identity, "all")
-					}
-				}
-			} else if next.Function.Name == "web_fetch" {
-				approval, approveErr = m.registry.ApproveWithIdentityAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), m.approval.IdentitySHA256, "all")
-			} else {
-				approval, approveErr = m.registry.ApproveAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), "all")
-			}
+			approval, approveErr := m.issueApproval(next, "all")
 			if approveErr != nil {
 				m.pendingTools = m.pendingTools[1:]
 				m.approval = approvalPreview{}
@@ -819,6 +761,60 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 	m.status = "Running: " + sanitizeForDisplay(next.Function.Name)
 	m.refresh()
 	return m, m.launchTool(next, nil)
+}
+
+func (m *uiModel) appendPreviewInvalidError(tc ToolCall) {
+	m.pendingTools = m.pendingTools[1:]
+	content := "Error: file changed since approval preview; re-read it and retry."
+	display := "Blocked: file changed after preview"
+	if m.approval.GuardAbsent {
+		content = "Error: target path already exists or became unsafe since approval preview; inspect workspace and retry."
+		display = "Blocked: target appeared after preview"
+	}
+	m.approval = approvalPreview{}
+	m.messages = append(m.messages, Message{
+		Role:       "tool",
+		ToolCallID: tc.ID,
+		Content:    content,
+		Display:    display,
+	})
+	m.refresh()
+}
+
+func (m *uiModel) issueApproval(tc ToolCall, autoMode string) (tools.Approval, error) {
+	rawArgs := json.RawMessage(tc.Function.Arguments)
+	switch tc.Function.Name {
+	case "edit_file", "create_file":
+		if autoMode != "" {
+			return m.registry.ApprovePreviewAuto(tc.Function.Name, rawArgs, m.approval.State, autoMode)
+		}
+		return m.registry.ApprovePreview(tc.Function.Name, rawArgs, m.approval.State)
+	case "mcp_call":
+		var p struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal(rawArgs, &p); err != nil {
+			return tools.Approval{}, err
+		}
+		identity, err := m.registry.MCPIdentity(p.Command)
+		if err != nil {
+			return tools.Approval{}, err
+		}
+		if autoMode != "" {
+			return m.registry.ApproveWithIdentityAuto(tc.Function.Name, rawArgs, identity, autoMode)
+		}
+		return m.registry.ApproveWithIdentity(tc.Function.Name, rawArgs, identity)
+	case "web_fetch":
+		if autoMode != "" {
+			return m.registry.ApproveWithIdentityAuto(tc.Function.Name, rawArgs, m.approval.IdentitySHA256, autoMode)
+		}
+		return m.registry.ApproveWithIdentity(tc.Function.Name, rawArgs, m.approval.IdentitySHA256)
+	default:
+		if autoMode != "" {
+			return m.registry.ApproveAuto(tc.Function.Name, rawArgs, autoMode)
+		}
+		return m.registry.Approve(tc.Function.Name, rawArgs)
+	}
 }
 
 func (m *uiModel) finishRequest() {
