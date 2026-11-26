@@ -113,9 +113,16 @@ type uiModel struct {
 	provider          string
 	searchEnabled     bool
 	autoApprove       AutoApproveMode
-	clipboardFn       func(ctx context.Context, text string, target copyTarget) (clipboardResult, error)
-	keySource         string
-	projectCtx        projectContextSnapshot
+	// toolQueueMode is the auto-approval mode that was in force when the
+	// current batch of tool calls was enqueued. A later mode change must not
+	// retroactively authorize a request the model already sent.
+	toolQueueMode AutoApproveMode
+	// autoConfirm holds a pending /auto all request until the user explicitly
+	// confirms it; Esc, Enter or any other key cancels without enabling it.
+	autoConfirm *AutoApproveMode
+	clipboardFn func(ctx context.Context, text string, target copyTarget) (clipboardResult, error)
+	keySource   string
+	projectCtx  projectContextSnapshot
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -214,7 +221,7 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 	if mode == AutoApproveAll {
 		initialMsgs = append(initialMsgs, Message{
 			Role:    "local",
-			Content: "⚠️ WARNING: Auto-approve mode is ALL. Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review.",
+			Content: "⚠️ WARNING: Auto-approve mode is ALL. Set by " + AutoApproveEnv + ". Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review. go_verify and mcp_call still require a manual approval on every call.",
 		})
 	}
 	if projectCtx.ConfigError != "" {
@@ -267,6 +274,7 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 		client:        client,
 		registry:      reg,
 		autoApprove:   mode,
+		toolQueueMode: mode,
 		keySource:     keyStatus,
 		status:        "Ready",
 		baseHeight:    20,
@@ -306,6 +314,23 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 	case tea.KeyMsg:
+		if m.autoConfirm != nil && msg.Type != tea.KeyCtrlC {
+			pending := *m.autoConfirm
+			m.autoConfirm = nil
+			key := strings.ToLower(strings.TrimSpace(msg.String()))
+			// Only an explicit "y" enables ALL. Esc, Enter and any other
+			// key leave the current mode untouched.
+			if key == "y" || key == "yes" {
+				m.autoApprove = pending
+				m.status = "Auto-approval: " + string(pending)
+				m.messages = append(m.messages, Message{Role: "local", Content: autoApproveAllWarning(pending)})
+			} else {
+				m.status = "Auto-approval unchanged"
+				m.messages = append(m.messages, Message{Role: "local", Content: "Auto-approval request cancelled; mode remains " + string(m.autoApprove) + "."})
+			}
+			m.refresh()
+			return m, nil
+		}
 		if msg.Type == tea.KeyCtrlO {
 			if visibleExpandableToolIndex(m.messages) >= 0 {
 				m.expandLastTool = !m.expandLastTool
@@ -606,6 +631,9 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.callCounts[fingerprint]++
 			m.pendingTools = append(m.pendingTools, tc)
 		}
+		// Freeze the mode for this batch so toggling /auto later cannot
+		// authorize calls the model already produced.
+		m.toolQueueMode = m.autoApprove
 		m.refresh()
 		if len(m.pendingTools) == 0 {
 			m.busy = false
@@ -725,7 +753,9 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 			return m.advance()
 		}
 
-		if m.autoApprove == AutoApproveAll {
+		// Auto-approval never covers a tool that needs a human decision, and it
+		// only applies to calls enqueued while it was already active.
+		if m.autoApprove == AutoApproveAll && m.toolQueueMode == AutoApproveAll && !m.registry.RequiresManualApproval(next.Function.Name) {
 			m.approval = preview
 			if !m.approvalStillValid() {
 				m.pendingTools = m.pendingTools[1:]
@@ -1241,8 +1271,14 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 
 func (m *uiModel) handleAutoCommand(arg string) (tea.Model, tea.Cmd) {
 	m.clearInput()
+	// Any new /auto invocation discards an outstanding confirmation so a stale
+	// prompt cannot be confirmed later by an unrelated keypress.
+	m.autoConfirm = nil
 	if arg == "" {
 		content := fmt.Sprintf("Auto-approval mode: %s\nUsage: /auto off | readonly | all", m.autoApprove)
+		content += "\nreadonly: output of read-only tools is disclosed automatically whenever the advisory secret heuristic finds nothing. That heuristic is not comprehensive, so a clean result does not prove the output has no secrets."
+		content += "\ngo_verify and mcp_call always require a manual execution approval, in every mode including all."
+		content += "\nChanging mode never authorizes tool calls that were already requested: a batch keeps the mode it was queued under."
 		if m.autoApprove == AutoApproveAll {
 			content += "\n⚠️ WARNING: In 'all' mode, tool approvals and disclosures are bypassed. Tool outputs and potential credentials may be sent to the model provider."
 		}
@@ -1267,14 +1303,31 @@ func (m *uiModel) handleAutoCommand(arg string) (tea.Model, tea.Cmd) {
 		return *m, nil
 	}
 
-	m.autoApprove = mode
-	content := fmt.Sprintf("Auto-approval mode set to: %s", mode)
 	if mode == AutoApproveAll {
-		content += "\n⚠️ WARNING: Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review."
+		// Enabling ALL bypasses edit approvals and disclosure review, so it
+		// needs an explicit confirmation instead of a single command.
+		pending := mode
+		m.autoConfirm = &pending
+		m.status = "Confirm /auto all [y/N]"
+		m.messages = append(m.messages, Message{
+			Role: "local",
+			Content: "Enable auto-approval ALL for this session? This bypasses tool execution approvals (except go_verify and mcp_call) and output disclosure review.\n" +
+				"Press y to enable; Esc, Enter or any other key cancels and keeps the current mode.",
+		})
+		m.refresh()
+		return *m, nil
 	}
-	m.messages = append(m.messages, Message{Role: "local", Content: content})
+
+	m.autoApprove = mode
+	m.messages = append(m.messages, Message{Role: "local", Content: "Auto-approval mode set to: " + string(mode)})
 	m.refresh()
 	return *m, nil
+}
+
+// autoApproveAllWarning is the single ALL-mode warning shared by the startup
+// path and the interactive confirmation, so the two cannot drift apart.
+func autoApproveAllWarning(mode AutoApproveMode) string {
+	return fmt.Sprintf("Auto-approval mode set to: %s\n⚠️ WARNING: Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review. go_verify and mcp_call still require a manual approval on every call.", mode)
 }
 
 func (m *uiModel) handleCopyCommand(input string) (tea.Model, tea.Cmd) {
@@ -1393,6 +1446,17 @@ func (m *uiModel) formatStatus() string {
 	var b strings.Builder
 	b.WriteString("=== NabdCoder Status ===\n")
 	fmt.Fprintf(&b, "Auto-approve: %s\n", m.autoApprove)
+	if cleanupErr, at, failures, lastSuccess := m.registry.ShadowCleanupStatus(); cleanupErr != nil {
+		fmt.Fprintf(&b, "Shadow cleanup: FAILING (%d consecutive) at %s: %s\n", failures, at.UTC().Format("2006-01-02T15:04:05Z"), clip(sanitizeForDisplay(cleanupErr.Error()), 160))
+	} else {
+		last := lastSuccess
+		if last.IsZero() {
+			last = at
+		}
+		if !last.IsZero() {
+			fmt.Fprintf(&b, "Shadow cleanup: ok (%s)\n", last.UTC().Format("2006-01-02T15:04:05Z"))
+		}
+	}
 	fmt.Fprintf(&b, "Provider: %s\n", m.provider)
 	if m.provider == "gemini" {
 		searchStatus := "off"

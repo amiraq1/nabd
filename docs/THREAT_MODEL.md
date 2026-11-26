@@ -1,8 +1,8 @@
 # نموذج التهديدات — NabdCoder
 
-آخر تحديث لهذا الملف في القسم الأخير يصحّح الأقسام الأقدم: التنفيذ الخارجي معطّل افتراضياً، ويوجد عزل اختياري مثبت على Linux فقط.
+هذا المستند يصف ما يحاول NabdCoder حمايته، ومن هم الخصوم، وما يضمنه الكود في هذا المستودع فعلياً، وما لا يضمنه. يصف حالة الكود عند إصدار `v0.1.0-alpha`، لا نوايا تصميمية غير منفذة. كل ادعاء هنا يجب أن يقابله مسار في الشيفرة أو اختبار مذكور بالاسم.
 
-هذا المستند يحدد ما يحاول NabdCoder حمايته، ومن هم الخصوم، وما الذي يضمنه النظام فعلياً، وما لا يضمنه. يعتمد على الكود والاختبارات في هذا المستودع، وليس على نوايا تصميمية غير منفذة.
+الإصدار التجريبي لا يعني ضمان أمان شامل ولا دعم منصة لم تُختبر تشغيلياً.
 
 ## 1. النطاق
 
@@ -12,19 +12,20 @@
 - خادم `cmd/mcp-server` (للقراءة فقط).
 - التخزين المحلي: `.nabd/shadow` و`.nabd/audit.log`.
 - عميل LLM في `internal/llm` وبيئة التشغيل.
+- حدود العزل الاختيارية في `internal/sandbox` ومساعديها `cmd/nabd-limit` و`cmd/nabd-sandbox-probe` و`cmd/mcp-guard`.
 
 لا يشمل:
 
-- أمان نظام Termux/Android نفسه، أو صلاحيات التطبيق.
-- أمان خادم LLM البعيد أو مزوّد الشبكة.
+- أمان نظام Termux/Android نفسه أو صلاحيات التطبيق.
+- أمان خادم LLM البعيد أو مزوّد الشبكة أو مزوّد البحث.
 - أمان مستودع Git البعيد أو حسابات المطوّرين.
-- عزل kernel/container خارج نطاق الواجهة؛ العزل الاختياري الموصوف أدناه يعتمد على bubblewrap المثبت محلياً ولا يُعتبر ضماناً على Termux أو Windows.
+- عزل kernel/container خارج ما يثبته `sandbox.Prove` على Linux.
 
 ## 2. الأصول
 
 - **ملفات المشروع**: سرية وسلامة (كود، إعدادات، بيانات).
-- **الأسرار**: `NABD_API_KEY`, متغيرات البيئة، ملفات المفاتيح، `.env`, `.git/config`.
-- **سجل التدقيق ونسخ shadow**: سلامة السجل وقابلية الاستعادة.
+- **الأسرار**: مفاتيح API، `.env*`، `.git/config`، ملفات المفاتيح، متغيرات البيئة.
+- **نسخ shadow وسجل التدقيق**: قابلية الاستعادة وسلامة السجل.
 - **الطرفية**: منع تزوير الواجهة أو مطالبات الموافقة.
 - **الجهاز**: الذاكرة والقرص (Termux محدود الموارد).
 
@@ -34,106 +35,146 @@
 2. **TUI ↔ endpoint LLM**: الـendpoint غير موثوق؛ كل رسالة تُرسل قد تحمل محتوى workspace.
 3. **النموذج ↔ الأدوات**: النموذج غير موثوق؛ قد يكون مخترقاً أو متأثراً بـprompt injection.
 4. **الأدوات ↔ workspace**: المسارات والملفات غير موثوقة؛ قد تحتوي symlinks أو محتوى مضللاً.
-5. **go_verify ↔ كود المشروع**: كود الاختبار غير موثوق؛ ينفّذ بصلاحيات المستخدم.
-6. **mcp_call ↔ عمليات خارجية**: binary خارجي غير موثوق؛ يعمل بصلاحيات المستخدم.
-7. **mcp-server ↔ MCP client**: العميل غير موثوق؛ الخادم يقيّد نفسه للقراءة فقط.
+5. **`go_verify` ↔ كود المشروع**: كود الاختبار غير موثوق.
+6. **`mcp_call` ↔ عمليات خارجية**: binary خارجي غير موثوق، مُعرَّف مسبقاً من المستخدم فقط.
+7. **`mcp-server` ↔ MCP client**: العميل غير موثوق؛ الخادم يقيّد نفسه للقراءة فقط.
 
 ## 4. الخصوم والقدرات
 
-- **نموذج مخترق أو prompt injection**: يستطيع طلب أي أداة، وصياغة وسائط، وإخفاء تعليمات داخل الملفات أو مخرجات الأدوات.
-- **ملفات مشروع خبيثة**: ANSI/control sequences، مسارات ملتوية، symlinks، أسماء أسرار، مخرجات أدوات مضللة.
-- **مستخدم محلي آخر**: يقرأ/يحذف `.nabd`، يعرف مسارات الملفات، ولا يملك elevated privileges.
-- **endpoint بعيد**: يرى الرسائل كاملة، وقد يحتفظ بها.
-- **عملية MCP خارجية**: قد تنفّذ أي شيء عند تشغيلها، بما في ذلك الوصول للشبكة.
-- **كود اختبار خبيث**: يُنفَّذ عبر `go_verify` ويمكنه قراءة الملفات وفتح sockets.
+- **نموذج مخترق أو prompt injection**: يطلب أي أداة، يصوغ الوسائط، ويخفي تعليمات داخل الملفات أو مخرجات الأدوات.
+- **ملفات مشروع خبيثة**: ANSI/control sequences، مسارات ملتوية، symlinks، أسماء أسرار، مخرجات مضللة.
+- **مستخدم محلي آخر**: يقرأ/يحذف `.nabd`، ويعرف مسارات الملفات، بلا صلاحيات مرتفعة.
+- **endpoint بعيد**: يرى الرسائل كاملة وقد يحتفظ بها.
+- **عملية MCP خارجية**: قد تنفّذ أي شيء عند تشغيلها.
+- **كود اختبار خبيث**: يُنفَّذ عبر `go_verify`.
 
 ## 5. ما يضمنه النظام
 
-- **احتواء المسارات**: `os.Root` على جذر الـworkspace لكل عمليات الملفات، مع تحقق إضافي من `..` والمسارات المطلقة وvolume-relative وNUL. `edit_file` و`undo` يرفضان symlink. (اختبارات: `TestJailRejectsEscapes`, `TestJailRejectsSymlinkEscape`, `TestEditThroughSymlinkedParentRejected`.)
-- **فتح القراءة على Linux/Android**: فتح نسبي إلى واصف الجذر، مع `O_NOFOLLOW` لكل مكوّن وفتح غير حاجب. هذا لا يجعل جميع عمليات الكتابة مقاومة لسباقات الروابط أو إعادة تسمية المجلدات؛ لا يُدّعى الضمان نفسه للمنصات الأخرى.
-- **سياسة المسارات الحساسة**: `.nabd/`, `.git/`, `.env*` في كل مكوّن (عدا ملفات `.env.example` و`.env.sample` و`.env.template` و`.env.dist` النهائية؛ لا يُفحص محتواها), `id_*` (عدا `.pub`), وملفات المفاتيح مرفوضة لأدوات الملفات، ومخفية من `list_dir`. (اختبارات: `TestSensitivePathsDenied`, `TestShadowDeniedToFileTools`.)
-- **بوابة الموافقة**: preview يعرض المسار وdiff وSHA-256، وإعادة فحص hash الأساس قبل التنفيذ. `RunApproved` يتطلب token أحادي الاستخدام مربوطاً بالأداة و`args_sha256`، صالح 5 دقائق. `Run` بدون approver يفشل مغلقاً. (اختبارات: `TestApprovalPreviewEdit`, `TestApprovalGuardDetectsFileChange`, `TestRunFailsClosedWithoutApprover`, `TestApprovalTokenRequiredAndSingleUse`, `TestApprovalTokenExpires`.)
-- **تدقيق إلزامي للكتابة**: `requested`/`approved` fail-closed قبل التنفيذ؛ تعذّر الكتابة يمنع التعديل/التنفيذ. القراءة تعمل بدون تدقيق. (اختبارات: `TestAuditLogFailClosedForWrites`, `TestReadOnlyToolsSurviveAuditFailure`, `TestAuditLogApprovalFlow`.)
-- **تعديل آمن**: كتابة ذرّية temp+fsync+rename مع حفظ mode، رفض no-op وsymlink والملفات >2MiB، CRLF محفوظ، ونسخة shadow قبل التعديل. (اختبارات: `TestEditAtomicPreservesModeAndLeavesNoTemp`, `TestEditPreservesCRLFInGo`, `TestEditRejectsSymlink`, `TestEditRejectsLargeFile`.)
-- **استعادة محكومة**: `undo` يستعيد فقط إذا طابق محتوى الملف `sha256_after`، ويرفض symlink، ويعلّم النسخة `undone`. (اختبارات: `TestUndoRestoresFile`, `TestUndoRefusesAfterDrift`, `TestUndoNoArgRestoresLatest`, `TestUndoIsAudited`.)
-- **go_verify محكوم**: بيئة allowlist بلا مفاتيح أو proxy، `GOFLAGS=-mod=readonly`, `GOPROXY=off`, `GOTOOLCHAIN=local`، أنماط حزم workspace-relative، مهلة 90s توقف مجموعة العمليات على Unix؛ قد تفلت العمليات المنفصلة ولا يضمن ذلك عزل الكود، ونتيجة منظمة. (اختبارات: `TestGoVerifyEnvAllowlist`, `TestValidatePkgPattern`, `TestGoVerifyTimeout`, `TestProcessGroupKill` على Unix.)
-- **LLM مضبوط**: إعداد من البيئة فقط، مهلة كلية، إلغاء عند Ctrl+C، retry محدود على 429/5xx/الشبكة فقط، وميزانية سياق تقديرية مع trim واعٍ للأزواج. (اختبارات: `TestAgentCancelsRequestOnCtrlC`, `TestChatRetriesOn429And5xx`, `TestChatDoesNotRetry400`, `TestTrimHistoryKeepsToolPairs`.)
-- **واجهة مقاومة للتزوير**: إزالة ANSI/C0/C1 قبل العرض، clamp للطرفية، وخروج عند non-TTY. (اختبارات: `TestSanitizeForDisplay`, `TestApprovalPreviewSanitizesANSIText`, `TestTinyWindowDoesNotPanic`, `TestEnsureInteractiveRejectsNonTTY`.)
-- **حماية MCP الخارجي**: الحارس المطلوب بجانب الوكيل يحجب `setsid` و`setpgid` على Linux/Android المدعومين عبر seccomp-BPF محدد لكل معمارية (`SYS_SETSID` و `SYS_SETPGID`)، وتُفحص المعمارية (`seccomp_data.arch`) أولاً وتُقتل العملية فوراً بـ `SECCOMP_RET_KILL_PROCESS` عند عدم التطابق أو ضبط البت 30، وتُحجب البيئة إلا قائمة محددة ويُحد النقل الوارد بـ1MiB. هذه ليست عزلة ملفات أو شبكة. راجع [docs/SECCOMP_ARCH.md](SECCOMP_ARCH.md) لجدول التكافؤ الكامل. (اختبارات: `TestF24RealMCPCallAndEnvironment`, `TestF24SeccompBlocksSetsid`, `TestF24SeccompBlocksSetpgid`, `TestF24WireLimit`, `TestSeccompArchitectureParity`.)
-- **mcp-server للقراءة فقط**: يرفض الأدوات غير read-only لغياب approver، و`mcp_call` معطّل. (اختبار: `TestServerIsReadOnlyAndDisablesMCPCall`.)
+### 5.1 احتواء المسارات
+
+- `os.Root` على جذر الـworkspace لكل عمليات الملفات، مع رفض `..` والمسارات المطلقة وvolume-relative وNUL.
+- `edit_file` و`undo` يرفضان symlinks.
+- على Linux/Android تُفتح ملفات القراءة وكل مكوّنات مسارها بـ`O_NOFOLLOW`.
+- **حدود**: هذا لا يجعل كل عمليات الكتابة مقاومة لسباقات الروابط أو إعادة تسمية المجلدات، ولا ينطبق الضمان نفسه على المنصات الأخرى.
+
+### 5.2 سياسة المسارات الحساسة
+
+مرفوضة لأدوات الملفات ومخفية من `list_dir`: `.nabd/`، `.git/`، `.env*` في كل مكوّن (عدا أسماء القوالب النهائية `.env.example` و`.env.sample` و`.env.template` و`.env.dist`، ولا يُفحص محتواها)، `id_*` (عدا `.pub`)، والامتدادات `.pem` و`.key` و`.p12` و`.pfx` و`.jks` و`.keystore`.
+
+هذه سياسة **بالاسم فقط**: سرّ داخل `config.yaml` أو ملف لا يطابق الأنماط يمكن قراءته.
+
+### 5.3 بوابة الموافقة
+
+- `edit_file` يعرض diff وSHA-256 للمحتوى قبل/بعد، ويُعاد فحص hash الأساس قبل التنفيذ.
+- `RunApproved` يتطلب token أحادي الاستخدام مربوطاً بالأداة و`args_sha256` (و`identity` لـ`mcp_call`/`web_fetch`)، صالح 5 دقائق.
+- `Run` بدون approver يفشل مغلقاً.
+- **استثناء إلزامي**: `go_verify` و`mcp_call` يتطلبان موافقة تنفيذ بشرية في كل وضع، بما في ذلك `NABD_AUTO_APPROVE=all` و`/auto all`. الإنفاذ في نقطة واحدة داخل السجل (`Registry.RequiresManualApproval` + `approveWithState`)، لا في نص الواجهة.
+- تغيير وضع الموافقة لا يفوض الطلبات المعلقة بأثر رجعي: الدفعة تحتفظ بالوضع الذي أُدرجت فيه، ويُشترط أن يكون الوضع الحالي أيضاً مسموحاً.
+
+**ضمان محصور**: هذا يخص الأداتين المذكورتين فقط. الأدوات الأخرى قد تشغّل عمليات فرعية وفق سياساتها المعلنة.
+
+### 5.4 الإفصاح عن مخرجات الأدوات
+
+كل ناتج أداة يُعرض مع الوجهة والوسائط، ويُطلب التمرير إلى النهاية والموافقة قبل إرساله إلى النموذج، ما لم يكن الوضع التلقائي يسمح بذلك.
+
+- `readonly` يُفصح تلقائياً عن مخرجات أدوات القراءة **التي لا يطابقها كاشف الأسرار الإرشادي**.
+- `all` يُفصح تلقائياً عن كل شيء.
+- الكاشف الإرشادي ليس ماسح أسرار: يفوت صيغاً غير متوقعة وقِيَماً مُرمَّزة ومفاتيح مقسّمة، وقد ينبّه على نص عادي. **غياب التحذير لا يثبت خلو المحتوى من الأسرار**، والضمان الحقيقي هو مراجعة المستخدم للبايتات المعروضة.
+
+### 5.5 تدقيق إلزامي للكتابة
+
+`requested`/`approved` fail-closed قبل التنفيذ؛ تعذّر الكتابة يمنع التعديل/التنفيذ. القراءة تعمل بدون تدقيق. كل حدث يحمل بصمات (SHA-256) ووسائط نصية مُطهّرة، وسلسلة `prev_hash`/`hash`.
+
+**حدود كشف الاقتطاع**: السلسلة تكشف التعديل أو الحذف أو إعادة الترتيب في وسط السجل فقط إذا كانت المرساة `NABD_AUDIT_ANCHOR` محفوظة خارج متناول الخصم. **اقتطاع ذيل السجل لا يكشفه السجل نفسه**: بدون مرساة خارجية تحفظ آخر `hash` معروف، لا يمكن التمييز بين «السجل ينتهي هنا» و«حُذف ذيله». لا يوجد تدوير أو توقيع خارجي بعد.
+
+### 5.6 تخزين shadow
+
+- نسخة قبل كل تعديل في `.nabd/shadow`، واستعادة عبر `undo` بعد التحقق من `sha256_after`.
+- الاحتفاظ: آخر 20 نسخة لكل مسار و7 أيام، مع تنظيف دوري أثناء حياة العملية (افتراضياً كل 24 ساعة).
+- **الحذف قابل للاستئناف**: تُحذف البيانات قبل metadata، فأي انقطاع يترك أثراً معروفاً (metadata بلا نسخة) ينهيه المسح التالي. النسخ اليتيمة وملفات `.tmp-*` تُكنس بعد مهلة سماح (15 دقيقة) لتجنّب سباق كتابة من عملية أخرى.
+- `Latest` يتخطى النسخة المفقودة أو التالفة ولا يعيدها كناجحة؛ وإن لم توجد نسخة سليمة يُرجع خطأً صريحاً.
+- فشل التنظيف لا يُسقط تعديلاً ناجحاً، لكنه يبقى ظاهراً في `LastCleanupError` وسطر `/status` حتى ينجح مسح كامل، ويُقاس بعدّاد فشل متتالٍ.
+- **حدود**: لا تنسيق بين عمليات Nabd متعددة ولا مع كاتب خارجي، ولا ضمان حذف بعد إيقاف العملية، والكتابة عبر rename تفصل hard links.
+
+### 5.7 العزل الاختياري (Linux فقط)
+
+`go_verify` و`mcp_call` معطّلتان افتراضياً. تُعرضان فقط عند تحقق كل ما يلي في نفس التشغيل: `NABD_MCP_CONFIG` صالح، و`NABD_EXEC_SANDBOX=1`، ونجاح `sandbox.Prove`.
+
+Profile المُنفَّذ على Linux:
+
+- bubblewrap مع `--unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts --new-session --die-with-parent --clearenv`.
+- جذر شبه فارغ، `/proc` وtmpfs `/tmp`.
+- `/workspace` قابل للكتابة لـ`go_verify` وللقراءة فقط لـ`mcp_call`.
+- مسارات الحساسة داخل `/workspace` تُخفى: المجلدات بـtmpfs فارغ، والملفات بربط `/dev/null` (قراءتها تنجح لكنها **فارغة**، لا غير قابلة للقراءة).
+- `RLIMIT_AS` و`RLIMIT_NPROC` عبر `cmd/nabd-limit`، مع `NABD_SANDBOX_MEMORY_LIMIT` في مجال [512MiB, 64GiB].
+- بيئة allowlist بلا مفاتيح: `GOPROXY=off`, `GOFLAGS=-mod=readonly`, `GOTOOLCHAIN=local`, `CGO_ENABLED=0`.
+
+### 5.8 ما يثبته `Prove` بالضبط
+
+`Prove` يشغّل `cmd/nabd-sandbox-probe` داخل العزل نفسه ويفشل مغلقاً إن لم يتحقق كل ما يلي:
+
+1. مساحة أسماء الشبكة مختلفة عن المضيف (يُمرَّر `EXPECT_HOST_NETNS` ويُقارن من داخل العزل).
+2. مستمع loopback على المضيف **يعمل** من خارجه (ضابط إيجابي) و**لا يُبلغ** من داخل العزل.
+3. `/etc/passwd` غير مرئي.
+4. الكتابة في منطقة للقراءة فقط تفشل.
+5. قيم `RLIMIT_AS` و`RLIMIT_NPROC` المرئية داخل العزل تساوي القيم المطلوبة.
+
+**ما لا يثبته `Prove`**، ويجب عدم ادعائه:
+
+- أنه يشغّل profile الكتابة (`WritableWorkspace: true`) بنفس الضمانات؛ هو يثبت profile قراءة فقط.
+- أن مسارات الحساسة داخل `/workspace` مخفية فعلاً؛ هذا يثبته اختبار التكامل `TestGoVerifySandboxHidesWorkspaceSecrets` عند تشغيله.
+- استهلاك الذاكرة أو العمليات الفعلي؛ يثبت **ضبط** الحدود لا أن الكود لا يتجاوزها عبر قنوات أخرى.
+- كل خصائص profile الإنتاج: `go_verify` يضيف روابط فردية لمُحمّل ELF والمكتبات، ويختلف عن profile الإثبات.
+- أن العزل يمنع كل كتابة خارج `/workspace`: `/tmp` جزء من profile القابل للكتابة.
+- أن العملية المنفصلة عن مجموعة العمليات لا تفلت عند الإلغاء.
 
 ## 6. ما لا يضمنه النظام
 
-- **لا sandbox**: `go_verify` و`mcp_call` ينفّذان كوداً/عمليات بصلاحيات المستخدم. الموافقة خطوة بشرية، وليست عزلاً.
-- **شبكة كود الاختبار**: `GOPROXY=off` يمنع تنزيل وحدات Go فقط؛ كود الاختبار يستطيع فتح sockets مباشرة.
-- **`mcp_call`**: يشغّل binary بصلاحيات المستخدم، بلا sandbox للملفات أو الشبكة؛ `command` لا يدعم وسائط. seccomp يمنع syscallين فقط، ولا يضمن منع كل الانفصالات أو الهجمات عبر namespaces أو خدمات خارجية. لا يعتمد على `NABD_MCP_GUARD` لاستبدال الحارس. هوية الملف التنفيذي والحارس غير مرتبطة بالموافقة؛ يمكن تبديلهما بعد عرض الأمر وقبل التنفيذ.
-- **تسريب المحتوى إلى LLM**: `read_file` يتطلب موافقة قبل إرسال الناتج؛ قد تكشف أدوات أخرى والرسائل المكتوبة بيانات للـendpoint. إذا كان بعيداً، تخرج البيانات المسموح بها من الجهاز.
-- **سياسة الأسرار بالأسماء فقط**: سر داخل `config.yaml` أو ملف غير مطابق للأنماط يمكن قراءته.
-- **سلامة سجل التدقيق**: append-only بالبناء، لكنه ليس tamper-evident؛ مستخدم محلي يستطيع حذف/تفريغ `.nabd/audit.log`. لا hash chain ولا تدوير بعد.
-- **TOCTOU داخل الجذر**: بين preview والتنفيذ قد يتغيّر محتوى الملف داخل الـworkspace. hash guard + التطابق الفريد يخففان، لكن لا يوجد قفل ملف.
-- **hard links**: الكتابة الذرّية عبر rename تستبدل الاسم؛ الأسماء الأخرى المرتبطة تحتفظ بالمحتوى القديم.
-- **Windows**: `taskkill /T` أفضل جهد، والصلاحيات approximated.
-- **Termux DNS/TLS**: غير مؤكدين لثنائي `CGO_ENABLED=0`؛ راجع فحص الجهاز في README.
-- **لا حدود معدل/حصص**: لا rate limiting لاستدعاءات الأدوات أو الـLLM.
-- **لا LICENSE**: لم يُضف ترخيص قانوني بعد.
+- **لا ضمان لعزل كود الاختبار بلا `Prove` ناجح**: إن لم يُثبت العزل تبقى الأداتان غير موجودتين؛ لا يوجد مسار تنفيذ غير معزول في الإنتاج.
+- **شبكة كود الاختبار**: `GOPROXY=off` يمنع تنزيل وحدات Go فقط؛ في غياب العزل يستطيع كود الاختبار فتح sockets.
+- **`mcp_call`**: الحارس seccomp يحجب `setsid` و`setpgid` (بعد التحقق من المعمارية وضبط البت 30)، وهذا لا يمنع كل الانفصالات ولا يعد عزلاً للملفات أو الشبكة بحد ذاته. هوية الملف التنفيذي والحارس مرتبطة بالموافقة، ويبقى نافذ قصير يمكن فيه مستخدم محلي تبديل ملف بعد التحقق (لا `fexecve`).
+- **تسريب المحتوى إلى LLM**: أي أداة تُفصح عن مخرجاتها ترسلها للـendpoint؛ إن كان بعيداً خرجت البيانات من الجهاز.
+- **TOCTOU داخل الجذر**: بين preview والتنفيذ قد يتغيّر محتوى الملف؛ hash guard يخفف ولا يوجد قفل CAS ذري مقابل كاتب خارجي.
+- **حدود الحجم**: صفحة قراءة 3584 بايت، تعديل ونسخته الاحتياطية 2MiB، سجل `go_verify` يحتفظ بـ64KiB من بدايته ونهايته، ووسائط الموافقة 4000 بايت.
+- **لا حدود معدل أو حصص** لاستدعاءات الأدوات أو الـLLM.
 
-## 7. سيناريوهات واختبارات
+## 7. فروق المنصات
 
-- **هروب مسار/abs/UNC/NUL** → `TestJailRejectsEscapes`.
-- **symlink خارج الجذر** → `TestJailRejectsSymlinkEscape` و`TestEditThroughSymlinkedParentRejected`.
-- **قراءة أسرار بالاسم** → `TestSensitivePathsDenied`.
-- **تجاوز البوابة بلا approver** → `TestRunFailsClosedWithoutApprover`.
-- **إعادة استخدام token أو استخدامه لوسائط أخرى** → `TestApprovalTokenRequiredAndSingleUse`.
-- **انتهاء token** → `TestApprovalTokenExpires`.
-- **تعذّر التدقيق** → `TestAuditLogFailClosedForWrites`.
-- **تزوير ANSI** → `TestSanitizeForDisplay` و`TestApprovalPreviewSanitizesANSIText`.
-- **طرفية صغيرة/non-TTY** → `TestTinyWindowDoesNotPanic` و`TestEnsureInteractiveRejectsNonTTY`.
-- **تسريب بيئة الاختبار** → `TestGoVerifyEnvAllowlist`.
-- **أنماط حزم خارجية** → `TestValidatePkgPattern`.
-- **تعليق شجرة عمليات** → `TestProcessGroupKill` (Unix) و`TestGoVerifyTimeout` (الكل).
-- **حلقة أدوات لا نهائية/متكررة** → `TestMaxIterationsSynthesizesToolErrors` و`TestRepeatedCallsBlocked`.
-- **إلغاء طلب LLM** → `TestAgentCancelsRequestOnCtrlC`.
-- **retry غير صحيح** → `TestChatRetriesOn429And5xx` و`TestChatDoesNotRetry400`.
-- **كسر أزواج tool calls** → `TestTrimHistoryKeepsToolPairs`.
-- **تعديل غير ذرّي/فقدان mode** → `TestEditAtomicPreservesModeAndLeavesNoTemp`.
-- **undo بعد تغيير الملف** → `TestUndoRefusesAfterDrift`.
-- **خادم MCP يعدّل ملفاً** → `TestServerIsReadOnlyAndDisablesMCPCall`.
+| الجانب | Linux | Windows | Termux/Android |
+|---|---|---|---|
+| عزل التنفيذ | bubblewrap + user namespaces، يُثبت بـ`Prove` | غير متاح (`ErrUnavailable`) | غير متاح: الملف مبني بـ`linux && !android` |
+| `go_verify`/`mcp_call` | متاحتان فقط بعد إثبات ناجح | معطّلتان دائماً | معطّلتان دائماً |
+| فتح الملفات بلا اتباع روابط | `O_NOFOLLOW` لكل مكوّن | غير مطبق | مطبق |
+| قتل شجرة العمليات | process group | `taskkill /T` أفضل جهد | process group |
+| اختبار التشغيل | CI على `amd64` و`arm64` (يجب أن يفشل عند التخطي) | لم يُثبت؛ حزمة `internal/safefs` و`internal/tools` تفشل مسبقاً في اختباراتها | غير مثبت |
 
-## 8. المخاطر المتبقية وأولوياتها
+## 8. سيناريوهات واختبارات
 
-- **P1**: عزل/allowlist لـ`mcp_call`، وsandbox أو تقييد شبكي/ملفي لـ`go_verify` إذا كان النموذج غير موثوق.
-- **P2**: سلسلة hash (`prev_hash`/`entry_hash`) وتدوير سجل التدقيق.
-- **P2**: كشف/تنقيح الأسرار بالمحتوى لا بالاسم.
-- **P2**: `os.Root` + قفل/معاملة تغلق TOCTOU بين preview والتنفيذ.
-- **P3**: Job Objects على Windows بدل `taskkill`، وضبط `max_tokens`/`temperature`، وstreaming، وترخيص.
+- هروب مسار/abs/UNC/NUL → `TestJailRejectsEscapes`, `TestResolveSafePathRejectsEscapes`.
+- symlink خارج الجذر → `TestJailRejectsSymlinkEscape`, `TestEditThroughSymlinkedParentRejected`.
+- قراءة أسرار بالاسم → `TestSensitivePathsDenied`.
+- تجاوز البوابة بلا approver → `TestRunFailsClosedWithoutApprover`.
+- تجاوز الموافقة عبر الوضع التلقائي → `TestAutoApprovalIsRefusedForManualApprovalTools`, `TestAutoApproveAllDoesNotBypassManualTools`.
+- تفويض رجعي عند تغيير الوضع → `TestModeChangeDoesNotAuthorizeQueuedTools`.
+- تأكيد `/auto all` → `TestAutoAllRequiresExplicitConfirmation`.
+- إعادة استخدام token أو استخدامه لوسائط أخرى → `TestApprovalTokenRequiredAndSingleUse`.
+- انتهاء token → `TestApprovalTokenExpires`.
+- تعذّر التدقيق → `TestAuditLogFailClosedForWrites`.
+- تزوير ANSI → `TestSanitizeForDisplay`, `TestApprovalPreviewSanitizesANSIText`.
+- تسريب بيئة الاختبار → `TestGoVerifyEnvAllowlist`.
+- حجب ملفات الـworkspace داخل العزل → `TestGoVerifySandboxHidesWorkspaceSecrets`.
+- عزل الشبكة/الملفات/الحدود → `TestLinuxSandboxProof`, `TestLinuxSandboxOptInPath`.
+- فشل التنظيف والاستئناف → `TestCleanupKeepsMetadataWhenBackupRemovalFails`, `TestCleanupRepairsMetadataWithoutBackup`, `TestLatestSkipsUnusableNewestEntry`, `TestCleanupSweepsOrphanedBackupAndTempFiles`, `TestCleanupFailureIsReportedAndCleared`.
+- حد مسار الكنس → `TestCleanupNeverTouchesFilesOutsideTheStore`.
+- undo بعد تغيير الملف → `TestUndoRefusesAfterDrift`.
 
-## 9. التحقق على Termux
+## 9. المخاطر المتبقية
 
-راجع قسم «التحقق على Termux» في [README](../README.md): كتلة probe واحدة مع المخرجات المتوقعة لـDNS/TLS/HTTPS. النتيجة تُحدد ما إذا كان `CGO_ENABLED=0` يحتاج ضبط `SSL_CERT_FILE` أو مسار DNS محلي.
+- **P1**: إثبات سلوك profile الكتابة ومسارات الحساسة في CI مع فشل صريح عند التخطي؛ وتشغيل الاختبارات على Termux فعلياً.
+- **P2**: تدوير سجل التدقيق وتوقيع خارجي؛ ومرساة تحفظ آخر hash لكشف اقتطاع الذيل.
+- **P2**: تنقيح الأسرار بالمحتوى بدل الاسم.
+- **P3**: Job Objects على Windows بدل `taskkill`، و`fexecve` لإغلاق نافذة استبدال الملف.
 
+## 10. التحقق على Termux
 
-## تحديث أمني: فرع العزل والإفشاء (يُلغي ما سبق عند التعارض)
-
-### التنفيذ الخارجي
-
-- `go_verify` و`mcp_call` معطّلتان افتراضياً. لا تُعرضان إلا إذا وُجدت قائمة خوادم MCP مملوكة للمستخدم (`NABD_MCP_CONFIG`)، وتم تفعيل `NABD_EXEC_SANDBOX=1`، ونجح `sandbox.Prove` في نفس التشغيل. أي فشل أو غياب أداة يبقي الأداتين غير موجودتين في سجل الأدوات.
-- العزل المُثبت على Linux يستخدم bubblewrap مع user/pid/net/ipc/uts namespace، وجذر شبه فارغ، وربط workspace للقراءة فقط لـMCP وللكتابة لـ`go_verify`، و`/proc` وtmpfs `/tmp`، و`--die-with-parent`. يحصل `go_verify` على محمّل ELF والمكتبات المشتركة التي يحتاجها ثنائي `go` فعلاً، كملفات فردية فقط: لا تُربط مجلدات `/lib` أو `/usr/lib` ولا يظهر `/etc`. الثنائي الساكن لا يحصل على أي ربط إضافي. يضبط `cmd/nabd-limit` حدود `RLIMIT_AS` و`RLIMIT_NPROC` قبل exec، مع دعم ضبط `NABD_SANDBOX_MEMORY_LIMIT` بمجال آمن [512MiB, 64GiB] وتوثيقه في سجل التدقيق. يُثبت `cmd/nabd-sandbox-probe` من داخل العزل أنه لا يرى `/etc/passwd`، ولا يستطيع الكتابة في منطقة للقراءة فقط، ولا يفتح socket، ويرى الحدود المطلوبة. (اختبارات: `TestLinuxSandboxProof`، `TestLinuxSandboxOptInPath`، `TestLinuxWrapConstructsConfinedCommand`، `TestLoaderBindsReturnsInterpreterAndLibraries`، `TestLoaderBindsStaticBinaryNeedsNothing`، `TestLinuxSandboxRunsDynamicallyLinkedTarget`، `TestDefaultMemoryLimitConfigurableAndPageSizeAware`.)
-- `mcp_call` لا يقبل مسار executable من النموذج: يختار اسم خادم من القائمة فقط. تُربط الموافقة ببصمة الخادم والحارس وأي حارس مستخدم والبيئة، وتُعاد البصمات قبل التنفيذ. لا تُمرَّر متغيرات البيئة إلا بقائمة صريحة. (اختبارات: `TestMCPAllowlist*`, `TestMCPApprovalIsBoundToConfiguredServerIdentity`.)
-- **ما لا يثبته هذا العزل**: لا يوجد `fexecve` في Go هنا، لذا تبقى نافذة قصيرة بين إعادة التحقق والتنفيذ يمكن لمستخدم محلي فيها تبديل ملف. لا يُقدَّم العزل على Windows أو Termux أو الأنظمة التي لا يتوفر فيها bubblewrap؛ قتل المجموعة لا يضمن عملية انفصلت إلى جلسة أخرى؛ `os.Root` والموافقة وseccomp ليست بديلاً عن العزل.
-
-### الإفشاء إلى النموذج
-
-- كل ناتج أداة يُحتجز محلياً ويُعرض مع الوجهة والوسائط والمخرجات بصيغة `QuoteToASCII`، مع علامة `[END]` وإلزام بالتمرير إلى نهاية العرض قبل الموافقة. تغيير حجم الطرفية يُعيد المراجعة إلى البداية. تُرفض المخرجات التي تحتوي تحكمات أو أحرف اتجاه غير قابلة للعرض بأمان. (اختبارات: `TestAllToolOutputsRequireDisclosure`, `TestFileDisclosureResizeRequiresRereview`, `TestDisclosureFailsClosedOnDeceptiveCharacters`.)
-- رفض HTTP البعيد وإعادة التوجيه يبقى كما هو. كشف الأسرار بالمحتوى إرشادي وغير شامل وموثّق كذلك؛ لا يُقدَّم كضمان. رسائل المستخدم وأي قناة جديدة يجب أن تُقيَّم على حدة.
-
-### الكتابة والاستعادة
-
-- قفل `.nabd/edit.lock` عبر `flock`/`LockFileEx` يمنع تحرير أو استعادة متزامنين من عمليتي Nabd؛ القفل داخل العملية لا يزال `writeMu`. (اختبار: `TestCrossProcessLockRefusesConcurrentEdit`.)
-- البايتات المعاينة والمكتوبة تمر عبر تحويل واحد؛ بصمتا الإدخال والإخراج يُعاد فحصهما قبل الاستبدال. فشل `fsync` للمجلد بعد rename يُبلَّغ كتحذير وتبقى النسخة الاحتياطية قابلة للاستعادة؛ فشل rename يترك الملف الأصلي بلا ملفات مؤقتة. (اختبارات: `TestDirectorySyncFailureKeepsRestoreAvailable`, `TestReplacementFailureLeavesOriginalAndNoTemp`.)
-- **حدود ذرّية**: لا يوجد compare-and-swap مقابل كاتب خارجي بين الفحص النهائي وrename، ولا مزامنة دليل على غير Unix. لا يمكن ضمان الذرّية أمام كاتب خارجي أو انقطاع الطاقة على تلك المنصات.
-
-### التدقيق والاحتفاظ
-
-- السجل مربوط بسلسلة `prev_hash`/`hash` مع حدث `executing` قبل كل عملية كتابة؛ فشل تسجيل النتيجة بعد التنفيذ لا يمحو سجل البدء. الوسائط النصية تُطهَّر من التحكمات وأحرف الاتجاه. (اختبارات: `TestHashChainDetectsTampering`, `TestExecutingEventSurvivesResultLoggingGap`.)
-- **`مرساة موثوقة`**: السلسلة تكشف العبث فقط إذا حُفظ `NABD_AUDIT_ANCHOR` خارج متناول من يُراقَب. مستخدم محلي يملك السجل والمرساة يستطيع إعادة حسابها بالكامل؛ لا توقيع خارجي ولا تدوير.
-- Shadow يُنظَّف دورياً أثناء تشغيل العملية (افتراضياً كل 24 ساعة) بقاعدة 7 أيام/20 نسخة، مع حذف البيانات الوصفية أولاً حتى لا تظهر نسخة بلا نسخة احتياطية. لا يوجد موعد حذف مضمون بعد إيقاف العملية، ولا تنسيق مع عملية Nabd أخرى. (اختبارات: `TestScheduledCleanupRemovesExpiredWithoutBreakingRecentRestore`, `TestRetentionLoopStopsAndIsCancellable`.)
+راجع قسم «التحقق على Termux» في [README](../README.md): كتلة probe واحدة مع المخرجات المتوقعة لـDNS/TLS/HTTPS. نتيجة هذا الفحص لم تُثبت بعد، والبناء المتقاطع `android/arm64` لا يُعد اختبار تشغيل.

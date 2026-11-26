@@ -26,7 +26,7 @@ var slashCommands = []slashCommand{
 	},
 	{
 		Name:        "auto",
-		Description: "View or set auto-approval mode (/auto off|readonly|all)",
+		Description: "Auto-approval mode; 'all' needs an explicit y (/auto off|readonly|all)",
 	},
 	{
 		Name:        "clear",
