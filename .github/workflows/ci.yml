@@ -68,7 +68,13 @@ jobs:
         run: |
           set -euo pipefail
           bwrap --unshare-net --dev-bind / / true
-          unshare -Ur true
+          # bare `unshare -Ur` is denied by the hosted runner's AppArmor policy
+          # (/proc/self/uid_map: Operation not permitted) even when bwrap's own
+          # profile is allowed, so the capability is proved through bwrap, which
+          # is the only unprivileged-userns entry point the tests use.
+          uid="$(bwrap --unshare-user --unshare-pid --unshare-net --dev-bind / / id -u)"
+          echo "uid inside the sandbox: $uid"
+          test "$uid" = "0"
 
       - name: verify native ${{ matrix.arch }}
         run: |
