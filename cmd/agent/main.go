@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"runtime"
@@ -121,6 +122,9 @@ type uiModel struct {
 	// confirms it; Esc, Enter or any other key cancels without enabling it.
 	autoConfirm *AutoApproveMode
 	clipboardFn func(ctx context.Context, text string, target copyTarget) (clipboardResult, error)
+	ttyWriter   io.Writer
+	copyGen     uint64
+	copyCancel  context.CancelFunc
 	keySource   string
 	projectCtx  projectContextSnapshot
 }
@@ -302,9 +306,11 @@ type errorMsg struct {
 	err error
 }
 type clipboardResultMsg struct {
-	result clipboardResult
-	err    error
-	target copyTarget
+	gen           uint64
+	result        clipboardResult
+	err           error
+	target        copyTarget
+	secretWarning bool
 }
 
 func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -666,9 +672,13 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, nil
 	case clipboardResultMsg:
+		if msg.gen != m.copyGen {
+			return m, nil
+		}
+		m.finishCopy()
 		if msg.err != nil {
 			m.status = "Clipboard error"
-			m.messages = append(m.messages, Message{Role: "local", Content: "Clipboard error: " + msg.err.Error()})
+			m.messages = append(m.messages, Message{Role: "local", Content: "Clipboard error: " + sanitizeSingleLineDisplay(msg.err.Error())})
 		} else {
 			targetDesc := "last reply"
 			if msg.target == targetCode {
@@ -678,14 +688,21 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			var statusText string
 			if msg.result.Unconfirmed {
-				statusText = fmt.Sprintf("Clipboard request sent via OSC 52 (%d bytes); terminal acceptance not confirmed", msg.result.Bytes)
+				statusText = fmt.Sprintf("Clipboard request for %s sent via OSC 52 (%d bytes); terminal acceptance not confirmed", targetDesc, msg.result.Bytes)
 			} else if msg.result.RemoteSSH {
-				statusText = fmt.Sprintf("Copied %s (%d bytes via %s [remote SSH])", targetDesc, msg.result.Bytes, msg.result.Method)
+				statusText = fmt.Sprintf("Copied %s (%d bytes via %s [remote SSH])", targetDesc, msg.result.Bytes, sanitizeSingleLineDisplay(msg.result.Method))
 			} else {
-				statusText = fmt.Sprintf("Copied %s (%d bytes via %s)", targetDesc, msg.result.Bytes, msg.result.Method)
+				statusText = fmt.Sprintf("Copied %s (%d bytes via %s)", targetDesc, msg.result.Bytes, sanitizeSingleLineDisplay(msg.result.Method))
 			}
+			statusText = sanitizeSingleLineDisplay(statusText)
 			m.status = statusText
 			m.messages = append(m.messages, Message{Role: "local", Content: statusText})
+			if msg.secretWarning {
+				m.messages = append(m.messages, Message{
+					Role:    "local",
+					Content: "⚠️ Advisory: copied text resembles a credential (heuristic only); verify before pasting into untrusted targets.",
+				})
+			}
 		}
 		m.refresh()
 		return m, nil
@@ -1177,6 +1194,7 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	}
 	if input == "clear" || input == "/clear" {
 		m.cancelActiveTask()
+		m.cancelCopy()
 		m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
 		if m.projectCtx.HasRules() {
 			m.messages = append(m.messages, Message{
@@ -1223,8 +1241,8 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, nil
 	}
-	if input == "/copy" || input == "/copy code" || input == "/copy tool" || strings.HasPrefix(input, "/copy ") {
-		return m.handleCopyCommand(input)
+	if isCopy, target, ok := parseCopyCommand(input); isCopy {
+		return m.handleCopyCommand(target, ok)
 	}
 	if input == "/compact" {
 		return m.handleCompactCommand()
@@ -1326,17 +1344,53 @@ func autoApproveAllWarning(mode AutoApproveMode) string {
 	return fmt.Sprintf("Auto-approval mode set to: %s\n⚠️ WARNING: Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review. go_verify and mcp_call still require a manual approval on every call.", mode)
 }
 
-func (m *uiModel) handleCopyCommand(input string) (tea.Model, tea.Cmd) {
-	m.clearInput()
-	var target copyTarget
-	switch input {
+func (m *uiModel) finishCopy() {
+	if m.copyCancel != nil {
+		m.copyCancel()
+		m.copyCancel = nil
+	}
+}
+
+func (m *uiModel) cancelCopy() {
+	m.finishCopy()
+	m.copyGen++
+}
+
+func parseCopyCommand(input string) (isCopy bool, target copyTarget, ok bool) {
+	fields := strings.Fields(strings.ToLower(input))
+	if len(fields) == 0 {
+		return false, targetReply, false
+	}
+	switch fields[0] {
 	case "/copy":
-		target = targetReply
-	case "/copy code":
-		target = targetCode
-	case "/copy tool":
-		target = targetTool
+		isCopy = true
+	case "copy":
+		// Match documented "/copy, copy" alias for exact commands without stealing natural prompts.
+		if len(fields) == 1 || (len(fields) == 2 && (fields[1] == "code" || fields[1] == "tool")) {
+			isCopy = true
+		} else {
+			return false, targetReply, false
+		}
 	default:
+		return false, targetReply, false
+	}
+	if len(fields) == 1 {
+		return true, targetReply, true
+	}
+	if len(fields) == 2 {
+		switch fields[1] {
+		case "code":
+			return true, targetCode, true
+		case "tool":
+			return true, targetTool, true
+		}
+	}
+	return true, targetReply, false
+}
+
+func (m *uiModel) handleCopyCommand(target copyTarget, usageOK bool) (tea.Model, tea.Cmd) {
+	m.clearInput()
+	if !usageOK {
 		m.messages = append(m.messages, Message{Role: "local", Content: "Usage: /copy, /copy code, or /copy tool"})
 		m.refresh()
 		return *m, nil
@@ -1366,20 +1420,36 @@ func (m *uiModel) handleCopyCommand(input string) (tea.Model, tea.Cmd) {
 		return *m, nil
 	}
 
+	secretWarning := len(advisorySecretWarnings(text)) > 0
+
+	m.cancelCopy()
+	ctx, cancel := context.WithCancel(m.lifecycle.ctx)
+	m.copyCancel = cancel
+	gen := m.copyGen
+
 	m.status = "Copying to clipboard..."
 	fn := m.clipboardFn
 	if fn == nil {
-		fn = func(ctx context.Context, txt string, _ copyTarget) (clipboardResult, error) {
-			return copyToClipboard(ctx, txt, detectSystemEnv(), nil)
+		env := detectSystemEnv()
+		if m.ttyWriter != nil {
+			env.ttyWriter = m.ttyWriter
+			if f, ok := m.ttyWriter.(interface{ Fd() uintptr }); ok {
+				env.isTTY = term.IsTerminal(int(f.Fd()))
+			}
+		}
+		fn = func(c context.Context, txt string, _ copyTarget) (clipboardResult, error) {
+			return copyToClipboard(c, txt, env, nil)
 		}
 	}
 
 	return *m, m.lifecycle.wrap(func() tea.Msg {
-		res, err := fn(m.lifecycle.ctx, text, target)
+		res, err := fn(ctx, text, target)
 		return clipboardResultMsg{
-			result: res,
-			err:    err,
-			target: target,
+			gen:           gen,
+			result:        res,
+			err:           err,
+			target:        target,
+			secretWarning: secretWarning,
 		}
 	})
 }
@@ -1619,9 +1689,11 @@ func main() {
 			}
 		}
 	}
+	ttyOut := newSyncTTYWriter(os.Stdout)
 	model := initialModel(reg, client, autoMode)
+	model.ttyWriter = ttyOut
 	model.setKeySource(keySource)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithOutput(ttyOut))
 	_, runErr := p.Run()
 	model.lifecycle.stop()
 	if !model.lifecycle.wait(5 * time.Second) {
