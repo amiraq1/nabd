@@ -87,11 +87,46 @@ func f24Probe(t *testing.T, mode string) (string, string) {
 	return dir, bin
 }
 
+func mcpTestEnvironment() []string {
+	allowed := map[string]bool{"PATH": true, "HOME": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "PREFIX": true}
+	env := []string{}
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if allowed[key] {
+			env = append(env, entry)
+		}
+	}
+	return env
+}
+
+func callGuardedMCPForTest(ctx context.Context, dir, command, tool string, args map[string]any) (string, error) {
+	if (runtime.GOOS != "linux" && runtime.GOOS != "android") || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
+		return "", fmt.Errorf("MCP process isolation unsupported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	guard, err := mcpGuardPath()
+	if err != nil {
+		return "", err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
+	defer cancel()
+	if err := callCtx.Err(); err != nil {
+		return "", err
+	}
+	cmd := exec.Command(guard, command)
+	cmd.Dir = dir
+	cmd.Env = mcpTestEnvironment()
+	process, stdin, stdout, err := startMCPProcessWithCmd(callCtx, cmd)
+	if err != nil {
+		return "", err
+	}
+	return runMCPServerProtocol(callCtx, process, stdin, stdout, "", tool, args)
+}
+
 func TestF24IntegrationRealMCPAndEnvironment(t *testing.T) {
 	dir, bin := f24Probe(t, "env")
 	t.Setenv("NABD_API_KEY", "synthetic-only")
 	t.Setenv("F24_PRIVATE_TOKEN", "synthetic-only")
-	out, err := callExternalMCP(context.Background(), dir, bin, "probe", nil)
+	out, err := callGuardedMCPForTest(context.Background(), dir, bin, "probe", nil)
 	if err != nil {
 		t.Fatalf("real MCP request failed: %v", err)
 	}
@@ -111,7 +146,7 @@ func TestF24IntegrationRealMCPAndEnvironment(t *testing.T) {
 
 func f24Run(t *testing.T, dir, bin string, ctx context.Context) string {
 	t.Helper()
-	out, err := callExternalMCP(ctx, dir, bin, "probe", nil)
+	out, err := callGuardedMCPForTest(ctx, dir, bin, "probe", nil)
 	if err != nil {
 		return "Error: " + err.Error()
 	}
@@ -258,7 +293,7 @@ func TestF24WireLimit(t *testing.T) {
 
 func TestF24TextCap(t *testing.T) {
 	dir, bin := f24Probe(t, "medium")
-	out, err := callExternalMCP(context.Background(), dir, bin, "probe", nil)
+	out, err := callGuardedMCPForTest(context.Background(), dir, bin, "probe", nil)
 	if err != nil {
 		t.Fatalf("call failed: %v", err)
 	}
@@ -278,7 +313,7 @@ func TestF24GuardUnavailable(t *testing.T) {
 	old := mcpGuardOverride
 	mcpGuardOverride = filepath.Join(t.TempDir(), "missing-guard")
 	t.Cleanup(func() { mcpGuardOverride = old })
-	_, err := callExternalMCP(context.Background(), dir, bin, "probe", nil)
+	_, err := callGuardedMCPForTest(context.Background(), dir, bin, "probe", nil)
 	if err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Fatalf("missing guard did not fail closed: %v", err)
 	}
@@ -296,7 +331,7 @@ func TestF24GuardFailure(t *testing.T) {
 	old := mcpGuardOverride
 	mcpGuardOverride = guard
 	t.Cleanup(func() { mcpGuardOverride = old })
-	_, err := callExternalMCP(context.Background(), dir, bin, "probe", nil)
+	_, err := callGuardedMCPForTest(context.Background(), dir, bin, "probe", nil)
 	if err == nil {
 		t.Fatal("failing guard did not refuse the call")
 	}
@@ -332,7 +367,7 @@ func TestF24CanceledContextKillsTree(t *testing.T) {
 	defer cancel()
 	done := make(chan string, 1)
 	go func() {
-		out, err := callExternalMCP(ctx, dir, bin, "probe", nil)
+		out, err := callGuardedMCPForTest(ctx, dir, bin, "probe", nil)
 		if err != nil {
 			done <- "Error: " + err.Error()
 			return
@@ -411,7 +446,7 @@ func TestF24AlreadyCancelledStartsNothing(t *testing.T) {
 	dir, bin := f24Probe(t, "env")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := callExternalMCP(ctx, dir, bin, "probe", nil)
+	_, err := callGuardedMCPForTest(ctx, dir, bin, "probe", nil)
 	if err == nil {
 		t.Fatal("already canceled call succeeded")
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -133,6 +134,33 @@ func TestGuardHelperProcess(t *testing.T) {
 		fmt.Fprintf(os.Stderr, "process survived architecture mismatch!\n")
 		os.Exit(2)
 
+	case "blocked_dangerous_syscalls":
+		if err := installFilter(); err != nil {
+			fmt.Fprintf(os.Stderr, "installFilter failed: %v\n", err)
+			os.Exit(1)
+		}
+		checks := []struct {
+			name string
+			nr   uintptr
+			a1   uintptr
+		}{
+			{"personality", uintptr(unix.SYS_PERSONALITY), 0xffffffff},
+			{"ptrace", uintptr(unix.SYS_PTRACE), 0},
+			{"unshare", uintptr(unix.SYS_UNSHARE), 0},
+			{"bpf", uintptr(unix.SYS_BPF), 0},
+			{"setpgid", uintptr(unix.SYS_SETPGID), 0},
+			{"setsid", uintptr(unix.SYS_SETSID), 0},
+		}
+		for _, c := range checks {
+			_, _, errno := syscall.RawSyscall(c.nr, c.a1, 0, 0)
+			if errno != syscall.EPERM {
+				fmt.Fprintf(os.Stderr, "%s returned errno=%v, want EPERM\n", c.name, errno)
+				os.Exit(2)
+			}
+		}
+		fmt.Println("BLOCKED_DANGEROUS_EPERM")
+		os.Exit(0)
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode: %s\n", mode)
 		os.Exit(1)
@@ -182,9 +210,11 @@ func TestSeccompArchitectureParity(t *testing.T) {
 	}
 
 	// 2. Program Structure and Instruction Parity
+	denied := deniedSyscalls()
+	expectedLen := 6 + len(denied) + 2
 	filter := seccompFilter()
-	if len(filter) != 10 {
-		t.Fatalf("expected filter length 10 on %s, got %d", runtime.GOARCH, len(filter))
+	if len(filter) != expectedLen {
+		t.Fatalf("expected filter length %d on %s, got %d", expectedLen, runtime.GOARCH, len(filter))
 	}
 
 	// Instruction 0: load arch at offset 4
@@ -217,25 +247,25 @@ func TestSeccompArchitectureParity(t *testing.T) {
 		t.Errorf("inst 5: want SECCOMP_RET_KILL_PROCESS, got code=0x%x K=0x%x", filter[5].Code, filter[5].K)
 	}
 
-	// Instruction 6: branch on SYS_SETSID
-	if filter[6].Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || filter[6].K != uint32(unix.SYS_SETSID) || filter[6].Jt != 2 || filter[6].Jf != 0 {
-		t.Errorf("inst 6: want JEQ SYS_SETSID (%d) Jt=2 Jf=0, got K=%d Jt=%d Jf=%d", unix.SYS_SETSID, filter[6].K, filter[6].Jt, filter[6].Jf)
+	allowIdx := 6 + len(denied)
+	epermIdx := allowIdx + 1
+	for i, nr := range denied {
+		inst := filter[6+i]
+		wantJt := uint8(len(denied) - i)
+		if inst.Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || inst.K != nr || inst.Jt != wantJt || inst.Jf != 0 {
+			t.Errorf("inst %d: want JEQ %d Jt=%d Jf=0, got code=0x%x K=%d Jt=%d Jf=%d", 6+i, nr, wantJt, inst.Code, inst.K, inst.Jt, inst.Jf)
+		}
 	}
 
-	// Instruction 7: branch on SYS_SETPGID
-	if filter[7].Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || filter[7].K != uint32(unix.SYS_SETPGID) || filter[7].Jt != 1 || filter[7].Jf != 0 {
-		t.Errorf("inst 7: want JEQ SYS_SETPGID (%d) Jt=1 Jf=0, got K=%d Jt=%d Jf=%d", unix.SYS_SETPGID, filter[7].K, filter[7].Jt, filter[7].Jf)
+	// Default ALLOW
+	if filter[allowIdx].Code != (unix.BPF_RET|unix.BPF_K) || filter[allowIdx].K != unix.SECCOMP_RET_ALLOW {
+		t.Errorf("inst %d: want SECCOMP_RET_ALLOW, got code=0x%x K=0x%x", allowIdx, filter[allowIdx].Code, filter[allowIdx].K)
 	}
 
-	// Instruction 8: default ALLOW
-	if filter[8].Code != (unix.BPF_RET|unix.BPF_K) || filter[8].K != unix.SECCOMP_RET_ALLOW {
-		t.Errorf("inst 8: want SECCOMP_RET_ALLOW, got code=0x%x K=0x%x", filter[8].Code, filter[8].K)
-	}
-
-	// Instruction 9: reject setsid/setpgid with EPERM
+	// Reject denied syscalls with EPERM
 	wantEperm := unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)
-	if filter[9].Code != (unix.BPF_RET|unix.BPF_K) || filter[9].K != wantEperm {
-		t.Errorf("inst 9: want SECCOMP_RET_ERRNO | EPERM (0x%x), got code=0x%x K=0x%x", wantEperm, filter[9].Code, filter[9].K)
+	if filter[epermIdx].Code != (unix.BPF_RET|unix.BPF_K) || filter[epermIdx].K != wantEperm {
+		t.Errorf("inst %d: want SECCOMP_RET_ERRNO | EPERM (0x%x), got code=0x%x K=0x%x", epermIdx, wantEperm, filter[epermIdx].Code, filter[epermIdx].K)
 	}
 }
 
@@ -278,6 +308,8 @@ func TestStaticBPFArchitectureValidation(t *testing.T) {
 }
 
 func TestStaticBPFProgramIntegrity(t *testing.T) {
+	denied := deniedSyscalls()
+	expectedLen := 6 + len(denied) + 2
 	filter := seccompFilter()
 	if len(filter) == 0 {
 		t.Fatal("seccompFilter returned empty program")
@@ -285,8 +317,8 @@ func TestStaticBPFProgramIntegrity(t *testing.T) {
 	if len(filter) > 4096 {
 		t.Fatalf("filter length %d exceeds kernel BPF_MAXINSNS (4096)", len(filter))
 	}
-	if len(filter) != 10 {
-		t.Errorf("expected filter length 10, got %d", len(filter))
+	if len(filter) != expectedLen {
+		t.Errorf("expected filter length %d, got %d", expectedLen, len(filter))
 	}
 
 	// Verify all jump offsets stay within filter boundaries
@@ -320,9 +352,11 @@ func TestStaticBPFProgramIntegrity(t *testing.T) {
 }
 
 func TestStaticBPFPolicyRules(t *testing.T) {
+	denied := deniedSyscalls()
+	expectedLen := 6 + len(denied) + 2
 	filter := seccompFilter()
-	if len(filter) != 10 {
-		t.Fatalf("expected 10 instructions, got %d", len(filter))
+	if len(filter) != expectedLen {
+		t.Fatalf("expected %d instructions, got %d", expectedLen, len(filter))
 	}
 
 	// Instruction 3: load syscall nr at offset 0
@@ -343,31 +377,57 @@ func TestStaticBPFPolicyRules(t *testing.T) {
 		t.Errorf("instruction 5 must be SECCOMP_RET_KILL_PROCESS: got code=0x%x K=0x%x", filter[5].Code, filter[5].K)
 	}
 
-	// Instruction 6: check SYS_SETSID
-	if filter[6].Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || filter[6].K != uint32(unix.SYS_SETSID) {
-		t.Errorf("instruction 6 must check SYS_SETSID (%d): got code=0x%x K=%d", unix.SYS_SETSID, filter[6].Code, filter[6].K)
-	}
-	if filter[6].Jt != 2 || filter[6].Jf != 0 {
-		t.Errorf("instruction 6 jump targets invalid: Jt=%d (expected 2 to errno ret), Jf=%d (expected 0)", filter[6].Jt, filter[6].Jf)
-	}
-
-	// Instruction 7: check SYS_SETPGID
-	if filter[7].Code != (unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K) || filter[7].K != uint32(unix.SYS_SETPGID) {
-		t.Errorf("instruction 7 must check SYS_SETPGID (%d): got code=0x%x K=%d", unix.SYS_SETPGID, filter[7].Code, filter[7].K)
-	}
-	if filter[7].Jt != 1 || filter[7].Jf != 0 {
-		t.Errorf("instruction 7 jump targets invalid: Jt=%d (expected 1 to errno ret), Jf=%d (expected 0)", filter[7].Jt, filter[7].Jf)
+	seen := make(map[uint32]bool, len(denied))
+	epermIdx := len(filter) - 1
+	allowIdx := len(filter) - 2
+	for i, inst := range filter[6:allowIdx] {
+		if inst.Code != (unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K) {
+			t.Fatalf("instruction %d must be BPF_JEQ: got code=0x%x", 6+i, inst.Code)
+		}
+		targetTrue := (6 + i) + 1 + int(inst.Jt)
+		if targetTrue != epermIdx || inst.Jf != 0 {
+			t.Fatalf("instruction %d jump targets invalid: targetTrue=%d (want %d), Jf=%d", 6+i, targetTrue, epermIdx, inst.Jf)
+		}
+		seen[inst.K] = true
 	}
 
-	// Instruction 8: default ALLOW
-	if filter[8].Code != (unix.BPF_RET|unix.BPF_K) || filter[8].K != unix.SECCOMP_RET_ALLOW {
-		t.Errorf("instruction 8 must be SECCOMP_RET_ALLOW: got code=0x%x K=0x%x", filter[8].Code, filter[8].K)
+	requiredBlocked := []uint32{
+		uint32(unix.SYS_SETSID),
+		uint32(unix.SYS_SETPGID),
+		uint32(unix.SYS_PTRACE),
+		uint32(unix.SYS_PROCESS_VM_READV),
+		uint32(unix.SYS_PROCESS_VM_WRITEV),
+		uint32(unix.SYS_UNSHARE),
+		uint32(unix.SYS_SETNS),
+		uint32(unix.SYS_MOUNT),
+		uint32(unix.SYS_BPF),
+		uint32(unix.SYS_IO_URING_SETUP),
+		uint32(unix.SYS_IO_URING_ENTER),
+		uint32(unix.SYS_IO_URING_REGISTER),
+		uint32(unix.SYS_USERFAULTFD),
+		uint32(unix.SYS_KEYCTL),
+		uint32(unix.SYS_KEXEC_LOAD),
+		uint32(unix.SYS_INIT_MODULE),
+		uint32(unix.SYS_PERSONALITY),
+	}
+	for _, nr := range requiredBlocked {
+		if !seen[nr] {
+			t.Errorf("required dangerous syscall %d missing from seccomp deny list", nr)
+		}
+	}
+	if seen[uint32(unix.SYS_EXECVEAT)] {
+		t.Error("SYS_EXECVEAT must not be in the deny list")
 	}
 
-	// Instruction 9: reject with EPERM
+	// Default ALLOW
+	if filter[allowIdx].Code != (unix.BPF_RET|unix.BPF_K) || filter[allowIdx].K != unix.SECCOMP_RET_ALLOW {
+		t.Errorf("instruction %d must be SECCOMP_RET_ALLOW: got code=0x%x K=0x%x", allowIdx, filter[allowIdx].Code, filter[allowIdx].K)
+	}
+
+	// Reject with EPERM
 	expectedErrnoRet := unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)
-	if filter[9].Code != (unix.BPF_RET|unix.BPF_K) || filter[9].K != expectedErrnoRet {
-		t.Errorf("instruction 9 must be SECCOMP_RET_ERRNO | EPERM (0x%x): got code=0x%x K=0x%x", expectedErrnoRet, filter[9].Code, filter[9].K)
+	if filter[epermIdx].Code != (unix.BPF_RET|unix.BPF_K) || filter[epermIdx].K != expectedErrnoRet {
+		t.Errorf("instruction %d must be SECCOMP_RET_ERRNO | EPERM (0x%x): got code=0x%x K=0x%x", epermIdx, expectedErrnoRet, filter[epermIdx].Code, filter[epermIdx].K)
 	}
 }
 
@@ -443,13 +503,20 @@ func TestKernelEnforcedAuditArchMismatch(t *testing.T) {
 	}
 }
 
-func TestCLISuccessfulExecution(t *testing.T) {
-	echoPath, err := exec.LookPath("echo")
+func TestKernelEnforcedBlockedDangerousSyscalls(t *testing.T) {
+	_, out, err := runHelperSubprocess(t, "blocked_dangerous_syscalls")
 	if err != nil {
-		t.Fatalf("echo not found in PATH on Linux: %v", err)
+		t.Fatalf("blocked_dangerous_syscalls subprocess failed: %v\nOutput: %s", err, string(out))
 	}
+	if !strings.Contains(string(out), "BLOCKED_DANGEROUS_EPERM") {
+		t.Fatalf("expected BLOCKED_DANGEROUS_EPERM in output, got: %s", string(out))
+	}
+}
+
+func TestCLISuccessfulExecution(t *testing.T) {
+	target := getTestTargetBinary(t)
 	guard := getGuardBinary(t)
-	cmd := exec.Command(guard, echoPath, "mcp-guard-test-pass")
+	cmd := exec.Command(guard, target, "mcp-guard-test-pass")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("mcp-guard execution failed: %v\nOutput: %s", err, string(out))
@@ -460,13 +527,10 @@ func TestCLISuccessfulExecution(t *testing.T) {
 }
 
 func TestCLIExitCodePropagation(t *testing.T) {
-	shPath, err := exec.LookPath("sh")
-	if err != nil {
-		t.Fatalf("sh not found in PATH on Linux: %v", err)
-	}
+	target := getTestTargetBinary(t)
 	guard := getGuardBinary(t)
-	cmd := exec.Command(guard, shPath, "-c", "exit 42")
-	err = cmd.Run()
+	cmd := exec.Command(guard, target, "--exit", "42")
+	err := cmd.Run()
 	if err == nil {
 		t.Fatal("expected exit code 42, got exit 0")
 	}
@@ -476,5 +540,46 @@ func TestCLIExitCodePropagation(t *testing.T) {
 	}
 	if exitErr.ExitCode() != 42 {
 		t.Fatalf("expected exit code 42, got %d", exitErr.ExitCode())
+	}
+}
+
+func TestCLISymlinkAndWritableTargetRejected(t *testing.T) {
+	guard := getGuardBinary(t)
+	target := getTestTargetBinary(t)
+
+	// 1. Direct symlink target must be rejected fail-closed.
+	symDir := t.TempDir()
+	symTarget := filepath.Join(symDir, "sym-target")
+	if err := os.Symlink(target, symTarget); err != nil {
+		t.Skipf("symlink creation unsupported: %v", err)
+	}
+	if out, err := exec.Command(guard, symTarget, "should-not-run").CombinedOutput(); err == nil {
+		t.Fatalf("expected symlink target to be rejected, output: %s", string(out))
+	}
+
+	// 2. Intermediate symlinked parent directory must be rejected fail-closed.
+	symParent := filepath.Join(symDir, "sym-parent")
+	if err := os.Symlink(filepath.Dir(target), symParent); err != nil {
+		t.Skipf("parent symlink creation unsupported: %v", err)
+	}
+	viaParent := filepath.Join(symParent, filepath.Base(target))
+	if out, err := exec.Command(guard, viaParent, "should-not-run").CombinedOutput(); err == nil {
+		t.Fatalf("expected symlink parent dir target to be rejected, output: %s", string(out))
+	}
+
+	// 3. Group/world-writable target executable must be rejected fail-closed.
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writableTarget := filepath.Join(symDir, "writable-target")
+	if err := os.WriteFile(writableTarget, data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(writableTarget, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(guard, writableTarget, "should-not-run").CombinedOutput(); err == nil {
+		t.Fatalf("expected group-writable target to be rejected, output: %s", string(out))
 	}
 }

@@ -27,7 +27,7 @@ func renderHeader(m *uiModel, width int) string {
 		budget = defaultHistoryTokens
 	}
 
-	modelPill := m.modelName
+	modelPill := sanitizeSingleLineDisplay(m.modelName)
 	if modelPill == "" || modelPill == "unknown" {
 		modelPill = "default-model"
 	}
@@ -41,7 +41,7 @@ func renderHeader(m *uiModel, width int) string {
 	iterMetric := fmt.Sprintf("Iter %d/%d", m.iteration, m.maxIterations)
 
 	// Workspace path
-	ws := m.workspace
+	ws := sanitizeSingleLineDisplay(m.workspace)
 	if ws == "" {
 		ws = "."
 	}
@@ -211,10 +211,11 @@ func renderFooter(m *uiModel, width int) string {
 	}
 
 	var statusPart string
+	statusText := sanitizeSingleLineDisplay(m.status)
 	if m.busy {
-		statusPart = m.spinner.View() + " " + footerStatusStyle.Render(m.status)
-	} else if m.status != "" {
-		statusPart = footerStatusStyle.Render(m.status)
+		statusPart = m.spinner.View() + " " + footerStatusStyle.Render(statusText)
+	} else if statusText != "" {
+		statusPart = footerStatusStyle.Render(statusText)
 	} else {
 		statusPart = footerStatusStyle.Render("Ready")
 	}

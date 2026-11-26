@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -934,16 +935,46 @@ func TestUndoIsAudited(t *testing.T) {
 			undoEvents = append(undoEvents, event)
 		}
 	}
-	if len(undoEvents) != 2 {
+	if len(undoEvents) != 3 {
 		t.Fatalf("undo audit events = %+v", undoEvents)
 	}
-	if undoEvents[0].Event != "requested" || undoEvents[1].Event != "applied" {
+	if undoEvents[0].Event != "requested" || undoEvents[1].Event != "executing" || undoEvents[2].Event != "applied" {
 		t.Fatalf("undo events = %+v", undoEvents)
 	}
-	if undoEvents[0].ArgsSHA256 == "" || undoEvents[1].ResultSHA256 == "" {
-		t.Fatalf("undo hashes missing: %+v", undoEvents)
+	if undoEvents[0].ArgsSHA256 == "" || undoEvents[1].ArgsSHA256 != undoEvents[0].ArgsSHA256 || undoEvents[2].ResultSHA256 == "" {
+		t.Fatalf("undo hashes missing or mismatched: %+v", undoEvents)
 	}
-	if undoEvents[0].Detail != "target.txt" {
-		t.Fatalf("undo detail = %q", undoEvents[0].Detail)
+	if undoEvents[0].Detail != "target.txt" || undoEvents[1].Detail != "target.txt" {
+		t.Fatalf("undo detail = %q / %q", undoEvents[0].Detail, undoEvents[1].Detail)
+	}
+}
+
+func TestUndoExecutingEventRecordedBeforeWriteFailure(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	writeTestFile(t, filepath.Join(root, "target.txt"), "original\n")
+	runToolApproved(t, reg, "edit_file", map[string]any{
+		"path": "target.txt", "old_text": "original", "new_text": "changed",
+	})
+
+	oldHook := parentRenameHook
+	parentRenameHook = func() error { return errors.New("injected undo failure") }
+	t.Cleanup(func() { parentRenameHook = oldHook })
+
+	if _, err := reg.Undo("target.txt"); err == nil {
+		t.Fatal("expected Undo to fail when rename fails")
+	}
+
+	events, _ := readAuditLog(t, root)
+	var undoEvents []audit.Event
+	for _, event := range events {
+		if event.Tool == "undo" {
+			undoEvents = append(undoEvents, event)
+		}
+	}
+	if len(undoEvents) != 3 {
+		t.Fatalf("undo audit events = %+v", undoEvents)
+	}
+	if undoEvents[0].Event != "requested" || undoEvents[1].Event != "executing" || undoEvents[2].Event != "failed" {
+		t.Fatalf("undo events = %+v, want [requested executing failed]", undoEvents)
 	}
 }

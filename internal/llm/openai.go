@@ -35,6 +35,7 @@ const (
 type OpenAIClient struct {
 	cfg         Config
 	httpClient  *http.Client
+	resolver    loopbackResolver
 	sleep       func(context.Context, time.Duration) error
 	backoffBase time.Duration
 }
@@ -56,12 +57,13 @@ func NewOpenAIClient(cfg Config) *OpenAIClient {
 		t := DefaultTemperature
 		cfg.Temperature = &t
 	}
-	return &OpenAIClient{
+	c := &OpenAIClient{
 		cfg:         cfg,
-		httpClient:  &http.Client{Timeout: cfg.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		sleep:       sleepContext,
 		backoffBase: 500 * time.Millisecond,
 	}
+	c.httpClient = newLLMHTTPClient(cfg.BaseURL, cfg.Timeout, func() loopbackResolver { return c.resolver })
+	return c
 }
 
 // BaseURL identifies the model endpoint for disclosure prompts.
@@ -80,6 +82,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	if err := validateBaseURL(c.cfg.BaseURL); err != nil {
 		return nil, err
 	}
+	ctx = withSchemeDialPolicy(ctx, c.cfg.BaseURL)
 	body, err := c.encode(req)
 	if err != nil {
 		return nil, err
@@ -169,6 +172,9 @@ func (c *OpenAIClient) attempt(ctx context.Context, endpoint string, body []byte
 		if ctx.Err() != nil {
 			return nil, false, 0, ctx.Err()
 		}
+		if errors.Is(err, errNonLoopbackAddress) {
+			return nil, false, 0, err
+		}
 		return nil, true, 0, err
 	}
 	defer resp.Body.Close()
@@ -212,6 +218,11 @@ func (c *OpenAIClient) attempt(ctx context.Context, endpoint string, body []byte
 func (c *OpenAIClient) CheckModel(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+
+	if err := validateBaseURL(c.cfg.BaseURL); err != nil {
+		return err
+	}
+	ctx = withSchemeDialPolicy(ctx, c.cfg.BaseURL)
 
 	endpoint := strings.TrimRight(c.cfg.BaseURL, "/") + "/models"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)

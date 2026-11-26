@@ -168,3 +168,26 @@ func TestValidateWorkspaceMasksNoFollow(t *testing.T) {
 		}
 	}
 }
+
+func TestBwrapHostEnvDropsSecrets(t *testing.T) {
+	t.Setenv("NABD_API_KEY", "secret-llm-key")
+	t.Setenv("NABD_AUDIT_ANCHOR", "secret-anchor")
+	t.Setenv("NABD_FIRECRAWL_API_KEY", "secret-fc-key")
+	t.Setenv("NABD_BRAVE_API_KEY", "secret-brave-key")
+	t.Setenv("LD_PRELOAD", "/tmp/evil.so")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	env := bwrapHostEnv()
+	if env == nil {
+		t.Fatal("bwrapHostEnv returned nil (would inherit full host os.Environ)")
+	}
+	joined := strings.Join(env, "\n")
+	for _, secret := range []string{"NABD_API_KEY", "NABD_AUDIT_ANCHOR", "NABD_FIRECRAWL_API_KEY", "NABD_BRAVE_API_KEY", "LD_PRELOAD", "secret-"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("bwrap host env leaked %q: %v", secret, env)
+		}
+	}
+	if !strings.Contains(joined, "PATH=/usr/bin:/bin") {
+		t.Fatalf("bwrap host env dropped PATH: %v", env)
+	}
+}

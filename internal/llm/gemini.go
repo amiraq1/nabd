@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
@@ -18,6 +19,7 @@ import (
 type GeminiClient struct {
 	cfg         Config
 	httpClient  *http.Client
+	resolver    loopbackResolver
 	sleep       func(context.Context, time.Duration) error
 	backoffBase time.Duration
 }
@@ -40,17 +42,13 @@ func NewGeminiClient(cfg Config) *GeminiClient {
 		t := DefaultTemperature
 		cfg.Temperature = &t
 	}
-	return &GeminiClient{
-		cfg: cfg,
-		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+	c := &GeminiClient{
+		cfg:         cfg,
 		sleep:       sleepContext,
 		backoffBase: 500 * time.Millisecond,
 	}
+	c.httpClient = newLLMHTTPClient(cfg.BaseURL, cfg.Timeout, func() loopbackResolver { return c.resolver })
+	return c
 }
 
 // BaseURL returns the configured base URL.
@@ -76,6 +74,7 @@ func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error)
 	if err := validateBaseURL(c.cfg.BaseURL); err != nil {
 		return nil, err
 	}
+	ctx = withSchemeDialPolicy(ctx, c.cfg.BaseURL)
 
 	body, err := c.encode(req)
 	if err != nil {
@@ -131,6 +130,9 @@ func (c *GeminiClient) attempt(ctx context.Context, endpoint string, body []byte
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, false, 0, ctx.Err()
+		}
+		if errors.Is(err, errNonLoopbackAddress) {
+			return nil, false, 0, err
 		}
 		return nil, true, 0, err
 	}
@@ -421,6 +423,12 @@ func parseGeminiResponse(data []byte) (*Response, error) {
 			textBuilder.WriteString(part.Text)
 		}
 		if part.FunctionCall != nil {
+			if strings.TrimSpace(part.FunctionCall.Name) == "" {
+				return nil, fmt.Errorf("gemini response contains invalid tool call")
+			}
+			if len(toolCalls) >= maxToolCalls {
+				return nil, fmt.Errorf("too many tool calls in one response (limit %d)", maxToolCalls)
+			}
 			argsBytes, err := json.Marshal(part.FunctionCall.Args)
 			if err != nil {
 				argsBytes = []byte("{}")
@@ -481,6 +489,11 @@ func parseGeminiResponse(data []byte) (*Response, error) {
 func (c *GeminiClient) CheckModel(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+
+	if err := validateBaseURL(c.cfg.BaseURL); err != nil {
+		return err
+	}
+	ctx = withSchemeDialPolicy(ctx, c.cfg.BaseURL)
 
 	targetNorm := strings.TrimPrefix(c.cfg.Model, "models/")
 	nextPageToken := ""

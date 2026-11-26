@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -388,4 +390,131 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+type loopbackResolver interface {
+	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+}
+
+type loopbackRequiredKey struct{}
+
+var errNonLoopbackAddress = errors.New("resolved address is not loopback")
+
+func withSchemeDialPolicy(ctx context.Context, rawBaseURL string) context.Context {
+	u, err := url.Parse(rawBaseURL)
+	if err != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, loopbackRequiredKey{}, strings.EqualFold(u.Scheme, "http"))
+}
+
+func newLLMHTTPClient(baseURL string, timeout time.Duration, getResolver func() loopbackResolver) *http.Client {
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+
+	defaultRequireLoopback := false
+	if u, err := url.Parse(baseURL); err == nil && strings.EqualFold(u.Scheme, "http") {
+		defaultRequireLoopback = true
+	}
+
+	baseProxy := tr.Proxy
+	tr.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") {
+			return nil, nil
+		}
+		if baseProxy != nil {
+			return baseProxy(req)
+		}
+		return nil, nil
+	}
+
+	baseDial := tr.DialContext
+	if baseDial == nil {
+		baseDial = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		requireLoopback := defaultRequireLoopback
+		if v, ok := ctx.Value(loopbackRequiredKey{}).(bool); ok {
+			requireLoopback = v
+		}
+		if !requireLoopback {
+			return baseDial(ctx, network, addr)
+		}
+		var resolver loopbackResolver
+		if getResolver != nil {
+			resolver = getResolver()
+		}
+		return dialVerifiedLoopback(ctx, network, addr, resolver, baseDial)
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func dialVerifiedLoopback(
+	ctx context.Context,
+	network, addr string,
+	resolver loopbackResolver,
+	dialFn func(context.Context, string, string) (net.Conn, error),
+) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid address %q: %v", errNonLoopbackAddress, addr, err)
+	}
+	if host == "" {
+		return nil, fmt.Errorf("%w: empty host", errNonLoopbackAddress)
+	}
+
+	if ipAddr, parseErr := netip.ParseAddr(host); parseErr == nil {
+		if ipAddr.Zone() != "" || !ipAddr.Unmap().IsLoopback() {
+			return nil, fmt.Errorf("%w: %s", errNonLoopbackAddress, host)
+		}
+		return dialFn(ctx, network, net.JoinHostPort(ipAddr.Unmap().String(), port))
+	}
+
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve %q: %v", errNonLoopbackAddress, host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("%w: no addresses resolved for %q", errNonLoopbackAddress, host)
+	}
+
+	verified := make([]netip.Addr, 0, len(ips))
+	for _, candidate := range ips {
+		if candidate.Zone != "" {
+			return nil, fmt.Errorf("%w: IP zone identifiers are not allowed for %q", errNonLoopbackAddress, host)
+		}
+		parsed, ok := netip.AddrFromSlice(candidate.IP)
+		if !ok || !parsed.IsValid() {
+			return nil, fmt.Errorf("%w: invalid IP resolved for %q", errNonLoopbackAddress, host)
+		}
+		unmapped := parsed.Unmap()
+		if !unmapped.IsLoopback() {
+			return nil, fmt.Errorf("%w: host %q resolved to non-loopback IP %s", errNonLoopbackAddress, host, unmapped.String())
+		}
+		verified = append(verified, unmapped)
+	}
+
+	var lastErr error
+	for _, targetIP := range verified {
+		conn, dialErr := dialFn(ctx, network, net.JoinHostPort(targetIP.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	return nil, lastErr
 }

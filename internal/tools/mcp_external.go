@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -62,20 +61,6 @@ func (l *wireLimitReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-//lint:ignore U1000 exercised by platform-specific integration tests
-func mcpEnvironment() []string {
-	allowed := map[string]bool{"PATH": true, "HOME": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "PREFIX": true}
-	env := []string{}
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if allowed[key] {
-			env = append(env, entry)
-		}
-	}
-	return env
-}
-
-//lint:ignore U1000 exercised by platform-specific integration tests
 func mcpGuardPath() (string, error) {
 	path := mcpGuardOverride
 	if path == "" {
@@ -90,27 +75,6 @@ func mcpGuardPath() (string, error) {
 		return "", fmt.Errorf("MCP process isolation unavailable: install nabd-mcp-guard next to the agent")
 	}
 	return path, nil
-}
-
-//lint:ignore U1000 exercised by platform-specific integration tests
-func callExternalMCP(ctx context.Context, dir, command, tool string, args map[string]any) (output string, retErr error) {
-	if (runtime.GOOS != "linux" && runtime.GOOS != "android") || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
-		return "", fmt.Errorf("MCP process isolation unsupported on %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-	guard, err := mcpGuardPath()
-	if err != nil {
-		return "", err
-	}
-	callCtx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
-	defer cancel()
-	if err := callCtx.Err(); err != nil {
-		return "", err
-	}
-	process, stdin, stdout, err := startMCPProcess(callCtx, guard, dir, command)
-	if err != nil {
-		return "", err
-	}
-	return runMCPProtocol(callCtx, process, stdin, stdout, tool, args)
 }
 
 // callExternalMCPServer launches a user-preconfigured server inside the proven
@@ -159,10 +123,6 @@ func callExternalMCPServer(ctx context.Context, dir string, b sandbox.Backend, s
 		return "", err
 	}
 	return runMCPServerProtocol(callCtx, process, stdin, stdout, server.Name, tool, args)
-}
-
-func runMCPProtocol(callCtx context.Context, process *mcpProcess, stdin, stdout *os.File, tool string, args map[string]any) (output string, retErr error) {
-	return runMCPServerProtocol(callCtx, process, stdin, stdout, "", tool, args)
 }
 
 func runMCPServerProtocol(callCtx context.Context, process *mcpProcess, stdin, stdout *os.File, serverName, tool string, args map[string]any) (output string, retErr error) {

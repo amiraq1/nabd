@@ -6,20 +6,23 @@
 
 ## الجزء الأول: ما يفرضه الفلتر فعلياً في كود BPF والنواة (Enforced Rules)
 
-يقوم حارس `cmd/mcp-guard` بتثبيت برنامج BPF بطول 10 تعليمات فقط عبر `unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, ...)` بعد تفعيل `PR_SET_NO_NEW_PRIVS`.
+يقوم حارس `cmd/mcp-guard` بتثبيت برنامج BPF عبر `unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, ...)` بعد تفعيل `PR_SET_NO_NEW_PRIVS`، ثم يفتح الملف التنفيذي المستهدف عبر `internal/safefs` (رفض الروابط الرمزية في كل مكوّن والملفات غير المنتظمة والقابلة للكتابة من المجموعة/الغير، واشتراط بت التنفيذ) وينفّذه عبر `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` لإزالة نافذة TOCTOU.
 
-الفلتر مبني على سياسة **حظر محدد وسماح افتراضي (Allow-by-default with specific Deny-list)**، والجدول التالي يحصر **كل ما يفحصه الفلتر فعلياً في النواة**:
+الفلتر مبني على سياسة **قائمة حظر موسّعة وسماح افتراضي (Allow-by-default with Hardened Deny-list)**؛ صُممت بحيث لا تكسر خوادم MCP المعتمدة (Go/glibc/Python/Node مثل REA) على نواة Linux (`amd64`/`arm64`)، مع حظر الفئات الخطرة بـ `SECCOMP_RET_ERRNO | EPERM`:
 
 | العنصر المفحوص | رقم الاستدعاء على `amd64` | رقم الاستدعاء على `arm64` | القرار البرمجي في BPF | النتيجة في النواة | الغرض الأمني |
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **`seccomp_data.arch`** | `AUDIT_ARCH_X86_64`<br>(`0xc000003e`) | `AUDIT_ARCH_AARCH64`<br>(`0xc00000b7`) | `SECCOMP_RET_KILL_PROCESS` عند عدم التطابق | قتل فوري بإشارة `SIGSYS` | التحقق من المعمارية أولاً؛ منع هجمات حقن استدعاءات من معمارية أخرى (cross-ABI mismatch). |
 | **البت 30 (`0x40000000`)** | `0x40000000` | `0x40000000` | `SECCOMP_RET_KILL_PROCESS` عند ضبط البت | قتل فوري بإشارة `SIGSYS` | على amd64 يمنع الالتفاف عبر x32 ABI؛ وعلى arm64 يقتل أي استدعاء يقع خارج النطاق القياسي. |
-| **`SYS_SETSID`** | **112** | **157** | `SECCOMP_RET_ERRNO \| EPERM` | فشل الاستدعاء مع `EPERM` (Operation not permitted) | منع خادم MCP من إنشاء جلسة جديدة والانفصال عن شجرة العمليات. |
-| **`SYS_SETPGID`** | **109** | **154** | `SECCOMP_RET_ERRNO \| EPERM` | فشل الاستدعاء مع `EPERM` (Operation not permitted) | منع خادم MCP من تغيير مجموعة العمليات للانفصال عن إشارات الإلغاء. |
-| **كافة استدعاءات النظام الأخرى** | أي رقم آخر | أي رقم آخر | **`SECCOMP_RET_ALLOW`** | تنفيذ طبيعي دون اعتراض | السماح المشروط لعمليات الخادم (قراءة/كتابة، شبكة، تخصيص ذاكرة). |
+| **`SYS_SETSID`, `SYS_SETPGID`** | **112, 109** | **157, 154** | `SECCOMP_RET_ERRNO \| EPERM` | فشل الاستدعاء مع `EPERM` | منع خادم MCP من إنشاء جلسة جديدة أو تغيير مجموعة العمليات للانفصال عن شجرة العمليات. |
+| **التصحيح وحقن الذاكرة والمقابض** | `ptrace`, `process_vm_readv/writev`, `process_madvise`, `kcmp`, `pidfd_getfd` | نفسها (وفق `zsysnum_linux_arm64`) | `SECCOMP_RET_ERRNO \| EPERM` | فشل الاستدعاء مع `EPERM` | منع فحص أو تعديل ذاكرة/واصفات العمليات الأخرى. |
+| **مساحات الأسماء والتركيب (`mount`)** | `unshare`, `setns`, `mount`, `umount2`, `pivot_root`, `chroot`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `open_by_handle_at`, `name_to_handle_at` | نفسها (وفق `zsysnum_linux_arm64`) | `SECCOMP_RET_ERRNO \| EPERM` | فشل الاستدعاء مع `EPERM` | منع الهروب عبر مساحات الأسماء أو تركيب أنظمة ملفات أو فتح مقابض خارج الحاوية. |
+| **سطح هجوم النواة والتجاوز** | `bpf`, `io_uring_setup/enter/register`, `userfaultfd`, `perf_event_open` | نفسها (وفق `zsysnum_linux_arm64`) | `SECCOMP_RET_ERRNO \| EPERM` | فشل الاستدعاء مع `EPERM` | سد استدعاءات `io_uring` و`bpf` و`userfaultfd` عالية الخطورة وتجاوز مراقبة الاستدعاءات. |
+| **وحدات النواة، المفاتيح، التوقيت، التراثيات** | `init_module`, `finit_module`, `delete_module`, `kexec_*`, `reboot`, `swapon/off`, `add_key`, `request_key`, `keyctl`, `personality`, `syslog`, `quotactl`, `acct`, `vhangup`, `sethostname`, `setdomainname`, `adjtimex`, `clock_adjtime`, `clock_settime`, `settimeofday`, `lookup_dcookie` + (`uselib`, `ustat`, `sysfs`, `modify_ldt`, `iopl`, `ioperm`, `create_module`, `get_kernel_syms`, `query_module` في `arch_amd64.go`) | المشتركة في `filter_linux.go` | `SECCOMP_RET_ERRNO \| EPERM` | فشل الاستدعاء مع `EPERM` | منع الوصول إلى keyring النواة أو تغيير `personality` أو استغلال واجهات النواة التراثية. |
+| **بقية استدعاءات النظام (بما فيها `execveat`)** | أي رقم آخر | أي رقم آخر | **`SECCOMP_RET_ALLOW`** | تنفيذ طبيعي دون اعتراض | السماح لخوادم MCP بعملياتها التشغيلية الطبيعية (I/O، ذاكرة، مقابس محلية، خيوط). |
 
 > [!IMPORTANT]
-> **تأكيد حاسم**: الفلتر البرمجي لا يفحص ولا يحظر أي استدعاء نظام بخلاف `setsid` و `setpgid` (وفحص المعمارية والبت 30). أي استدعاء آخر يمر مباشرة إلى `SECCOMP_RET_ALLOW`.
+> **تأكيد حاسم**: القاعدة الفعالة هي قائمة حظر موسّعة كما هو موثّق في `commonDeniedSyscalls` (`cmd/mcp-guard/filter_linux.go`) و`archDeniedSyscalls` (`cmd/mcp-guard/arch_amd64.go` / `arch_arm64.go`)؛ وأي استدعاء خارجها يمر إلى `SECCOMP_RET_ALLOW` بينما يبقى عزل الملفات والشبكة مسؤولية `bubblewrap`.
 
 ---
 

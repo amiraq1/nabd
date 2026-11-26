@@ -10,71 +10,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// openSafeWebKeyFile opens path with FILE_FLAG_OPEN_REPARSE_POINT and validates
-// attributes, size, link count, and broad-group DACL entries on the opened
-// handle (no separate Lstat-then-Open race). POSIX 0600 mode bits are ignored
-// on Windows; confidentiality depends on NTFS ACLs of the key file and parent
+// validateWebKeyFilePlatform verifies hard-link count and NTFS DACL restrictions
+// on the already-opened key file handle. POSIX 0600 mode bits are ignored on
+// Windows; confidentiality depends on NTFS ACLs of the key file and parent
 // user profile directory.
-func openSafeWebKeyFile(path string) (*os.File, error) {
-	utf16Path, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, fmt.Errorf("invalid key file path %s: %w", path, err)
+func validateWebKeyFilePlatform(f *os.File, path string) error {
+	if err := ensureNoHardLinks(f); err != nil {
+		return err
 	}
-	h, err := windows.CreateFile(
-		utf16Path,
-		windows.GENERIC_READ,
-		windows.FILE_SHARE_READ,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("open key file %s: %w", path, err)
-	}
-	f := os.NewFile(uintptr(h), path)
-	if f == nil {
-		_ = windows.CloseHandle(h)
-		return nil, fmt.Errorf("invalid key file handle for %s", path)
-	}
-
-	var bhfi windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &bhfi); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("inspect key file handle %s: %w", path, err)
-	}
-	if bhfi.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		_ = f.Close()
-		return nil, fmt.Errorf("insecure key file: symlinks/reparse points are not allowed: %s", path)
-	}
-	if bhfi.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
-		_ = f.Close()
-		return nil, fmt.Errorf("insecure key file: not a regular file: %s", path)
-	}
-	if bhfi.NumberOfLinks > 1 {
-		_ = f.Close()
-		return nil, fmt.Errorf("refusing multiply-linked key file %s (link count %d)", path, bhfi.NumberOfLinks)
-	}
-
-	info, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("stat key file %s: %w", path, err)
-	}
-	if !info.Mode().IsRegular() {
-		_ = f.Close()
-		return nil, fmt.Errorf("insecure key file: not a regular file: %s", path)
-	}
-	if info.Size() > maxWebKeyFileBytes {
-		_ = f.Close()
-		return nil, fmt.Errorf("insecure key file: size %d bytes exceeds %d-byte limit: %s", info.Size(), maxWebKeyFileBytes, path)
-	}
-
-	if err := checkWindowsKeyFileDACL(windows.Handle(f.Fd()), path); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return f, nil
+	return checkWindowsKeyFileDACL(windows.Handle(f.Fd()), path)
 }
 
 func checkWindowsKeyFileDACL(h windows.Handle, path string) error {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -757,5 +758,89 @@ func TestUnauthorizedErrors(t *testing.T) {
 				t.Fatalf("expected 1 attempt (no retry), got %d", attempts)
 			}
 		})
+	}
+}
+
+type staticLoopbackResolver struct {
+	ips []net.IPAddr
+	err error
+}
+
+func (r staticLoopbackResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
+	return r.ips, r.err
+}
+
+func TestOpenAICheckModelRejectsInsecureBaseURL(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://example.com/v1",
+		"http://169.254.169.254/v1",
+		"ftp://127.0.0.1:8080/v1",
+		"://invalid-url",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			client := NewOpenAIClient(Config{
+				BaseURL: rawURL,
+				Model:   "gpt-4o",
+				APIKey:  "secret-key-123",
+			})
+			if err := client.CheckModel(context.Background()); err == nil {
+				t.Fatalf("expected CheckModel to reject %q, got nil", rawURL)
+			}
+		})
+	}
+}
+
+func TestOpenAILoopbackDialerRejectsNonLoopbackIP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"data":[{"id":"local"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localhostURL := "http://localhost:" + u.Port() + "/v1"
+
+	// 1. Non-loopback IP returned for localhost must fail closed in both Chat and CheckModel.
+	badClient := NewOpenAIClient(Config{
+		BaseURL: localhostURL,
+		Model:   "local",
+		Timeout: 2 * time.Second,
+	})
+	badClient.resolver = staticLoopbackResolver{ips: []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}}
+	if _, err := badClient.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}}); !errors.Is(err, errNonLoopbackAddress) {
+		t.Fatalf("expected Chat to reject non-loopback IP, got: %v", err)
+	}
+	if err := badClient.CheckModel(context.Background()); !errors.Is(err, errNonLoopbackAddress) {
+		t.Fatalf("expected CheckModel to reject non-loopback IP, got: %v", err)
+	}
+
+	// 2. Mixed loopback + non-loopback resolution must also fail closed.
+	badClient.resolver = staticLoopbackResolver{ips: []net.IPAddr{
+		{IP: net.ParseIP("127.0.0.1")},
+		{IP: net.ParseIP("10.0.0.1")},
+	}}
+	if _, err := badClient.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}}); !errors.Is(err, errNonLoopbackAddress) {
+		t.Fatalf("expected Chat to reject mixed non-loopback DNS response, got: %v", err)
+	}
+
+	// 3. Verified loopback IP succeeds.
+	goodClient := NewOpenAIClient(Config{
+		BaseURL: localhostURL,
+		Model:   "local",
+		Timeout: 2 * time.Second,
+	})
+	goodClient.resolver = staticLoopbackResolver{ips: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}}
+	if err := goodClient.CheckModel(context.Background()); err != nil {
+		t.Fatalf("expected verified loopback CheckModel to succeed, got: %v", err)
+	}
+	if _, err := goodClient.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}}); err != nil {
+		t.Fatalf("expected verified loopback Chat to succeed, got: %v", err)
 	}
 }
