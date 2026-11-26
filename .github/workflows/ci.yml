@@ -71,10 +71,14 @@ jobs:
           # bare `unshare -Ur` is denied by the hosted runner's AppArmor policy
           # (/proc/self/uid_map: Operation not permitted) even when bwrap's own
           # profile is allowed, so the capability is proved through bwrap, which
-          # is the only unprivileged-userns entry point the tests use.
-          uid="$(bwrap --unshare-user --unshare-pid --unshare-net --dev-bind / / id -u)"
-          echo "uid inside the sandbox: $uid"
-          test "$uid" = "0"
+          # is the only unprivileged-userns entry point the tests use. bwrap maps
+          # the caller's uid (1001), not root, hence comparing namespace ids
+          # rather than asserting uid 0.
+          host_ns="$(readlink /proc/self/ns/user)"
+          guest_ns="$(bwrap --unshare-user --unshare-pid --unshare-net --dev-bind / / readlink /proc/self/ns/user)"
+          echo "user namespace: host=$host_ns guest=$guest_ns"
+          test -n "$guest_ns"
+          test "$host_ns" != "$guest_ns"
 
       - name: verify native ${{ matrix.arch }}
         run: |
