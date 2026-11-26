@@ -29,13 +29,6 @@ jobs:
     # for real runtime verification.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    env:
-      # Dedicated build output directory, outside the checkout, so no binary can
-      # be committed by accident and the artifact contains only intended files.
-      # The `runner` context is not available in job-level env (only step-level),
-      # so this is resolved from the workspace's parent directory instead of
-      # ${{ runner.temp }}; on hosted runners that is RUNNER_TEMP's parent.
-      DIST: ${{ github.workspace }}/../nabd-dist
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +39,15 @@ jobs:
             runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Dedicated build output directory, outside the checkout, so no binary can
+      # be committed by accident and the artifact contains only intended files.
+      # Resolved in a step because the `runner` context is not available in
+      # job-level env, and exported through GITHUB_ENV so later steps and the
+      # artifact upload receive a normalized absolute path (upload-artifact
+      # rejects any path containing "..").
+      - name: resolve DIST
+        run: echo "DIST=${RUNNER_TEMP}/nabd-dist" >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
