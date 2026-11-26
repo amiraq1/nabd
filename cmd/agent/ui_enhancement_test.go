@@ -1746,3 +1746,390 @@ func TestCompactToolsWidthComplianceWithANSIAndWideRunes(t *testing.T) {
 		t.Logf("\n%s", out)
 	})
 }
+
+func stripTestANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			i = skipEscape(s, i)
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func TestWelcomeScreenLifecycleAndPriority(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	t.Run("startup_before_and_after_resize_keeps_history_untouched", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		m := initialModel(reg, &mockClient{})
+		if len(m.messages) != 1 || m.messages[0].Role != "system" {
+			t.Fatalf("expected only system message on empty start, got %+v", m.messages)
+		}
+		if len(m.history) != 0 {
+			t.Fatalf("expected empty prompt history, got %v", m.history)
+		}
+		if !shouldShowWelcome(&m) {
+			t.Fatal("expected welcome screen active at empty startup")
+		}
+		wantSB := welcomeSandboxLabel(&m, false)
+		if vp := m.viewport.View(); !strings.Contains(vp, wantSB) || !strings.Contains(vp, "Type /") {
+			t.Fatalf("expected welcome screen rendered at initialModel before WindowSizeMsg:\n%s", vp)
+		}
+
+		// Resize triggers responsive re-render without creating fake messages.
+		upd, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
+		m = upd.(uiModel)
+		if len(m.messages) != 1 {
+			t.Fatalf("resize created unexpected message(s): %+v", m.messages)
+		}
+		if vp := stripTestANSI(m.viewport.View()); !strings.Contains(vp, "N A B D  C O D E") || !strings.Contains(vp, "──╱╲──╱╲──") {
+			t.Fatalf("expected compact welcome screen at 40x20:\n%s", vp)
+		}
+	})
+
+	t.Run("hidden_on_conversation_tool_error_local_and_restored_on_clear", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		cases := []struct {
+			name string
+			msg  Message
+			want string
+		}{
+			{"user", Message{Role: "user", Content: "Hello Nabd"}, "Hello Nabd"},
+			{"assistant", Message{Role: "assistant", Content: "Hi user"}, "Hi user"},
+			{"tool", Message{Role: "tool", ToolCallID: "t1", Content: "ok", Display: "read_file(a.go) -> 2 bytes"}, "read_file(a.go)"},
+			{"error", Message{Role: "error", Content: "boom failure"}, "boom failure"},
+			{"local_status", Message{Role: "local", Content: "=== NabdCoder Status ==="}, "=== NabdCoder Status ==="},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				m := initialModel(reg, &mockClient{})
+				m.messages = append(m.messages, tc.msg)
+				m.refresh()
+				if shouldShowWelcome(&m) {
+					t.Fatalf("welcome screen should hide when %s message exists", tc.name)
+				}
+				if vp := stripTestANSI(m.viewport.View()); !strings.Contains(vp, tc.want) || strings.Contains(vp, "N A B D  C O D E") {
+					t.Fatalf("expected normal stream for %s without welcome logo, got:\n%s", tc.name, vp)
+				}
+			})
+		}
+
+		// Local commands /status, /tools, /help replace welcome, /clear restores it when empty.
+		m := initialModel(reg, &mockClient{})
+		for _, cmd := range []string{"/status", "/tools", "/help"} {
+			upd, _ := m.executeLocalCommand(cmd)
+			m = upd.(uiModel)
+			if shouldShowWelcome(&m) {
+				t.Fatalf("welcome screen should hide after %s", cmd)
+			}
+			upd, _ = m.executeLocalCommand("/clear")
+			m = upd.(uiModel)
+			if !shouldShowWelcome(&m) {
+				t.Fatalf("welcome screen should return after /clear following %s", cmd)
+			}
+			if vp := stripTestANSI(m.viewport.View()); !strings.Contains(vp, "Type /") {
+				t.Fatalf("expected welcome screen restored after /clear:\n%s", vp)
+			}
+		}
+
+		// If a local notice remains alongside /clear (or approval pending), welcome stays hidden.
+		m.messages = append(m.messages, Message{Role: "local", Content: "Active project notice"})
+		m.refresh()
+		if shouldShowWelcome(&m) {
+			t.Fatal("welcome screen must stay hidden when a local notice remains")
+		}
+	})
+
+	t.Run("security_priority_auto_all_approval_disclosure_and_palette", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+
+		// 1. AutoApproveAll preserves startup WARNING local message untouched.
+		mAll := initialModel(reg, &mockClient{}, AutoApproveAll)
+		if shouldShowWelcome(&mAll) {
+			t.Fatal("welcome screen must NOT cover startup Auto: ALL warning message")
+		}
+		vpAll := stripTestANSI(mAll.viewport.View())
+		if !strings.Contains(vpAll, "WARNING: Auto-approve mode is ALL") {
+			t.Fatalf("missing startup Auto: ALL warning in viewport:\n%s", vpAll)
+		}
+		upd, _ := mAll.Update(tea.WindowSizeMsg{Width: 36, Height: 14})
+		mAll = upd.(uiModel)
+		mAll.viewport.GotoTop()
+		vpNarrow := stripTestANSI(mAll.viewport.View())
+		if !strings.Contains(vpNarrow, "WARNING: Auto-approve mode is") || !strings.Contains(vpNarrow, "ALL.") {
+			t.Fatalf("narrow resize lost Auto: ALL warning:\n%s", vpNarrow)
+		}
+		if !strings.Contains(stripTestANSI(mAll.View()), "Auto: ALL") {
+			t.Fatalf("header missing Auto: ALL badge:\n%s", mAll.View())
+		}
+
+		// 2. Approval and disclosure take priority over welcome screen.
+		m := initialModel(reg, &mockClient{})
+		m.awaitingApproval = true
+		m.pendingTools = []ToolCall{makeTestToolCall("a1", "edit_file", `{"path":"x.go"}`)}
+		m.approval = approvalPreview{Summary: "path: x.go\n+new line"}
+		m.refresh()
+		if shouldShowWelcome(&m) {
+			t.Fatal("welcome must yield to awaitingApproval")
+		}
+		if !strings.Contains(stripTestANSI(m.View()), "Approve edit_file? [Y/N]") {
+			t.Fatalf("approval prompt missing:\n%s", m.View())
+		}
+
+		m.awaitingApproval = false
+		m.pendingDisclosure = &Message{Role: "tool", ToolCallID: "a1", Content: "sk-1234567890abcdef1234567890"}
+		m.refresh()
+		if shouldShowWelcome(&m) {
+			t.Fatal("welcome must yield to pendingDisclosure")
+		}
+		if view := stripTestANSI(m.View()); !strings.Contains(view, "ADVISORY WARNING") || !strings.Contains(view, "Destination (quoted):") {
+			t.Fatalf("disclosure review missing:\n%s", view)
+		}
+
+		// 3. Slash palette open while empty shrinks viewport & adjusts welcome without covering palette.
+		mEmpty := initialModel(reg, &mockClient{})
+		upd, _ = mEmpty.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+		mEmpty = upd.(uiModel)
+		mEmpty.textArea.SetValue("/")
+		mEmpty.palette.updatePalette("/", false, false, false)
+		mEmpty.adjustViewportHeight()
+		view := stripTestANSI(mEmpty.View())
+		if !strings.Contains(view, "/status") || !strings.Contains(view, "/help") {
+			t.Fatalf("slash palette items hidden when welcome active:\n%s", view)
+		}
+		totalLines := len(strings.Split(view, "\n"))
+		if totalLines > 24 {
+			t.Fatalf("full View() exceeded terminal height 24 when palette open (got %d lines):\n%s", totalLines, view)
+		}
+	})
+}
+
+func TestWelcomeScreenDimensionsSanitizationAndModes(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	t.Run("responsive_widths_heights_and_edge_sizes", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		widths := []int{36, 40, 45, 60, 80, 120}
+		termHeights := []int{0, 1, 5, 12, 16, 24}
+
+		for _, w := range widths {
+			for _, th := range termHeights {
+				m := initialModel(reg, &mockClient{})
+				m.modelName = "claude-sonnet-4-5-20250929-very-long-model-name-with-arabic-نموذج"
+				m.workspace = "/home/user/workspace/extremely/deep/nested/مشروع_نبض_الطويل"
+
+				upd, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: th})
+				m = upd.(uiModel)
+				if m.viewport.Width < 1 || m.viewport.Height < 1 {
+					t.Fatalf("invalid viewport dims at %dx%d: %dx%d", w, th, m.viewport.Width, m.viewport.Height)
+				}
+
+				vpOut := m.viewport.View()
+				if !welcomeVisualCheck(vpOut) {
+					t.Fatalf("invalid UTF-8 in welcome viewport at %dx%d", w, th)
+				}
+				vpLines := strings.Split(vpOut, "\n")
+				if len(vpLines) > m.viewport.Height {
+					t.Fatalf("welcome viewport exceeded height %d at width %d (got %d lines)", m.viewport.Height, w, len(vpLines))
+				}
+				for i, line := range vpLines {
+					if lw := lipgloss.Width(line); lw > m.viewport.Width {
+						t.Fatalf("welcome line %d exceeds width %d (got %d): %q", i, m.viewport.Width, lw, line)
+					}
+				}
+
+				// Compact target check on 36..45: unpadded content width <= 32.
+				if w >= 36 && w <= 45 && m.viewport.Height >= 5 {
+					for _, line := range vpLines {
+						trimmed := strings.TrimSpace(stripTestANSI(line))
+						if trimmed == "" {
+							continue
+						}
+						if tw := lipgloss.Width(trimmed); tw > 32 {
+							t.Fatalf("compact line exceeds 32-cell target at width %d (got %d): %q", w, tw, trimmed)
+						}
+					}
+				}
+
+				// When term height >= 16, full m.View() strictly fits within terminal height & width.
+				fullView := m.View()
+				for i, line := range strings.Split(fullView, "\n") {
+					if lw := lipgloss.Width(line); lw > m.viewport.Width {
+						t.Fatalf("View() line %d exceeds width %d at %dx%d (got %d): %q", i, m.viewport.Width, w, th, lw, line)
+					}
+				}
+				if th >= 16 {
+					if lines := len(strings.Split(fullView, "\n")); lines > th {
+						t.Fatalf("View() exceeded terminal height %d at width %d (got %d lines)", th, w, lines)
+					}
+				}
+			}
+		}
+	})
+
+	t.Run("height_degradation_drops_pulse_and_hint_before_logo", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		m := initialModel(reg, &mockClient{})
+		m.sandboxProven = true
+
+		// Zero height renders safely without panic or non-empty overflow.
+		if got := renderWelcomeScreen(&m, 80, 0); got != "" {
+			t.Fatalf("expected empty output at height 0, got %q", got)
+		}
+
+		outH4 := stripTestANSI(renderWelcomeScreen(&m, 80, 4))
+		if !strings.Contains(outH4, "N A B D  C O D E") || !strings.Contains(outH4, "──╱╲──╱╲──") || strings.Contains(outH4, "Type /") {
+			t.Fatalf("height=4 should drop hint first and keep logo + pulse:\n%s", outH4)
+		}
+
+		outH3 := stripTestANSI(renderWelcomeScreen(&m, 80, 3))
+		if !strings.Contains(outH3, "N A B D  C O D E") || strings.Contains(outH3, "──╱╲──╱╲──") || !strings.Contains(outH3, "Sandbox: Proven") {
+			t.Fatalf("height=3 should hide pulse & hint before logo and keep real Sandbox:\n%s", outH3)
+		}
+
+		outH2 := stripTestANSI(renderWelcomeScreen(&m, 40, 2))
+		if !strings.Contains(outH2, "N A B D  C O D E") || !strings.Contains(outH2, "Sandbox: Proven") {
+			t.Fatalf("height=2 should preserve logo and Sandbox: Proven:\n%s", outH2)
+		}
+
+		outH1 := stripTestANSI(renderWelcomeScreen(&m, 40, 1))
+		if !strings.Contains(outH1, "Sandbox: Proven") || len(strings.Split(outH1, "\n")) != 1 {
+			t.Fatalf("height=1 should drop decoration and preserve single-line Sandbox: Proven:\n%s", outH1)
+		}
+	})
+
+	t.Run("wide_block_art_and_pulse_structural_and_real_sandbox", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		mOff := initialModel(reg, &mockClient{})
+		mOff.sandboxProven = false
+		mOff.modelName = "gpt-4o"
+		mOff.workspace = "/work/nabd"
+
+		outOff := stripTestANSI(renderWelcomeScreen(&mOff, 80, 20))
+		if !strings.Contains(outOff, "█") || !strings.Contains(outOff, "╱│╲") || !strings.Contains(outOff, "Sandbox: Off") {
+			t.Fatalf("wide welcome missing block-art logo, ECG pulse, or Sandbox: Off:\n%s", outOff)
+		}
+		for _, line := range strings.Split(outOff, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if lw := lipgloss.Width(trimmed); lw > 56 {
+				t.Fatalf("wide welcome content exceeds 56-cell limit (got %d): %q", lw, trimmed)
+			}
+		}
+
+		mOn := mOff
+		mOn.sandboxProven = true
+		outOn := stripTestANSI(renderWelcomeScreen(&mOn, 80, 20))
+		if !strings.Contains(outOn, "Sandbox: Proven") || strings.Contains(outOn, "Sandbox: Off") {
+			t.Fatalf("welcome screen did not reflect sandboxProven=true:\n%s", outOn)
+		}
+	})
+
+	t.Run("sanitization_ascii_dumb_no_color_and_arabic_fields", func(t *testing.T) {
+		setUnicodeDisplayEnv(t)
+		mSec := initialModel(reg, &mockClient{})
+		mSec.modelName = "model\x1b[31mRed\x1b[0m\u202E"
+		mSec.workspace = "/tmp/ws\nspoof\u202D"
+		outSec := renderWelcomeScreen(&mSec, 80, 20)
+		plainSec := stripTestANSI(outSec)
+		if strings.Contains(plainSec, "\u202E") || strings.Contains(plainSec, "\u202D") || !strings.Contains(plainSec, "\\u202D") {
+			t.Fatalf("bidi control char was not visibly escaped in welcome: %q", plainSec)
+		}
+		// Short workspace ensures modelName with \u202E fits untruncated too
+		mSec.workspace = "/tmp"
+		plainShort := stripTestANSI(renderWelcomeScreen(&mSec, 80, 20))
+		if !strings.Contains(plainShort, "\\u202E") || strings.Contains(plainShort, "\u202E") {
+			t.Fatalf("expected \\u202E visible escaping when untruncated: %q", plainShort)
+		}
+		if strings.Contains(plainSec, "\nspoof") {
+			t.Fatalf("newline inside workspace was not flattened: %q", plainSec)
+		}
+
+		// ASCII + NO_COLOR modes keep static art pure ASCII when enabled and emit zero ANSI when color disabled.
+		for _, mode := range []struct {
+			name      string
+			wantASCII bool
+			wantNoESC bool
+			env       map[string]string
+		}{
+			{"NABD_ASCII", true, false, map[string]string{"NABD_ASCII": "1", "TERM": "xterm-256color"}},
+			{"TERM_dumb", true, true, map[string]string{"NABD_ASCII": "", "TERM": "dumb"}},
+			{"NO_COLOR_unicode", false, true, map[string]string{"NABD_ASCII": "", "NO_COLOR": "1", "TERM": "xterm-256color"}},
+			{"NO_COLOR_ascii", true, true, map[string]string{"NABD_ASCII": "1", "NO_COLOR": "1", "TERM": "xterm-256color"}},
+		} {
+			t.Run(mode.name, func(t *testing.T) {
+				for k, v := range mode.env {
+					t.Setenv(k, v)
+				}
+				mMode := initialModel(reg, &mockClient{})
+				mMode.modelName = "gpt-4o"
+				mMode.workspace = "/work/nabd"
+
+				wideOut := renderWelcomeScreen(&mMode, 80, 20)
+				narrowOut := renderWelcomeScreen(&mMode, 40, 14)
+				for _, rendered := range []string{wideOut, narrowOut} {
+					if mode.wantNoESC && strings.ContainsRune(rendered, 0x1b) {
+						t.Fatalf("%s emitted unexpected ANSI escape sequence:\n%q", mode.name, rendered)
+					}
+					if mode.wantASCII {
+						plain := stripTestANSI(rendered)
+						for _, r := range plain {
+							if r > 0x7f {
+								t.Fatalf("%s leaked non-ASCII rune %U in static welcome:\n%s", mode.name, r, plain)
+							}
+						}
+					}
+				}
+				if mode.wantASCII && !strings.Contains(stripTestANSI(narrowOut), "---/\\---/\\---") {
+					t.Fatalf("narrow ASCII welcome missing ASCII ECG pulse:\n%s", stripTestANSI(narrowOut))
+				}
+
+				// Arabic user-provided model/workspace remains preserved (not stripped) even in ASCII mode.
+				mAr := initialModel(reg, &mockClient{})
+				mAr.modelName = "نموذج-عربي"
+				mAr.workspace = "/home/مجلد_نبض"
+				arOut := stripTestANSI(renderWelcomeScreen(&mAr, 40, 14))
+				if !strings.Contains(arOut, "نموذج-عربي") || !strings.Contains(arOut, "مجلد_نبض") {
+					t.Fatalf("Arabic user model/workspace was dropped or mangled in compact mode:\n%s", arOut)
+				}
+			})
+		}
+	})
+}
+
+func TestWelcomeScreenTextPreviews(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	setUnicodeDisplayEnv(t)
+	m := initialModel(reg, &mockClient{})
+	m.modelName = "claude-3-7-sonnet"
+	m.workspace = "/home/amiraq/nabd"
+	m.sandboxProven = true
+
+	t.Logf("=== PREVIEW 80 COLS (Unicode) ===\n%s", stripTestANSI(renderWelcomeScreen(&m, 80, 16)))
+	t.Logf("=== PREVIEW 40 COLS (Unicode) ===\n%s", stripTestANSI(renderWelcomeScreen(&m, 40, 12)))
+
+	t.Setenv("NABD_ASCII", "1")
+	t.Logf("=== PREVIEW 40 COLS (ASCII) ===\n%s", stripTestANSI(renderWelcomeScreen(&m, 40, 12)))
+	t.Logf("=== PREVIEW 80 COLS (ASCII) ===\n%s", stripTestANSI(renderWelcomeScreen(&m, 80, 16)))
+}
