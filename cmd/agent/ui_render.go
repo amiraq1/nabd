@@ -21,7 +21,7 @@ func renderHeader(m *uiModel, width int) string {
 		width = 80
 	}
 
-	tokens := estimateMessages(m.messages)
+	tokens := estimateSessionTokens(m.messages, m.projectCtx)
 	budget := m.historyBudget
 	if budget <= 0 {
 		budget = defaultHistoryTokens
@@ -1149,6 +1149,10 @@ func renderMessageCard(msg Message, width int, isLastTool bool, expanded bool) s
 
 // formatHelp builds the agent help guide dynamically from the single source of truth slashCommands.
 func formatHelp() string {
+	return formatHelpWithProject(projectContextSnapshot{})
+}
+
+func formatHelpWithProject(snap projectContextSnapshot) string {
 	var b strings.Builder
 	b.WriteString("=== NabdCoder Help ===\nCommands:\n")
 	for _, cmd := range slashCommands {
@@ -1157,6 +1161,16 @@ func formatHelp() string {
 	}
 	b.WriteString("  undo [path]     - Restore file from shadow backup\n")
 	b.WriteString("  exit, quit      - Exit NabdCoder\n\n")
+	if snap.Disabled {
+		b.WriteString("Project Commands: disabled via NABD_NO_PROJECT_RULES=1\n\n")
+	} else if len(snap.Commands) > 0 {
+		b.WriteString("Project Commands (.nabd/commands/*.md):\n")
+		for _, cmd := range snap.Commands {
+			cmdName := "/" + sanitizeForDisplay(cmd.Name)
+			fmt.Fprintf(&b, "  %-15s - [project] %s\n", cmdName, sanitizeForDisplay(cmd.Description))
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString(`Keybindings:
   Enter           - Send prompt to model
   Alt+Enter/Ctrl+J- Insert newline in multi-line prompt

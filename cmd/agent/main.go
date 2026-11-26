@@ -114,6 +114,7 @@ type uiModel struct {
 	autoApprove       AutoApproveMode
 	clipboardFn       func(ctx context.Context, text string, target copyTarget) (clipboardResult, error)
 	keySource         string
+	projectCtx        projectContextSnapshot
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -165,9 +166,16 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 	sysPrompt := buildSystemPrompt(reg)
 
 	workspace := "."
-	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+	projectWorkspace := ""
+	if reg != nil && reg.WorkDir() != "" {
+		workspace = reg.WorkDir()
+		projectWorkspace = reg.WorkDir()
+	} else if cwd, err := os.Getwd(); err == nil && cwd != "" {
 		workspace = cwd
 	}
+	projectCtx := loadProjectContext(context.Background(), projectWorkspace)
+	pal := slashPalette{}
+	pal.setProjectCommands(projectCtx.CommandDefs())
 
 	destination := "unknown model endpoint"
 	modelName := "unknown"
@@ -209,6 +217,33 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 			Content: "⚠️ WARNING: Auto-approve mode is ALL. Tool execution approvals and output disclosures will be approved automatically for this session. Tool output and potential credentials may be sent to the model provider without manual review.",
 		})
 	}
+	if projectCtx.ConfigError != "" {
+		initialMsgs = append(initialMsgs, Message{
+			Role:    "local",
+			Content: "Project rules configuration error (failing closed): " + projectCtx.ConfigError,
+		})
+	} else if projectCtx.HasRules() {
+		initialMsgs = append(initialMsgs, Message{
+			Role:    "local",
+			Content: fmt.Sprintf("Loaded project rules from %s (%d bytes, lower priority, untrusted repo content). Use /status for details or %s=1 to disable.", projectCtx.RulesFile, projectCtx.RulesSize, ProjectRulesDisableEnv),
+		})
+	} else if projectCtx.RulesError != "" {
+		initialMsgs = append(initialMsgs, Message{
+			Role:    "local",
+			Content: "Project rules rejected: " + projectCtx.RulesError,
+		})
+	}
+	if projectCtx.CommandsError != "" {
+		initialMsgs = append(initialMsgs, Message{
+			Role:    "local",
+			Content: "Project commands scan error: " + projectCtx.CommandsError,
+		})
+	} else if projectCtx.CommandsIncomplete {
+		initialMsgs = append(initialMsgs, Message{
+			Role:    "local",
+			Content: fmt.Sprintf("Project commands scan incomplete (%d loaded; directory/limit reached). See /status.", len(projectCtx.Commands)),
+		})
+	}
 
 	return uiModel{
 		destination:   destination,
@@ -235,6 +270,8 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 		keySource:     keyStatus,
 		status:        "Ready",
 		baseHeight:    20,
+		palette:       pal,
+		projectCtx:    projectCtx,
 	}
 }
 
@@ -715,7 +752,15 @@ func (m uiModel) startLLM() (tea.Model, tea.Cmd) {
 	m.finishRequest()
 	ctx, cancel := context.WithCancel(m.lifecycle.ctx)
 	m.requestCancel = cancel
-	return m, m.lifecycle.wrap(callLLMCmd(m.client, m.registry.OpenAITools(), m.messages, m.historyBudget, ctx))
+	snapshot, rulesOmitted := historyForLLMWithProject(m.messages, m.projectCtx, m.historyBudget)
+	if rulesOmitted {
+		m.messages = append(m.messages, Message{
+			Role:    "local",
+			Content: fmt.Sprintf("Project rules (%s) omitted for this request: exceeds remaining context budget.", m.projectCtx.RulesFile),
+		})
+		m.refresh()
+	}
+	return m, m.lifecycle.wrap(callLLMCmdPrepared(m.client, m.registry.OpenAITools(), snapshot, ctx))
 }
 
 func (m uiModel) View() string {
@@ -798,8 +843,7 @@ func (m *uiModel) refresh() {
 	m.viewport.GotoBottom()
 }
 
-func callLLMCmd(client llm.Client, toolDefs []map[string]any, history []Message, budget int, ctx context.Context) tea.Cmd {
-	snapshot := historyForLLM(history, budget)
+func callLLMCmdPrepared(client llm.Client, toolDefs []map[string]any, snapshot []Message, ctx context.Context) tea.Cmd {
 	return func() tea.Msg {
 		resp, err := client.Chat(ctx, llm.Request{Messages: snapshot, Tools: toolDefs})
 		if err != nil {
@@ -821,6 +865,49 @@ func historyForLLM(history []Message, budget int) []Message {
 		}
 	}
 	return trimHistory(filtered, budget)
+}
+
+func historyForLLMWithProject(history []Message, projectCtx projectContextSnapshot, budget int) ([]Message, bool) {
+	filtered := make([]Message, 0, len(history))
+	for _, msg := range history {
+		if msg.Role != "error" && msg.Role != "local" {
+			filtered = append(filtered, msg)
+		}
+	}
+	rulesMsg, hasRules := buildProjectRulesMessage(projectCtx)
+	if !hasRules || len(filtered) == 0 || filtered[0].Role != "system" {
+		return trimHistory(filtered, budget), false
+	}
+
+	rulesTokens := estimateMessage(rulesMsg)
+	if budget > 0 {
+		units := groupMessageUnits(filtered[1:])
+		minRequired := estimateMessage(filtered[0]) + rulesTokens
+		if len(units) > 0 {
+			minRequired += estimateMessages(units[len(units)-1])
+		}
+		if minRequired > budget {
+			return trimHistory(filtered, budget), true
+		}
+		trimmed := trimHistory(filtered, budget-rulesTokens)
+		out := make([]Message, 0, len(trimmed)+1)
+		out = append(out, trimmed[0], rulesMsg)
+		out = append(out, trimmed[1:]...)
+		return out, false
+	}
+
+	out := make([]Message, 0, len(filtered)+1)
+	out = append(out, filtered[0], rulesMsg)
+	out = append(out, filtered[1:]...)
+	return out, false
+}
+
+func estimateSessionTokens(messages []Message, projectCtx projectContextSnapshot) int {
+	tokens := estimateMessages(messages)
+	if rulesMsg, ok := buildProjectRulesMessage(projectCtx); ok {
+		tokens += estimateMessage(rulesMsg)
+	}
+	return tokens
 }
 
 // trimHistory drops the oldest complete message units until the estimated
@@ -986,6 +1073,12 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	}
 	if input == "clear" || input == "/clear" {
 		m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
+		if m.projectCtx.HasRules() {
+			m.messages = append(m.messages, Message{
+				Role:    "local",
+				Content: fmt.Sprintf("Conversation cleared. Active project rules remain: %s (%d bytes, lower priority, untrusted repo content).", m.projectCtx.RulesFile, m.projectCtx.RulesSize),
+			})
+		}
 		m.pendingTools = nil
 		m.awaitingApproval = false
 		m.approval = approvalPreview{}
@@ -1022,7 +1115,7 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 		return m.handleAutoCommand(arg)
 	}
 	if input == "/help" || input == "help" {
-		m.messages = append(m.messages, Message{Role: "local", Content: formatHelp()})
+		m.messages = append(m.messages, Message{Role: "local", Content: formatHelpWithProject(m.projectCtx)})
 		m.clearInput()
 		m.refresh()
 		return m, nil
@@ -1032,6 +1125,30 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	}
 	if input == "/compact" {
 		return m.handleCompactCommand()
+	}
+
+	if cmdName, cmdArgs, isSlash := splitSlashCommandInput(input); isSlash && !isReservedCommandName(cmdName) {
+		if cmd, ok := m.projectCtx.LookupCommand(cmdName); ok {
+			expanded, err := expandProjectCommand(cmd, cmdArgs)
+			if err != nil {
+				m.clearInput()
+				m.messages = append(m.messages, Message{Role: "local", Content: "Project command error: " + sanitizeForDisplay(err.Error())})
+				m.refresh()
+				return m, nil
+			}
+			m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
+			m.messages = append(m.messages,
+				Message{Role: "local", Content: fmt.Sprintf("Project command /%s (source: %s; untrusted repository template)", cmd.Name, cmd.SourcePath)},
+				Message{Role: "user", Content: expanded},
+			)
+			m.clearInput()
+			m.busy = true
+			m.iteration = 0
+			m.callCounts = make(map[string]int)
+			m.status = "Thinking..."
+			m.refresh()
+			return m.startLLM()
+		}
 	}
 
 	m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
@@ -1179,8 +1296,22 @@ func (m *uiModel) setKeySource(source string) {
 	m.statusBar = fmt.Sprintf("provider=%s model=%s endpoint=%s key=%s", m.provider, m.modelName, endpointHost, m.keySource)
 }
 
+func splitSlashCommandInput(input string) (name string, args string, ok bool) {
+	if !strings.HasPrefix(input, "/") {
+		return "", "", false
+	}
+	rest := input[1:]
+	idx := strings.IndexAny(rest, " \t\r\n")
+	if idx < 0 {
+		return rest, "", rest != ""
+	}
+	name = rest[:idx]
+	args = strings.TrimSpace(rest[idx+1:])
+	return name, args, name != ""
+}
+
 func (m *uiModel) formatStatus() string {
-	tokens := estimateMessages(m.messages)
+	tokens := estimateSessionTokens(m.messages, m.projectCtx)
 	budget := m.historyBudget
 	var b strings.Builder
 	b.WriteString("=== NabdCoder Status ===\n")
@@ -1216,6 +1347,8 @@ func (m *uiModel) formatStatus() string {
 		webProvider = m.registry.WebSearchProvider()
 	}
 	fmt.Fprintf(&b, "Web Search: %s\n", webProvider)
+	fmt.Fprintf(&b, "Project Rules: %s\n", formatProjectRulesStatus(m.projectCtx))
+	fmt.Fprintf(&b, "Project Commands: %s\n", formatProjectCommandsStatus(m.projectCtx))
 	fmt.Fprintf(&b, "Iteration: %d / %d\n", m.iteration, m.maxIterations)
 	fmt.Fprintf(&b, "Context tokens: ~%d / %d (~%.1f%%)\n", tokens, budget, float64(tokens)*100.0/float64(budget))
 	fmt.Fprintf(&b, "Messages in history: %d\n", len(m.messages))
@@ -1300,6 +1433,10 @@ func main() {
 
 	autoMode, err := LoadAutoApproveFromEnv()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
+		os.Exit(2)
+	}
+	if _, err := LoadProjectRulesDisabledFromEnv(); err != nil {
 		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
 		os.Exit(2)
 	}

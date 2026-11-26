@@ -173,6 +173,14 @@ func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
 	return r, nil
 }
 
+// WorkDir returns the resolved absolute workspace directory bound to this registry.
+func (r *Registry) WorkDir() string {
+	if r == nil {
+		return ""
+	}
+	return r.workDir
+}
+
 // IsREAEnabled reports whether the opt-in REA MCP integration is configured and enabled.
 func (r *Registry) IsREAEnabled() bool {
 	return r.reaConfig != nil && r.Has("mcp_call")
