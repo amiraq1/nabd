@@ -102,6 +102,7 @@ type uiModel struct {
 	callCounts        map[string]int
 	client            llm.Client
 	requestCancel     context.CancelFunc
+	taskGen           uint64
 	lifecycle         *lifecycle
 	registry          *tools.Registry
 	status            string
@@ -280,9 +281,18 @@ func (m uiModel) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, m.textArea.Focus(), m.spinner.Tick)
 }
 
-type llmResponseMsg struct{ assistantMsg Message }
-type toolExecutedMsg struct{ toolMsg Message }
-type errorMsg struct{ err error }
+type llmResponseMsg struct {
+	gen          uint64
+	assistantMsg Message
+}
+type toolExecutedMsg struct {
+	gen     uint64
+	toolMsg Message
+}
+type errorMsg struct {
+	gen uint64
+	err error
+}
 type clipboardResultMsg struct {
 	result clipboardResult
 	err    error
@@ -319,13 +329,24 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refresh()
 				return m.advance()
 			}
-			if key == "n" || key == "no" || msg.Type == tea.KeyEsc {
+			if key == "n" || key == "no" {
 				id := m.pendingDisclosure.ToolCallID
 				m.pendingDisclosure = nil
 				m.pendingTools = m.pendingTools[1:]
 				m.messages = append(m.messages, Message{Role: "tool", ToolCallID: id, Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"})
 				m.refresh()
 				return m.advance()
+			}
+			if msg.Type == tea.KeyEsc {
+				id := m.pendingDisclosure.ToolCallID
+				m.cancelActiveTask()
+				m.status = "Cancelled by user"
+				m.messages = append(m.messages,
+					Message{Role: "tool", ToolCallID: id, Content: "Tool output disclosure rejected by user.", Display: "Tool output disclosure rejected"},
+					Message{Role: "local", Content: "Operation cancelled."},
+				)
+				m.refresh()
+				return m, nil
 			}
 			if msg.Type != tea.KeyCtrlC {
 				var cmd tea.Cmd
@@ -367,6 +388,8 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							approval, err = m.registry.ApproveWithIdentity(tc.Function.Name, json.RawMessage(tc.Function.Arguments), identity)
 						}
 					}
+				} else if tc.Function.Name == "web_fetch" {
+					approval, err = m.registry.ApproveWithIdentity(tc.Function.Name, json.RawMessage(tc.Function.Arguments), m.approval.IdentitySHA256)
 				} else {
 					approval, err = m.registry.Approve(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 				}
@@ -385,9 +408,9 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.approval = approvalPreview{}
 				m.status = "Executing: " + sanitizeForDisplay(tc.Function.Name)
 				m.refresh()
-				return m, m.lifecycle.wrap(executeToolCmd(m.lifecycle.ctx, m.registry, tc, &approval))
+				return m, m.launchTool(tc, &approval)
 			}
-			if key == "n" || key == "no" || msg.Type == tea.KeyEsc {
+			if key == "n" || key == "no" {
 				m.awaitingApproval = false
 				m.approval = approvalPreview{}
 				m.pendingTools = m.pendingTools[1:]
@@ -405,6 +428,27 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				m.refresh()
 				return m.advance()
+			}
+			if msg.Type == tea.KeyEsc {
+				content := "Rejected by user."
+				display := "Rejected " + sanitizeForDisplay(tc.Function.Name)
+				if err := m.registry.RecordDenied(tc.Function.Name, json.RawMessage(tc.Function.Arguments)); err != nil {
+					content += " Warning: rejection could not be recorded in audit log."
+					display += " (audit recording failed)"
+				}
+				m.cancelActiveTask()
+				m.status = "Cancelled by user"
+				m.messages = append(m.messages,
+					Message{
+						Role:       "tool",
+						ToolCallID: tc.ID,
+						Content:    content,
+						Display:    display,
+					},
+					Message{Role: "local", Content: "Operation cancelled."},
+				)
+				m.refresh()
+				return m, nil
 			}
 		}
 
@@ -452,8 +496,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyEsc:
 			if m.busy {
-				m.finishRequest()
-				m.busy = false
+				m.cancelActiveTask()
 				m.status = "Cancelled by user"
 				m.messages = append(m.messages, Message{Role: "local", Content: "Operation cancelled."})
 				m.refresh()
@@ -522,6 +565,9 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.adjustViewportHeight()
 		m.refresh()
 	case llmResponseMsg:
+		if msg.gen != m.taskGen {
+			return m, nil
+		}
 		m.finishRequest()
 		m.messages = append(m.messages, msg.assistantMsg)
 		m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
@@ -569,6 +615,9 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.advance()
 	case toolExecutedMsg:
+		if msg.gen != m.taskGen || len(m.pendingTools) == 0 || m.pendingDisclosure != nil {
+			return m, nil
+		}
 		// Every tool result is project-derived data. Hold it locally until the
 		// user has reviewed the exact bytes and the destination that will
 		// receive them. Fail closed if the terminal cannot display them.
@@ -609,12 +658,10 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshDisclosure()
 		return m, nil
 	case errorMsg:
-		m.finishRequest()
-		m.busy = false
-		m.awaitingApproval = false
-		m.approval = approvalPreview{}
-		m.pendingDisclosure = nil
-		m.pendingTools = nil
+		if msg.gen != m.taskGen {
+			return m, nil
+		}
+		m.cancelActiveTask()
 		m.status = "Error"
 		m.messages = append(m.messages, Message{Role: "error", Content: msg.err.Error()})
 		m.refresh()
@@ -667,7 +714,7 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 	if !m.registry.Has(next.Function.Name) {
 		m.status = "Running: " + sanitizeForDisplay(next.Function.Name)
 		m.refresh()
-		return m, m.lifecycle.wrap(executeToolCmd(m.lifecycle.ctx, m.registry, next, nil))
+		return m, m.launchTool(next, nil)
 	}
 	if m.registry.RequiresApproval(next.Function.Name) {
 		preview, err := prepareApprovalPreview(m.registry, next)
@@ -709,6 +756,8 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 						approval, approveErr = m.registry.ApproveWithIdentityAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), identity, "all")
 					}
 				}
+			} else if next.Function.Name == "web_fetch" {
+				approval, approveErr = m.registry.ApproveWithIdentityAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), m.approval.IdentitySHA256, "all")
 			} else {
 				approval, approveErr = m.registry.ApproveAuto(next.Function.Name, json.RawMessage(next.Function.Arguments), "all")
 			}
@@ -727,7 +776,7 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 			m.approval = approvalPreview{}
 			m.status = "Executing: " + sanitizeForDisplay(next.Function.Name)
 			m.refresh()
-			return m, m.lifecycle.wrap(executeToolCmd(m.lifecycle.ctx, m.registry, next, &approval))
+			return m, m.launchTool(next, &approval)
 		}
 
 		m.awaitingApproval = true
@@ -739,7 +788,7 @@ func (m uiModel) advance() (tea.Model, tea.Cmd) {
 	m.approval = approvalPreview{}
 	m.status = "Running: " + sanitizeForDisplay(next.Function.Name)
 	m.refresh()
-	return m, m.lifecycle.wrap(executeToolCmd(m.lifecycle.ctx, m.registry, next, nil))
+	return m, m.launchTool(next, nil)
 }
 
 func (m *uiModel) finishRequest() {
@@ -749,10 +798,28 @@ func (m *uiModel) finishRequest() {
 	}
 }
 
+func (m *uiModel) cancelActiveTask() {
+	m.finishRequest()
+	m.taskGen++
+	m.pendingTools = nil
+	m.awaitingApproval = false
+	m.approval = approvalPreview{}
+	m.pendingDisclosure = nil
+	m.busy = false
+}
+
+func (m *uiModel) launchTool(tc ToolCall, approval *tools.Approval) tea.Cmd {
+	m.finishRequest()
+	ctx, cancel := context.WithCancel(m.lifecycle.ctx)
+	m.requestCancel = cancel
+	return m.lifecycle.wrap(executeToolCmd(ctx, m.registry, tc, approval, m.taskGen))
+}
+
 func (m uiModel) startLLM() (tea.Model, tea.Cmd) {
 	m.finishRequest()
 	ctx, cancel := context.WithCancel(m.lifecycle.ctx)
 	m.requestCancel = cancel
+	gen := m.taskGen
 	snapshot, rulesOmitted := historyForLLMWithProject(m.messages, m.projectCtx, m.historyBudget)
 	if rulesOmitted {
 		m.messages = append(m.messages, Message{
@@ -761,7 +828,7 @@ func (m uiModel) startLLM() (tea.Model, tea.Cmd) {
 		})
 		m.refresh()
 	}
-	return m, m.lifecycle.wrap(callLLMCmdPrepared(m.client, m.registry.OpenAITools(), snapshot, ctx))
+	return m, m.lifecycle.wrap(callLLMCmdPrepared(m.client, m.registry.OpenAITools(), snapshot, ctx, gen))
 }
 
 func (m uiModel) View() string {
@@ -849,17 +916,17 @@ func (m *uiModel) refresh() {
 	m.viewport.GotoBottom()
 }
 
-func callLLMCmdPrepared(client llm.Client, toolDefs []map[string]any, snapshot []Message, ctx context.Context) tea.Cmd {
+func callLLMCmdPrepared(client llm.Client, toolDefs []map[string]any, snapshot []Message, ctx context.Context, gen uint64) tea.Cmd {
 	return func() tea.Msg {
 		resp, err := client.Chat(ctx, llm.Request{Messages: snapshot, Tools: toolDefs})
 		if err != nil {
-			return errorMsg{err}
+			return errorMsg{gen: gen, err: err}
 		}
 		msg := resp.Message
 		if msg.Role == "" {
 			msg.Role = "assistant"
 		}
-		return llmResponseMsg{assistantMsg: msg}
+		return llmResponseMsg{gen: gen, assistantMsg: msg}
 	}
 }
 
@@ -1002,7 +1069,7 @@ func toolFingerprint(tc ToolCall) string {
 	return sha256Hex(tc.Function.Name + "\x00" + tc.Function.Arguments)
 }
 
-func executeToolCmd(ctx context.Context, reg *tools.Registry, tc ToolCall, approval *tools.Approval) tea.Cmd {
+func executeToolCmd(ctx context.Context, reg *tools.Registry, tc ToolCall, approval *tools.Approval, gen uint64) tea.Cmd {
 	return func() tea.Msg {
 		var result string
 		if ctx.Err() != nil {
@@ -1014,6 +1081,7 @@ func executeToolCmd(ctx context.Context, reg *tools.Registry, tc ToolCall, appro
 		}
 		summary := formatToolSummary(tc.Function.Name, tc.Function.Arguments, result)
 		return toolExecutedMsg{
+			gen: gen,
 			toolMsg: Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
@@ -1082,6 +1150,7 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	if input == "clear" || input == "/clear" {
+		m.cancelActiveTask()
 		m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
 		if m.projectCtx.HasRules() {
 			m.messages = append(m.messages, Message{
@@ -1089,9 +1158,7 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 				Content: fmt.Sprintf("Conversation cleared. Active project rules remain: %s (%d bytes, lower priority, untrusted repo content).", m.projectCtx.RulesFile, m.projectCtx.RulesSize),
 			})
 		}
-		m.pendingTools = nil
-		m.awaitingApproval = false
-		m.approval = approvalPreview{}
+		m.status = "Ready"
 		m.clearInput()
 		m.refresh()
 		return m, nil

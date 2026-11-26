@@ -9,10 +9,11 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/amiraq1/nabd/internal/safefs"
 )
 
 const (
@@ -308,28 +309,27 @@ func NewClient(cfg Config) (Client, error) {
 }
 
 func readAPIKeyFile(path string) (string, error) {
-	fi, err := os.Lstat(path)
+	data, _, err := safefs.ReadFileNoFollow(path, safefs.OpenPolicy{
+		MaxBytes:          4096,
+		RequireOwner:      true,
+		StrictPrivateMode: true,
+		RejectExecutable:  true,
+	})
 	if err != nil {
-		return "", fmt.Errorf("read NABD_API_KEY_FILE: %w", err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("NABD_API_KEY_FILE cannot be a symlink: %s", path)
-	}
-	if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("NABD_API_KEY_FILE must be a regular file: %s", path)
-	}
-	if fi.Size() > 4096 {
-		return "", fmt.Errorf("NABD_API_KEY_FILE exceeds maximum size of 4KiB (%d bytes)", fi.Size())
-	}
-	if runtime.GOOS != "windows" && (fi.Mode().Perm()&0077 != 0 || fi.Mode().Perm()&0111 != 0) {
-		return "", fmt.Errorf("NABD_API_KEY_FILE permissions %04o are too open (must be 0600 or less)", fi.Mode().Perm())
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read NABD_API_KEY_FILE: %w", err)
-	}
-	if len(data) > 4096 {
-		return "", fmt.Errorf("NABD_API_KEY_FILE exceeds maximum size of 4KiB (%d bytes)", len(data))
+		switch {
+		case errors.Is(err, safefs.ErrSymlink):
+			return "", fmt.Errorf("NABD_API_KEY_FILE cannot be a symlink: %s", path)
+		case errors.Is(err, safefs.ErrNotRegularFile), errors.Is(err, safefs.ErrNotDirectory):
+			return "", fmt.Errorf("NABD_API_KEY_FILE must be a regular file: %s", path)
+		case errors.Is(err, safefs.ErrTooLarge):
+			return "", fmt.Errorf("NABD_API_KEY_FILE exceeds maximum size of 4KiB (%w)", err)
+		case errors.Is(err, safefs.ErrPermission):
+			return "", fmt.Errorf("NABD_API_KEY_FILE permissions are too open (must be 0600 or less): %w", err)
+		case errors.Is(err, safefs.ErrOwner):
+			return "", fmt.Errorf("NABD_API_KEY_FILE owner invalid: %w", err)
+		default:
+			return "", fmt.Errorf("read NABD_API_KEY_FILE: %w", err)
+		}
 	}
 	s := strings.TrimRight(string(data), "\r\n")
 	s = strings.TrimSpace(s)

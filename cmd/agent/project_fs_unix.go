@@ -10,56 +10,47 @@ import (
 	"os"
 	"sort"
 
-	"golang.org/x/sys/unix"
+	"github.com/amiraq1/nabd/internal/safefs"
 )
 
 const projectSymlinkSupportNote = "unix openat(O_NOFOLLOW|O_NONBLOCK)"
 
+func mapProjectFSErr(err error, part string) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, safefs.ErrSymlink):
+		if part != "" {
+			return fmt.Errorf("%w: %s", errProjectSymlink, part)
+		}
+		return errProjectSymlink
+	case errors.Is(err, safefs.ErrNotDirectory):
+		if part != "" {
+			return fmt.Errorf("%w: %s", errProjectNotDirectory, part)
+		}
+		return errProjectNotDirectory
+	case errors.Is(err, safefs.ErrNotRegularFile):
+		return errProjectNotRegularFile
+	case errors.Is(err, safefs.ErrTooLarge):
+		return fmt.Errorf("%w (%v)", errProjectFileTooLarge, err)
+	default:
+		return err
+	}
+}
+
 func openDirComponentNoFollow(parentFD int, name string) (*os.File, error) {
-	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), name)
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("invalid directory descriptor for %s", name)
-	}
-	return f, nil
+	return safefs.OpenDirAtNoFollow(parentFD, name)
 }
 
 func openRegularFileNoFollow(parentFD int, name string) (*os.File, os.FileInfo, error) {
-	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	f := os.NewFile(uintptr(fd), name)
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, nil, fmt.Errorf("invalid file descriptor for %s", name)
-	}
-	info, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, nil, err
-	}
-	if !info.Mode().IsRegular() {
-		_ = f.Close()
-		return nil, nil, errProjectNotRegularFile
-	}
-	return f, info, nil
+	return safefs.OpenRegularAtNoFollow(parentFD, name)
 }
 
 func readBoundedRegularNoFollow(f *os.File, info os.FileInfo, maxBytes int64) ([]byte, error) {
-	if info.Size() > maxBytes {
-		return nil, fmt.Errorf("%w (size %d > %d bytes)", errProjectFileTooLarge, info.Size(), maxBytes)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	data, err := safefs.ReadBoundedRegular(f, info, maxBytes)
 	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%w (exceeds %d bytes)", errProjectFileTooLarge, maxBytes)
+		return nil, mapProjectFSErr(err, "")
 	}
 	return data, nil
 }
@@ -73,13 +64,7 @@ func readRootFileNoFollow(root *os.Root, name string, maxBytes int64) ([]byte, e
 
 	f, info, err := openRegularFileNoFollow(int(rootDir.Fd()), name)
 	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, errProjectSymlink
-		}
-		if errors.Is(err, unix.EISDIR) {
-			return nil, errProjectNotRegularFile
-		}
-		return nil, err
+		return nil, mapProjectFSErr(err, "")
 	}
 	defer f.Close()
 	return readBoundedRegularNoFollow(f, info, maxBytes)
@@ -103,23 +88,8 @@ func scanCommandsDirNoFollow(
 		}
 		nextDir, openErr := openDirComponentNoFollow(int(curDir.Fd()), part)
 		if openErr != nil {
-			if errors.Is(openErr, unix.ELOOP) {
-				_ = curDir.Close()
-				return false, fmt.Errorf("%w: %s", errProjectSymlink, part)
-			}
-			if errors.Is(openErr, unix.ENOTDIR) {
-				var st unix.Stat_t
-				// Linux openat(O_DIRECTORY|O_NOFOLLOW) returns ENOTDIR on a symlink to dir;
-				// inspect the unfollowed component via pinned dirfd to report symlinks accurately.
-				if fErr := unix.Fstatat(int(curDir.Fd()), part, &st, unix.AT_SYMLINK_NOFOLLOW); fErr == nil && (uint32(st.Mode)&unix.S_IFMT) == unix.S_IFLNK {
-					_ = curDir.Close()
-					return false, fmt.Errorf("%w: %s", errProjectSymlink, part)
-				}
-				_ = curDir.Close()
-				return false, fmt.Errorf("%w: %s", errProjectNotDirectory, part)
-			}
 			_ = curDir.Close()
-			return false, openErr
+			return false, mapProjectFSErr(openErr, part)
 		}
 		_ = curDir.Close()
 		curDir = nextDir
@@ -164,13 +134,7 @@ func scanCommandsDirNoFollow(
 		readFn := func(maxBytes int64) ([]byte, error) {
 			f, info, oErr := openRegularFileNoFollow(dirFD, name)
 			if oErr != nil {
-				if errors.Is(oErr, unix.ELOOP) {
-					return nil, errProjectSymlink
-				}
-				if errors.Is(oErr, unix.EISDIR) {
-					return nil, errProjectNotRegularFile
-				}
-				return nil, oErr
+				return nil, mapProjectFSErr(oErr, "")
 			}
 			defer f.Close()
 			return readBoundedRegularNoFollow(f, info, maxBytes)

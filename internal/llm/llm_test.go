@@ -178,3 +178,25 @@ func TestNewClientFactory(t *testing.T) {
 		t.Fatalf("expected Provider() 'gemini', got %q", gemClient.Provider())
 	}
 }
+
+func TestReadAPIKeyFileComponentSymlinkAndFIFO(t *testing.T) {
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realKey := filepath.Join(realDir, "api_key")
+	if err := os.WriteFile(realKey, []byte("secret-api-key-12345\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAPIKeyFile(realKey); err != nil {
+		t.Fatalf("expected valid key file to succeed, got %v", err)
+	}
+
+	symDir := filepath.Join(base, "symdir")
+	if err := os.Symlink(realDir, symDir); err == nil {
+		if _, err := readAPIKeyFile(filepath.Join(symDir, "api_key")); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("expected component symlink rejection, got %v", err)
+		}
+	}
+}

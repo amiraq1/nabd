@@ -67,6 +67,12 @@ type Profile struct {
 	// ExtraReadonlyBinds are absolute host paths exposed read-only at the
 	// same absolute path inside the sandbox.
 	ExtraReadonlyBinds []string
+	// MaskedDirs are workspace-relative directory paths inside /workspace that
+	// must be hidden with an empty tmpfs overlay (e.g., ".git", ".nabd").
+	MaskedDirs []string
+	// MaskedFiles are workspace-relative regular file paths inside /workspace
+	// that must be hidden with read-only /dev/null (e.g., ".env", "*.key").
+	MaskedFiles []string
 	// Env is the complete child environment, in KEY=VALUE form.
 	Env []string
 	// MemoryLimitBytes is a hard RLIMIT_AS ceiling in the child.
@@ -120,6 +126,16 @@ func Validate(p Profile) error {
 			return fmt.Errorf("extra bind must be an absolute path")
 		}
 	}
+	for _, rel := range p.MaskedDirs {
+		if err := validateMaskedRelPath(rel); err != nil {
+			return fmt.Errorf("invalid masked directory %q: %w", rel, err)
+		}
+	}
+	for _, rel := range p.MaskedFiles {
+		if err := validateMaskedRelPath(rel); err != nil {
+			return fmt.Errorf("invalid masked file %q: %w", rel, err)
+		}
+	}
 	for _, entry := range p.Env {
 		key, value, ok := strings.Cut(entry, "=")
 		if !ok || key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, 0) {
@@ -128,6 +144,21 @@ func Validate(p Profile) error {
 	}
 	if p.MemoryLimitBytes <= 0 || p.ProcessLimit <= 0 {
 		return fmt.Errorf("memory and process limits must be positive")
+	}
+	return nil
+}
+
+func validateMaskedRelPath(rel string) error {
+	if rel == "" || rel == "." {
+		return fmt.Errorf("path must be non-empty and not '.'")
+	}
+	if strings.ContainsAny(rel, "\x00\\") || strings.HasPrefix(rel, "/") || strings.HasSuffix(rel, "/") {
+		return fmt.Errorf("path must be a clean slash-separated relative path")
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("path contains empty or traversal segment")
+		}
 	}
 	return nil
 }

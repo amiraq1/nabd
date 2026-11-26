@@ -224,7 +224,7 @@ func validateExternalURL(raw string) (*url.URL, error) {
 		return nil, errors.New("opaque URLs are not allowed")
 	}
 
-	host := u.Hostname()
+	host := strings.ToLower(u.Hostname())
 	if host == "" {
 		return nil, errors.New("URL must specify a valid host")
 	}
@@ -256,6 +256,11 @@ func validateExternalURL(raw string) (*url.URL, error) {
 		if portNum < 1 {
 			return nil, fmt.Errorf("port out of range: %s", p)
 		}
+		u.Host = net.JoinHostPort(host, p)
+	} else if strings.Contains(host, ":") {
+		u.Host = "[" + host + "]"
+	} else {
+		u.Host = host
 	}
 
 	return u, nil

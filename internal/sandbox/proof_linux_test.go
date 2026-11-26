@@ -104,7 +104,7 @@ func TestLinuxWrapConstructsConfinedCommand(t *testing.T) {
 	joined := strings.Join(cmd.Args, "\x00")
 	for _, flag := range []string{
 		"--unshare-user", "--unshare-pid", "--unshare-net", "--unshare-ipc",
-		"--unshare-uts", "--die-with-parent", "--clearenv",
+		"--unshare-uts", "--new-session", "--die-with-parent", "--clearenv",
 		"--ro-bind", "--tmpfs", "--chdir", "--setenv",
 	} {
 		if !strings.Contains(joined, flag) {

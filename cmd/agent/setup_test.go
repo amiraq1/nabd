@@ -299,11 +299,76 @@ func TestSetupReadSavedKeySecurity(t *testing.T) {
 		if err := os.WriteFile(loosePath, []byte("secret"), 0644); err != nil {
 			t.Fatalf("write loose key: %v", err)
 		}
+		if err := os.Chmod(loosePath, 0644); err != nil {
+			t.Fatalf("chmod loose key: %v", err)
+		}
 		_, err = readSavedKey(loosePath)
 		if err == nil || !strings.Contains(err.Error(), "permissions must be 0600 or stricter") {
 			t.Fatalf("expected permission rejection error, got %v", err)
 		}
+
+		// Executable bit must also be rejected for saved keys.
+		execPath := filepath.Join(dir, "exec_key")
+		if err := os.WriteFile(execPath, []byte("secret"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(execPath, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readSavedKey(execPath); err == nil || !strings.Contains(err.Error(), "permissions must be 0600 or stricter") {
+			t.Fatalf("expected executable key rejection error, got %v", err)
+		}
 	}
+
+	// 5. Reject symlink in parent directory component
+	symParent := filepath.Join(dir, "symdir")
+	realParent := filepath.Join(dir, "realdir")
+	if err := os.MkdirAll(realParent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realParent, "nested_key"), []byte("secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realParent, symParent); err == nil {
+		if _, err := readSavedKey(filepath.Join(symParent, "nested_key")); err == nil || !strings.Contains(err.Error(), "symlinks are not allowed") {
+			t.Fatalf("expected parent directory symlink rejection, got %v", err)
+		}
+	}
+}
+
+func TestSetupConfigSecurityFailsClosed(t *testing.T) {
+	clearEnv(t, "NABD_PROVIDER", "NABD_BASE_URL", "NABD_MODEL", "NABD_API_KEY", "NABD_API_KEY_FILE", "NABD_GEMINI_API_KEY", "NABD_GEMINI_API_KEY_FILE")
+
+	t.Run("reject_loose_config_json_on_unix", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("POSIX permissions not enforced on Windows")
+		}
+		cfgDir := t.TempDir()
+		cfgPath := filepath.Join(cfgDir, "config.json")
+		if err := os.WriteFile(cfgPath, []byte(`{"provider":"openai","model":"m"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(cfgPath, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := LoadEffectiveConfig(cfgDir); err == nil || !strings.Contains(err.Error(), "permissions must be 0600 or stricter") {
+			t.Fatalf("expected LoadEffectiveConfig to fail closed on loose config.json, got %v", err)
+		}
+	})
+
+	t.Run("reject_symlinked_config_dir", func(t *testing.T) {
+		realDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(realDir, "config.json"), []byte(`{"provider":"openai"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := filepath.Join(t.TempDir(), "cfg_link")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Skipf("symlink unsupported: %v", err)
+		}
+		if _, _, err := LoadEffectiveConfig(linkDir); err == nil || !strings.Contains(err.Error(), "symlinks are not allowed") {
+			t.Fatalf("expected symlinked configDir rejection, got %v", err)
+		}
+	})
 }
 
 func TestSetupValidateConfigDirNotInWorkspace(t *testing.T) {

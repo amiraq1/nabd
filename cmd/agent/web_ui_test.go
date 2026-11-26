@@ -69,7 +69,7 @@ func TestWebToolsAutoApproveReadOnlyStillPromptsAndStatusReports(t *testing.T) {
 		t.Fatal("AutoApproveReadOnly bypassed manual approval for outbound web_search tool")
 	}
 
-	// Verify web_fetch under AutoApproveReadOnly also requires manual approval and hides query string
+	// Verify web_fetch under AutoApproveReadOnly requires manual approval and displays full URL query params in preview
 	mRO2 := initialModel(regFC, &mockClient{}, AutoApproveReadOnly)
 	mRO2.pendingTools = []ToolCall{{
 		ID: "call-wf-1",
@@ -86,8 +86,11 @@ func TestWebToolsAutoApproveReadOnlyStillPromptsAndStatusReports(t *testing.T) {
 	if !uiNext2.awaitingApproval {
 		t.Fatal("AutoApproveReadOnly bypassed manual approval for outbound web_fetch tool")
 	}
-	if strings.Contains(uiNext2.approval.Summary, "TOP_SECRET_PARAM") {
-		t.Fatalf("approval preview leaked sensitive URL query parameter value: %s", uiNext2.approval.Summary)
+	if !strings.Contains(uiNext2.approval.Summary, "token=TOP_SECRET_PARAM") || strings.Contains(uiNext2.approval.Summary, "omitted") {
+		t.Fatalf("approval preview must display complete URL query parameters: %s", uiNext2.approval.Summary)
+	}
+	if uiNext2.approval.IdentitySHA256 == "" || !strings.HasPrefix(uiNext2.approval.IdentitySHA256, "webfetch:sha256:") {
+		t.Fatalf("expected canonical web_fetch IdentitySHA256 binding, got %q", uiNext2.approval.IdentitySHA256)
 	}
 	if !strings.Contains(uiNext2.approval.Summary, "docs.example.com") {
 		t.Fatalf("approval preview missing destination hostname: %s", uiNext2.approval.Summary)

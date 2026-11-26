@@ -4,13 +4,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 
-	"golang.org/x/sys/windows"
+	"github.com/amiraq1/nabd/internal/safefs"
 )
 
 // Windows Win32 has no openat(dirfd) equivalent in Go stdlib/x/sys; we open
@@ -20,118 +21,40 @@ import (
 // replacement between directory verification and child open.
 const projectSymlinkSupportNote = "windows FILE_FLAG_OPEN_REPARSE_POINT (intermediate dir swap window remains on Win32)"
 
-func openFileNoReparseWindows(fullPath string) (*os.File, windows.ByHandleFileInformation, error) {
-	var bhfi windows.ByHandleFileInformation
-	utf16Path, err := windows.UTF16PtrFromString(fullPath)
-	if err != nil {
-		return nil, bhfi, err
+func mapProjectFSWindowsErr(err error) error {
+	if err == nil {
+		return nil
 	}
-	h, err := windows.CreateFile(
-		utf16Path,
-		windows.GENERIC_READ,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
-	)
-	if err != nil {
-		return nil, bhfi, mapWindowsOpenErr(err)
+	switch {
+	case errors.Is(err, safefs.ErrSymlink):
+		return errProjectSymlink
+	case errors.Is(err, safefs.ErrNotDirectory):
+		return errProjectNotDirectory
+	case errors.Is(err, safefs.ErrNotRegularFile):
+		return errProjectNotRegularFile
+	case errors.Is(err, safefs.ErrTooLarge):
+		return fmt.Errorf("%w (%v)", errProjectFileTooLarge, err)
+	default:
+		return err
 	}
-	f := os.NewFile(uintptr(h), fullPath)
-	if f == nil {
-		_ = windows.CloseHandle(h)
-		return nil, bhfi, fmt.Errorf("invalid file handle for %s", fullPath)
-	}
-	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &bhfi); err != nil {
-		_ = f.Close()
-		return nil, bhfi, err
-	}
-	if bhfi.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		_ = f.Close()
-		return nil, bhfi, errProjectSymlink
-	}
-	if bhfi.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
-		_ = f.Close()
-		return nil, bhfi, errProjectNotRegularFile
-	}
-	return f, bhfi, nil
 }
 
-func verifyDirNoReparseWindows(fullPath string) (*os.File, error) {
-	utf16Path, err := windows.UTF16PtrFromString(fullPath)
+func readBoundedWindowsFile(f *os.File, info os.FileInfo, maxBytes int64) ([]byte, error) {
+	data, err := safefs.ReadBoundedRegular(f, info, maxBytes)
 	if err != nil {
-		return nil, err
-	}
-	h, err := windows.CreateFile(
-		utf16Path,
-		windows.GENERIC_READ,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
-	)
-	if err != nil {
-		return nil, mapWindowsOpenErr(err)
-	}
-	f := os.NewFile(uintptr(h), fullPath)
-	if f == nil {
-		_ = windows.CloseHandle(h)
-		return nil, fmt.Errorf("invalid directory handle for %s", fullPath)
-	}
-	var bhfi windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &bhfi); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if bhfi.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		_ = f.Close()
-		return nil, errProjectSymlink
-	}
-	if bhfi.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-		_ = f.Close()
-		return nil, errProjectNotDirectory
-	}
-	return f, nil
-}
-
-func mapWindowsOpenErr(err error) error {
-	if err == windows.ERROR_FILE_NOT_FOUND || err == windows.ERROR_PATH_NOT_FOUND {
-		return os.ErrNotExist
-	}
-	return err
-}
-
-func readBoundedWindowsFile(f *os.File, maxBytes int64) ([]byte, error) {
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errProjectNotRegularFile
-	}
-	if info.Size() > maxBytes {
-		return nil, fmt.Errorf("%w (size %d > %d bytes)", errProjectFileTooLarge, info.Size(), maxBytes)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%w (exceeds %d bytes)", errProjectFileTooLarge, maxBytes)
+		return nil, mapProjectFSWindowsErr(err)
 	}
 	return data, nil
 }
 
 func readRootFileNoFollow(root *os.Root, name string, maxBytes int64) ([]byte, error) {
 	fullPath := filepath.Join(root.Name(), name)
-	f, _, err := openFileNoReparseWindows(fullPath)
+	f, info, err := safefs.OpenRegularNoReparseWindows(fullPath)
 	if err != nil {
-		return nil, err
+		return nil, mapProjectFSWindowsErr(err)
 	}
 	defer f.Close()
-	return readBoundedWindowsFile(f, maxBytes)
+	return readBoundedWindowsFile(f, info, maxBytes)
 }
 
 func scanCommandsDirNoFollow(
@@ -141,16 +64,16 @@ func scanCommandsDirNoFollow(
 	visit func(name string, isDir, isSymlink bool, readFn func(maxBytes int64) ([]byte, error)) bool,
 ) (bool, error) {
 	nabdPath := filepath.Join(root.Name(), ".nabd")
-	hNabd, err := verifyDirNoReparseWindows(nabdPath)
+	hNabd, err := safefs.VerifyDirNoReparseWindows(nabdPath)
 	if err != nil {
-		return false, err
+		return false, mapProjectFSWindowsErr(err)
 	}
 	defer hNabd.Close()
 
 	cmdDirPath := filepath.Join(nabdPath, "commands")
-	hCmds, err := verifyDirNoReparseWindows(cmdDirPath)
+	hCmds, err := safefs.VerifyDirNoReparseWindows(cmdDirPath)
 	if err != nil {
-		return false, err
+		return false, mapProjectFSWindowsErr(err)
 	}
 	defer hCmds.Close()
 
@@ -195,12 +118,12 @@ func scanCommandsDirNoFollow(
 		isDir := de.IsDir()
 		isSymlink := de.Type()&os.ModeSymlink != 0
 		readFn := func(maxBytes int64) ([]byte, error) {
-			f, _, oErr := openFileNoReparseWindows(filepath.Join(cmdDirPath, name))
+			f, info, oErr := safefs.OpenRegularNoReparseWindows(filepath.Join(cmdDirPath, name))
 			if oErr != nil {
-				return nil, oErr
+				return nil, mapProjectFSWindowsErr(oErr)
 			}
 			defer f.Close()
-			return readBoundedWindowsFile(f, maxBytes)
+			return readBoundedWindowsFile(f, info, maxBytes)
 		}
 		if !visit(name, isDir, isSymlink, readFn) {
 			break

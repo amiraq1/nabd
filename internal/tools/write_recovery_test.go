@@ -33,10 +33,7 @@ func TestCrossProcessLockRefusesConcurrentEdit(t *testing.T) {
 	r := mustRegistry(t, dir)
 	defer r.Close()
 
-	if err := os.MkdirAll(filepath.Join(dir, ".nabd"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	lock, err := acquireProcessLock(filepath.Join(dir, ".nabd", "edit.lock"))
+	lock, err := acquireProcessLock(r.root)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,45 +93,11 @@ func (b *linuxBackend) Wrap(ctx context.Context, p Profile, executable string, a
 			return nil, err
 		}
 	}
+	if err := validateWorkspaceMasksNoFollow(p.WorkDir, p.MaskedDirs, p.MaskedFiles); err != nil {
+		return nil, err
+	}
 
-	// The child sees an almost empty root filesystem: only /workspace, the
-	// read-only binds, /proc and a tmpfs /tmp. There is no host /etc, /home
-	// or network namespace.
-	bwrapArgs := []string{
-		"--unshare-user",
-		"--unshare-pid",
-		"--unshare-net",
-		"--unshare-ipc",
-		"--unshare-uts",
-		"--die-with-parent",
-		"--clearenv",
-		"--proc", "/proc",
-		"--dev", "/dev",
-		"--tmpfs", "/tmp",
-		"--ro-bind", limiter, "/nabd/limiter",
-		"--ro-bind", abs, "/nabd/target",
-	}
-	if p.WritableWorkspace {
-		bwrapArgs = append(bwrapArgs, "--bind", p.WorkDir, "/workspace")
-	} else {
-		bwrapArgs = append(bwrapArgs, "--ro-bind", p.WorkDir, "/workspace")
-	}
-	for _, bind := range p.ExtraReadonlyBinds {
-		bwrapArgs = append(bwrapArgs, "--ro-bind", bind, bind)
-	}
-	for _, entry := range p.Env {
-		key, value, _ := strings.Cut(entry, "=")
-		bwrapArgs = append(bwrapArgs, "--setenv", key, value)
-	}
-	bwrapArgs = append(bwrapArgs,
-		"--chdir", "/workspace",
-		"--",
-		"/nabd/limiter",
-		strconv.FormatInt(p.MemoryLimitBytes, 10),
-		strconv.Itoa(p.ProcessLimit),
-		"/nabd/target",
-	)
-	bwrapArgs = append(bwrapArgs, args...)
+	bwrapArgs := buildBwrapArgs(p, limiter, abs, args...)
 
 	cmd := exec.CommandContext(ctx, b.bwrap, bwrapArgs...)
 	cmd.WaitDelay = 2 * time.Second
@@ -138,8 +105,8 @@ func (b *linuxBackend) Wrap(ctx context.Context, p Profile, executable string, a
 }
 
 // Prove runs the shipped probe inside the real sandbox. The probe fails if it
-// can read host files, write outside its allowed area, open a socket, or sees
-// different resource limits. A failure here leaves both execution tools off.
+// can read host files, write outside its allowed area, reach the host network
+// namespace or host loopback listener, or sees different resource limits.
 func (b *linuxBackend) Prove(ctx context.Context) error {
 	if b == nil || !b.Available() {
 		return ErrUnavailable
@@ -161,6 +128,39 @@ func (b *linuxBackend) Prove(ctx context.Context) error {
 	}
 	defer os.RemoveAll(tmp)
 
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("bind host loopback listener for netns proof: %w", err)
+	}
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			c, aErr := ln.Accept()
+			if aErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	defer func() {
+		_ = ln.Close()
+		<-acceptDone
+	}()
+
+	// Positive control on host: dialing ln.Addr() MUST succeed from the host namespace
+	// so the probe's failure inside the sandbox proves namespace isolation.
+	hostConn, err := net.DialTimeout("tcp", ln.Addr().String(), 500*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("host loopback positive control failed: %w", err)
+	}
+	_ = hostConn.Close()
+
+	hostNetNS, err := os.Readlink("/proc/self/ns/net")
+	if err != nil || hostNetNS == "" {
+		return fmt.Errorf("read host network namespace: %w", err)
+	}
+
 	proveCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
@@ -168,9 +168,14 @@ func (b *linuxBackend) Prove(ctx context.Context) error {
 	cmd, err := b.Wrap(proveCtx, Profile{
 		WorkDir:           tmp,
 		WritableWorkspace: false,
-		Env:               []string{"EXPECT_MEM=" + strconv.FormatInt(mem, 10), "EXPECT_PROCS=" + strconv.Itoa(proofProcesses)},
-		MemoryLimitBytes:  mem,
-		ProcessLimit:      proofProcesses,
+		Env: []string{
+			"EXPECT_MEM=" + strconv.FormatInt(mem, 10),
+			"EXPECT_PROCS=" + strconv.Itoa(proofProcesses),
+			"EXPECT_BLOCKED_ADDR=" + ln.Addr().String(),
+			"EXPECT_HOST_NETNS=" + hostNetNS,
+		},
+		MemoryLimitBytes: mem,
+		ProcessLimit:     proofProcesses,
 	}, probe)
 	if err != nil {
 		return err

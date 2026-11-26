@@ -17,10 +17,11 @@ const maxApprovalArgs = 4000
 const mcpIdentityWarning = "approval is bound to the configured server, guard and environment digests; a local user may still replace a file in the short verification window; filesystem and network bounds come from the proven sandbox, not from this prompt"
 
 type approvalPreview struct {
-	Summary   string
-	GuardPath string
-	GuardSHA  string
-	State     tools.ApprovalState
+	Summary        string
+	GuardPath      string
+	GuardSHA       string
+	IdentitySHA256 string
+	State          tools.ApprovalState
 }
 
 func (m *uiModel) approvalStillValid() bool {
@@ -120,46 +121,12 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		return approvalPreview{Summary: clip(sanitizeForDisplay(b.String()), maxApprovalChars)}
 
 	case "web_fetch":
-		var p struct {
-			URL string `json:"url"`
+		canonicalURL, u, id, urlErr := tools.CanonicalWebFetchURL(json.RawMessage(tc.Function.Arguments))
+		summary := formatWebFetchApprovalSummary(reg, u, canonicalURL, urlErr)
+		return approvalPreview{
+			Summary:        clip(sanitizeForDisplay(summary), maxApprovalArgs),
+			IdentitySHA256: id,
 		}
-		_ = json.Unmarshal([]byte(tc.Function.Arguments), &p)
-		dest := "(invalid URL)"
-		queryNotice := "none"
-		if u, err := url.Parse(p.URL); err == nil {
-			if u.User != nil {
-				dest = "(blocked: URL contains userinfo)"
-			} else if u.Hostname() != "" {
-				dest = u.Scheme + "://" + u.Hostname()
-				if port := u.Port(); port != "" {
-					dest += ":" + port
-				}
-				dest += u.EscapedPath()
-			}
-			if u.RawQuery != "" {
-				queryNotice = fmt.Sprintf("present (%d bytes; parameter values omitted from preview)", len(u.RawQuery))
-			}
-		}
-		isFirecrawl := reg != nil && reg.WebSearchProvider() == "firecrawl"
-		var b strings.Builder
-		if isFirecrawl {
-			fcHost := "api.firecrawl.dev"
-			if h := reg.WebSearchDestinationHost(); h != "" {
-				fcHost = h
-			}
-			b.WriteString("outbound network request: delegated scrape via Firecrawl API (25s timeout)\n")
-			fmt.Fprintf(&b, "firecrawl_endpoint: %s\n", sanitizeForDisplay(fcHost))
-			fmt.Fprintf(&b, "destination: %s\n", sanitizeForDisplay(dest))
-			fmt.Fprintf(&b, "query_string: %s\n", queryNotice)
-			b.WriteString("delegation_limit: local SSRF/DNS check runs before sending, but Firecrawl resolves DNS, follows redirects, runs JavaScript, and loads subresources remotely (Nabd cannot enforce SSRF/rebinding on Firecrawl servers)\n")
-			b.WriteString("warning: target URL leaves your device to third-party Firecrawl; verify destination and avoid signed, private, or token-bearing URLs")
-		} else {
-			b.WriteString("outbound network request: direct public HTTPS fetch (max 3 verified redirects, 15s timeout)\n")
-			fmt.Fprintf(&b, "destination: %s\n", sanitizeForDisplay(dest))
-			fmt.Fprintf(&b, "query_string: %s\n", queryNotice)
-			b.WriteString("warning: request leaves your device; verify destination and check for any embedded tokens in URL parameters")
-		}
-		return approvalPreview{Summary: clip(sanitizeForDisplay(b.String()), maxApprovalChars)}
 
 	default:
 		return approvalPreview{Summary: clip(sanitizeForDisplay("arguments: "+tc.Function.Arguments), maxApprovalChars)}
@@ -200,19 +167,22 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 			}
 		}
 		if tc.Function.Name == "web_fetch" {
-			var a struct {
-				URL string `json:"url"`
+			canonicalURL, u, id, urlErr := tools.CanonicalWebFetchURL(json.RawMessage(raw))
+			if urlErr != nil {
+				return approvalPreview{}, urlErr
 			}
-			if err := json.Unmarshal([]byte(raw), &a); err == nil {
-				if u, uErr := url.Parse(a.URL); uErr == nil {
-					if u.User != nil {
-						return approvalPreview{}, fmt.Errorf("web_fetch URL contains prohibited userinfo")
-					}
-					if a.URL != "" && (!strings.EqualFold(u.Scheme, "https") || u.Hostname() == "") {
-						return approvalPreview{}, fmt.Errorf("web_fetch URL must be a valid https:// destination")
-					}
-				}
+			if sanitizeForDisplay(canonicalURL) != canonicalURL || sanitizeForDisplay(u.RawQuery) != u.RawQuery {
+				return approvalPreview{}, fmt.Errorf("web_fetch URL contains undisplayable control characters")
 			}
+			fullSummary := formatWebFetchApprovalSummary(reg, u, canonicalURL, nil)
+			if sanitizeForDisplay(fullSummary) != fullSummary {
+				return approvalPreview{}, fmt.Errorf("web_fetch approval preview contains undisplayable control characters")
+			}
+			if len(fullSummary) > maxApprovalArgs {
+				return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; shorten URL or split the request", maxApprovalArgs)
+			}
+			p.Summary = fullSummary
+			p.IdentitySHA256 = id
 		} else if tc.Function.Name != "web_search" {
 			p.Summary += "\narguments: " + raw
 		}
@@ -221,6 +191,49 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 		return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; split the request", maxApprovalArgs)
 	}
 	return p, nil
+}
+
+func formatWebFetchApprovalSummary(reg *tools.Registry, u *url.URL, canonicalURL string, urlErr error) string {
+	dest := "(invalid URL)"
+	queryDisplay := "none"
+	if urlErr != nil {
+		dest = "(blocked: " + sanitizeForDisplay(urlErr.Error()) + ")"
+	} else if u != nil && u.Hostname() != "" {
+		dest = u.Scheme + "://" + u.Hostname()
+		if port := u.Port(); port != "" {
+			dest += ":" + port
+		}
+		dest += u.EscapedPath()
+		if u.RawQuery != "" {
+			queryDisplay = "?" + u.RawQuery
+		}
+	}
+	isFirecrawl := reg != nil && reg.WebSearchProvider() == "firecrawl"
+	var b strings.Builder
+	if isFirecrawl {
+		fcHost := "api.firecrawl.dev"
+		if h := reg.WebSearchDestinationHost(); h != "" {
+			fcHost = h
+		}
+		b.WriteString("outbound network request: delegated scrape via Firecrawl API (25s timeout)\n")
+		fmt.Fprintf(&b, "firecrawl_endpoint: %s\n", sanitizeForDisplay(fcHost))
+		fmt.Fprintf(&b, "destination: %s\n", sanitizeForDisplay(dest))
+		fmt.Fprintf(&b, "query_string: %s\n", sanitizeForDisplay(queryDisplay))
+		if canonicalURL != "" {
+			fmt.Fprintf(&b, "canonical_url: %s\n", sanitizeForDisplay(canonicalURL))
+		}
+		b.WriteString("delegation_limit: local SSRF/DNS check runs before sending, but Firecrawl resolves DNS, follows redirects, runs JavaScript, and loads subresources remotely (Nabd cannot enforce SSRF/rebinding on Firecrawl servers)\n")
+		b.WriteString("warning: target URL leaves your device to third-party Firecrawl; verify destination and query parameters carefully")
+	} else {
+		b.WriteString("outbound network request: direct public HTTPS fetch (max 3 verified redirects, 15s timeout)\n")
+		fmt.Fprintf(&b, "destination: %s\n", sanitizeForDisplay(dest))
+		fmt.Fprintf(&b, "query_string: %s\n", sanitizeForDisplay(queryDisplay))
+		if canonicalURL != "" {
+			fmt.Fprintf(&b, "canonical_url: %s\n", sanitizeForDisplay(canonicalURL))
+		}
+		b.WriteString("warning: request leaves your device; verify destination and full query parameters for any embedded secrets")
+	}
+	return b.String()
 }
 
 func prefixBlock(text, prefix string) string {
