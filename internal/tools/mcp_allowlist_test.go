@@ -170,3 +170,84 @@ func TestEnableExecutionRecordsMemoryLimitInAuditLog(t *testing.T) {
 		t.Fatalf("configured sandbox memory limit was not found in audit log: %+v", events)
 	}
 }
+
+func TestLoadMCPConfigSecurityPolicies(t *testing.T) {
+	exe, exeSum := fakeExecutable(t)
+	guard, guardSum := fakeExecutable(t)
+	spec := MCPServerConfig{
+		Executable:  exe,
+		SHA256:      exeSum,
+		Guard:       guard,
+		GuardSHA256: guardSum,
+	}
+
+	// 1. Backward compatibility: 0644 (group/other read-only, perm&0o022 == 0) MUST succeed.
+	cfgPath := writeAllowlist(t, spec)
+	if os.PathSeparator != '\\' {
+		if err := os.Chmod(cfgPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadMCPConfig(cfgPath); err != nil {
+			t.Fatalf("expected 0644 NABD_MCP_CONFIG to be accepted, got: %v", err)
+		}
+
+		// 2. Reject group-writable 0664 and world-writable 0666.
+		for _, badMode := range []os.FileMode{0o664, 0o666, 0o620} {
+			if err := os.Chmod(cfgPath, badMode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadMCPConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "group/other write") {
+				t.Fatalf("expected group/other write rejection for mode %04o, got: %v", badMode, err)
+			}
+		}
+		if err := os.Chmod(cfgPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 3. Reject parent component symlink and leaf symlink in NABD_MCP_CONFIG.
+	realDir := t.TempDir()
+	realCfg := filepath.Join(realDir, "mcp.json")
+	cfgBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(realCfg, cfgBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symParent := filepath.Join(t.TempDir(), "sym_cfg_dir")
+	if err := os.Symlink(realDir, symParent); err == nil {
+		if _, err := LoadMCPConfig(filepath.Join(symParent, "mcp.json")); err == nil || !strings.Contains(err.Error(), "symbolic links") {
+			t.Fatalf("expected component symlink rejection, got: %v", err)
+		}
+	}
+	leafLink := filepath.Join(t.TempDir(), "leaf.json")
+	if err := os.Symlink(realCfg, leafLink); err == nil {
+		if _, err := LoadMCPConfig(leafLink); err == nil || !strings.Contains(err.Error(), "symbolic links") {
+			t.Fatalf("expected leaf symlink rejection, got: %v", err)
+		}
+	}
+
+	// 4. Reject oversized allowlist > 1 MiB.
+	bigPath := filepath.Join(t.TempDir(), "big.json")
+	if err := os.WriteFile(bigPath, make([]byte, (1<<20)+10), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMCPConfig(bigPath); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("expected size limit error, got: %v", err)
+	}
+
+	// 5. Reject symlinked executable in server digest check.
+	symExe := filepath.Join(t.TempDir(), "sym_exe")
+	if err := os.Symlink(exe, symExe); err == nil {
+		symCfg := writeAllowlist(t, MCPServerConfig{
+			Executable:  symExe,
+			SHA256:      exeSum,
+			Guard:       guard,
+			GuardSHA256: guardSum,
+		})
+		if _, err := LoadMCPConfig(symCfg); err == nil || !strings.Contains(err.Error(), "executable digest mismatch") {
+			t.Fatalf("expected symlinked executable rejection, got: %v", err)
+		}
+	}
+}

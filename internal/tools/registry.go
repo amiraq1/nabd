@@ -299,14 +299,9 @@ func (r *Registry) Disable(names ...string) {
 }
 
 // withProcessLock serializes writes and restores across separate Nabd
-// processes. It does not claim to be a compare-and-swap against an unrelated
-// external writer; that remains impossible with POSIX rename.
+// processes using root-confined, symlink-safe descriptor operations.
 func (r *Registry) withProcessLock(fn func() (string, error)) (string, error) {
-	dir := filepath.Join(r.workDir, ".nabd")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	lock, err := acquireProcessLock(filepath.Join(dir, "edit.lock"))
+	lock, err := acquireProcessLock(r.root)
 	if err != nil {
 		return "", err
 	}
@@ -923,6 +918,17 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 		return Approval{}, fmt.Errorf("tool %q does not require approval", name)
 	}
 
+	if name == "web_fetch" {
+		_, _, canonicalID, err := CanonicalWebFetchURL(rawArgs)
+		if err != nil {
+			return Approval{}, err
+		}
+		if identity != "" && identity != canonicalID {
+			return Approval{}, fmt.Errorf("web_fetch canonical URL identity mismatch")
+		}
+		identity = canonicalID
+	}
+
 	hash := hashBytes(rawArgs)
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: r.toolDetail(name, rawArgs)}); err != nil {
 		return Approval{}, err
@@ -1029,20 +1035,28 @@ func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawA
 }
 
 func (r *Registry) expectedApprovalIdentity(name string, rawArgs json.RawMessage) (string, error) {
-	if name != "mcp_call" {
+	switch name {
+	case "mcp_call":
+		var p struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal(rawArgs, &p); err != nil {
+			return "", err
+		}
+		identity, err := r.MCPIdentity(p.Command)
+		if err != nil {
+			return "", err
+		}
+		return identity, nil
+	case "web_fetch":
+		_, _, identity, err := CanonicalWebFetchURL(rawArgs)
+		if err != nil {
+			return "", err
+		}
+		return identity, nil
+	default:
 		return "", nil
 	}
-	var p struct {
-		Command string `json:"command"`
-	}
-	if err := json.Unmarshal(rawArgs, &p); err != nil {
-		return "", err
-	}
-	identity, err := r.MCPIdentity(p.Command)
-	if err != nil {
-		return "", err
-	}
-	return identity, nil
 }
 
 func (r *Registry) consumeApproval(name, hash string, approval Approval, expectedIdentity string) (pendingApproval, bool) {
@@ -1102,7 +1116,9 @@ func (r *Registry) toolDetail(name string, rawArgs json.RawMessage) string {
 	case "web_fetch":
 		// Record destination hostname only; never record query strings or sensitive URL components.
 		host := "(invalid-url)"
-		if u, err := url.Parse(p.URL); err == nil && u.Hostname() != "" {
+		if _, parsed, _, err := CanonicalWebFetchURL(rawArgs); err == nil && parsed.Hostname() != "" {
+			host = parsed.Hostname()
+		} else if u, err := url.Parse(p.URL); err == nil && u.Hostname() != "" {
 			host = u.Hostname()
 		}
 		detail = "host=" + host
@@ -1454,10 +1470,16 @@ func (r *Registry) goVerifyCommand(ctx context.Context, pkg string) (*exec.Cmd, 
 		binds = appendUniquePaths(binds, modcache)
 		sandboxEnv = append(sandboxEnv, "GOMODCACHE="+modcache)
 	}
+	maskedDirs, maskedFiles, err := collectSensitiveWorkspaceMasks(r.workDir)
+	if err != nil {
+		return nil, err
+	}
 	profile := sandbox.Profile{
 		WorkDir:            r.workDir,
 		WritableWorkspace:  true,
 		ExtraReadonlyBinds: binds,
+		MaskedDirs:         maskedDirs,
+		MaskedFiles:        maskedFiles,
 		Env:                sandboxEnv,
 		MemoryLimitBytes:   sandbox.DefaultMemoryLimit(),
 		ProcessLimit:       64,

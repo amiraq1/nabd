@@ -112,3 +112,76 @@ func TestPR7ApprovalRejectsControlCharactersInCommand(t *testing.T) {
 		t.Fatal("command with line break was approvable")
 	}
 }
+
+func TestWebFetchApprovalShowsFullQueryAndBindsCanonicalURL(t *testing.T) {
+	t.Setenv(tools.WebSearchProviderEnv, "brave")
+	t.Setenv(tools.WebBraveAPIKeyEnv, "brave-test-key")
+
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	// 1. Query string parameters must be shown unclipped in preview so secret exfiltration cannot hide.
+	args := `{"url":"HTTPS://Docs.Example.COM/collect?secret=EXFIL_KEY_999&step=2"}`
+	tc := ToolCall{ID: "call_wf_q", Type: "function"}
+	tc.Function.Name = "web_fetch"
+	tc.Function.Arguments = args
+	preview, err := prepareApprovalPreview(reg, tc)
+	if err != nil {
+		t.Fatalf("prepareApprovalPreview valid web_fetch failed: %v", err)
+	}
+	if !strings.Contains(preview.Summary, "secret=EXFIL_KEY_999&step=2") {
+		t.Fatalf("preview omitted query string: %s", preview.Summary)
+	}
+	if !strings.Contains(preview.Summary, "https://docs.example.com/collect?secret=EXFIL_KEY_999&step=2") {
+		t.Fatalf("preview omitted normalized canonical URL: %s", preview.Summary)
+	}
+	if strings.Contains(preview.Summary, "omitted") {
+		t.Fatalf("preview still claims parameters are omitted: %s", preview.Summary)
+	}
+
+	// 2. Approval token bound to canonical identity cannot be used with a mismatched URL/identity,
+	//    and audit.log logs ONLY host=docs.example.com without query parameters.
+	app, err := reg.ApproveWithIdentity("web_fetch", []byte(args), preview.IdentitySHA256)
+	if err != nil {
+		t.Fatalf("ApproveWithIdentity web_fetch: %v", err)
+	}
+	tamperedArgs := []byte(`{"url":"https://docs.example.com/collect?secret=OTHER&step=2"}`)
+	if out := reg.RunApproved(t.Context(), "web_fetch", tamperedArgs, app); !strings.Contains(out, "invalid or expired") {
+		t.Fatalf("RunApproved accepted tampered web_fetch args for approved token: %s", out)
+	}
+	if _, err := reg.ApproveWithIdentity("web_fetch", []byte(args), "webfetch:sha256:wrong"); err == nil {
+		t.Fatal("ApproveWithIdentity accepted wrong canonical URL identity")
+	}
+	auditBytes, err := os.ReadFile(filepath.Join(dir, ".nabd", "audit.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(auditBytes), "EXFIL_KEY_999") || !strings.Contains(string(auditBytes), "host=docs.example.com") {
+		t.Fatalf("audit.log leaked query string or omitted normalized host: %s", string(auditBytes))
+	}
+
+	// 3. Reject hidden/unsafe/private/unknown-field/control-char web_fetch inputs before asking consent.
+	badCases := []struct {
+		name string
+		args string
+	}{
+		{"bidi_override_query", `{"url":"https://docs.example.com/p?x=\u202espoof"}`},
+		{"localhost_ssrf", `{"url":"https://localhost/admin"}`},
+		{"unknown_json_field", `{"url":"https://docs.example.com/p","extra":1}`},
+		{"url_over_2048", `{"url":"https://docs.example.com/` + strings.Repeat("a", 2060) + `"}`},
+	}
+	for _, tcCase := range badCases {
+		t.Run(tcCase.name, func(t *testing.T) {
+			badCall := ToolCall{ID: "bad_" + tcCase.name, Type: "function"}
+			badCall.Function.Name = "web_fetch"
+			badCall.Function.Arguments = tcCase.args
+			if _, err := prepareApprovalPreview(reg, badCall); err == nil {
+				t.Fatalf("expected prepareApprovalPreview to reject %s", tcCase.name)
+			}
+		})
+	}
+}

@@ -4,12 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/amiraq1/nabd/internal/safefs"
 )
 
 // MCPConfigEnv names the file of user-preconfigured MCP servers. There is no
@@ -54,28 +55,13 @@ type MCPConfig struct {
 }
 
 func digestFile(path string) (string, error) {
-	info, err := os.Stat(path)
+	sum, err := safefs.DigestFileNoFollow(path, safefs.OpenPolicy{
+		RequireExecutable: true,
+	})
 	if err != nil {
-		return "", fmt.Errorf("not an executable regular file: %s", path)
+		return "", fmt.Errorf("not an executable regular file: %s (%w)", path, err)
 	}
-	executable := info.Mode().Perm()&0111 != 0
-	if runtime.GOOS == "windows" {
-		// Windows reports no POSIX execute bits; executability is enforced by
-		// the OS at launch time instead.
-		executable = true
-	}
-	if !info.Mode().IsRegular() || !executable {
-		return "", fmt.Errorf("not an executable regular file: %s", path)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	if int64(len(data)) != info.Size() {
-		return "", fmt.Errorf("file changed while hashing: %s", path)
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
+	return sum, nil
 }
 
 func validDigest(s string) bool {
@@ -97,12 +83,16 @@ func LoadMCPConfig(path string) (*MCPConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(abs)
+	data, _, err := safefs.ReadFileNoFollow(abs, safefs.OpenPolicy{
+		MaxBytes:         1 << 20,
+		RequireOwner:     true,
+		RejectGroupWrite: true,
+	})
 	if err != nil {
+		if errors.Is(err, safefs.ErrTooLarge) {
+			return nil, fmt.Errorf("MCP allowlist is too large: %w", err)
+		}
 		return nil, fmt.Errorf("read MCP allowlist: %w", err)
-	}
-	if len(data) > 1<<20 {
-		return nil, fmt.Errorf("MCP allowlist is too large")
 	}
 	var file mcpConfigFile
 	if err := json.Unmarshal(data, &file); err != nil {

@@ -3,6 +3,8 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -26,6 +28,10 @@ func TestValidateRejectsUnsafeProfiles(t *testing.T) {
 		{"nul env", Profile{WorkDir: "/w", Env: []string{"K=v\x00x"}, MemoryLimitBytes: 1, ProcessLimit: 1}, "environment"},
 		{"zero memory", Profile{WorkDir: "/w", MemoryLimitBytes: 0, ProcessLimit: 1}, "positive"},
 		{"zero processes", Profile{WorkDir: "/w", MemoryLimitBytes: 1, ProcessLimit: 0}, "positive"},
+		{"masked dir dot", Profile{WorkDir: "/w", MaskedDirs: []string{"."}, MemoryLimitBytes: 1, ProcessLimit: 1}, "invalid masked directory"},
+		{"masked dir traversal", Profile{WorkDir: "/w", MaskedDirs: []string{"../etc"}, MemoryLimitBytes: 1, ProcessLimit: 1}, "invalid masked directory"},
+		{"masked file backslash", Profile{WorkDir: "/w", MaskedFiles: []string{`sub\.env`}, MemoryLimitBytes: 1, ProcessLimit: 1}, "invalid masked file"},
+		{"masked file leading slash", Profile{WorkDir: "/w", MaskedFiles: []string{"/.env"}, MemoryLimitBytes: 1, ProcessLimit: 1}, "invalid masked file"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,5 +107,64 @@ func TestDefaultMemoryLimitConfigurableAndPageSizeAware(t *testing.T) {
 	pageSizeFunc = func() int { return 65536 }
 	if pageSizeFunc() != 65536 {
 		t.Fatalf("pageSizeFunc stubbing failed, got %d", pageSizeFunc())
+	}
+}
+
+func TestBuildBwrapArgsIncludesNewSessionAndWorkspaceMasks(t *testing.T) {
+	args := buildBwrapArgs(Profile{
+		WorkDir:           "/work",
+		WritableWorkspace: true,
+		MaskedDirs:        []string{".git", ".nabd"},
+		MaskedFiles:       []string{".env", "keys/api.key"},
+		Env:               []string{"HOME=/tmp"},
+		MemoryLimitBytes:  1 << 30,
+		ProcessLimit:      64,
+	}, "/usr/bin/nabd-limit", "/usr/bin/go", "test", "./...")
+
+	joined := strings.Join(args, "\x00")
+	for _, want := range []string{
+		"--new-session",
+		"--unshare-net",
+		"--bind\x00/work\x00/workspace",
+		"--tmpfs\x00/workspace/.git",
+		"--tmpfs\x00/workspace/.nabd",
+		"--ro-bind\x00/dev/null\x00/workspace/.env",
+		"--ro-bind\x00/dev/null\x00/workspace/keys/api.key",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing expected bwrap sequence %q in %v", want, args)
+		}
+	}
+}
+
+func TestValidateWorkspaceMasksNoFollow(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".nabd"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := validateWorkspaceMasksNoFollow(dir, []string{".git", ".nabd"}, []string{".env"}); err != nil {
+		t.Fatalf("valid masks rejected: %v", err)
+	}
+
+	symDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(symDir, "real"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(symDir, "real"), filepath.Join(symDir, ".env")); err == nil {
+		if err := validateWorkspaceMasksNoFollow(symDir, nil, []string{".env"}); err == nil {
+			t.Fatal("expected symlinked masked file to be rejected")
+		}
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(symDir, ".nabd")); err == nil {
+		if err := validateWorkspaceMasksNoFollow(symDir, []string{".nabd"}, nil); err == nil {
+			t.Fatal("expected symlinked masked directory to be rejected")
+		}
 	}
 }

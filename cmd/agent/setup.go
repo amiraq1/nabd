@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/amiraq1/nabd/internal/llm"
+	"github.com/amiraq1/nabd/internal/safefs"
 	"golang.org/x/term"
 )
 
@@ -100,33 +101,30 @@ func validateConfigDirNotInWorkspace(configDir string, workspaceDir string) erro
 	return nil
 }
 
-// readSavedKey reads and validates an API key file with strict permission and size checks.
+// readSavedKey reads and validates an API key file with component-wise O_NOFOLLOW,
+// owner, strict 0600 (non-executable), and bounded read checks.
 func readSavedKey(path string) (string, error) {
-	info, err := os.Lstat(path)
+	data, _, err := safefs.ReadFileNoFollow(path, safefs.OpenPolicy{
+		MaxBytes:          maxKeyFileSize,
+		RequireOwner:      true,
+		StrictPrivateMode: true,
+		RejectExecutable:  true,
+	})
 	if err != nil {
-		return "", err
-	}
-
-	if info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("insecure key file: symlinks are not allowed: %s", path)
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("insecure key file: not a regular file: %s", path)
-	}
-	if info.Size() > maxKeyFileSize {
-		return "", fmt.Errorf("insecure key file: file size %d bytes exceeds %d bytes limit: %s", info.Size(), maxKeyFileSize, path)
-	}
-
-	if runtime.GOOS != "windows" {
-		perm := info.Mode().Perm()
-		if perm&0077 != 0 {
-			return "", fmt.Errorf("insecure key file permissions %04o for %s; permissions must be 0600 or stricter", perm, path)
+		switch {
+		case errors.Is(err, safefs.ErrSymlink):
+			return "", fmt.Errorf("insecure key file: symlinks are not allowed: %s", path)
+		case errors.Is(err, safefs.ErrNotRegularFile), errors.Is(err, safefs.ErrNotDirectory):
+			return "", fmt.Errorf("insecure key file: not a regular file: %s", path)
+		case errors.Is(err, safefs.ErrTooLarge):
+			return "", fmt.Errorf("insecure key file: file size exceeds %d bytes limit: %s", maxKeyFileSize, path)
+		case errors.Is(err, safefs.ErrPermission):
+			return "", fmt.Errorf("insecure key file permissions for %s; permissions must be 0600 or stricter (%w)", path, err)
+		case errors.Is(err, safefs.ErrOwner):
+			return "", fmt.Errorf("insecure key file owner for %s: %w", path, err)
+		default:
+			return "", err
 		}
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
 	}
 	return strings.TrimSpace(string(data)), nil
 }
@@ -138,7 +136,9 @@ func writeSecureFile(dir, filename string, data []byte, perm os.FileMode) error 
 		return fmt.Errorf("creating directory %s: %w", dir, err)
 	}
 	if runtime.GOOS != "windows" {
-		_ = os.Chmod(dir, 0700)
+		if err := os.Chmod(dir, 0700); err != nil {
+			return fmt.Errorf("securing directory %s: %w", dir, err)
+		}
 	}
 
 	targetPath := filepath.Join(dir, filename)
@@ -231,22 +231,26 @@ func ResetConfig(configDir string) error {
 func loadSavedConfig(configDir string) (SavedConfig, error) {
 	var cfg SavedConfig
 	path := filepath.Join(configDir, "config.json")
-	info, err := os.Lstat(path)
+	data, _, err := safefs.ReadFileNoFollow(path, safefs.OpenPolicy{
+		MaxBytes:          65536,
+		RequireOwner:      true,
+		StrictPrivateMode: true,
+	})
 	if err != nil {
-		return cfg, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return cfg, fmt.Errorf("insecure config file: symlinks are not allowed: %s", path)
-	}
-	if !info.Mode().IsRegular() {
-		return cfg, fmt.Errorf("insecure config file: not a regular file: %s", path)
-	}
-	if info.Size() > 65536 {
-		return cfg, fmt.Errorf("config file too large (%d bytes)", info.Size())
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, err
+		switch {
+		case errors.Is(err, safefs.ErrSymlink):
+			return cfg, fmt.Errorf("insecure config file: symlinks are not allowed: %s", path)
+		case errors.Is(err, safefs.ErrNotRegularFile), errors.Is(err, safefs.ErrNotDirectory):
+			return cfg, fmt.Errorf("insecure config file: not a regular file: %s", path)
+		case errors.Is(err, safefs.ErrTooLarge):
+			return cfg, fmt.Errorf("config file exceeds 65536 bytes limit: %s", path)
+		case errors.Is(err, safefs.ErrPermission):
+			return cfg, fmt.Errorf("insecure config file permissions for %s; permissions must be 0600 or stricter (%w)", path, err)
+		case errors.Is(err, safefs.ErrOwner):
+			return cfg, fmt.Errorf("insecure config file owner for %s: %w", path, err)
+		default:
+			return cfg, err
+		}
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parsing %s: %w", path, err)
@@ -258,7 +262,10 @@ func loadSavedConfig(configDir string) (SavedConfig, error) {
 // It enforces strict provider isolation: an OpenAI key will never be sent to Gemini or vice-versa.
 // Returned keySource is one of: "env", "env_file", "saved", or "none".
 func LoadEffectiveConfig(configDir string) (llm.Config, string, error) {
-	savedCfg, _ := loadSavedConfig(configDir)
+	savedCfg, err := loadSavedConfig(configDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return llm.Config{}, "", fmt.Errorf("loading saved config: %w", err)
+	}
 
 	provider := strings.ToLower(strings.TrimSpace(os.Getenv("NABD_PROVIDER")))
 	if provider == "" {
@@ -316,15 +323,14 @@ func LoadEffectiveConfig(configDir string) (llm.Config, string, error) {
 			keySource = "env_file"
 		} else {
 			savedKeyPath := filepath.Join(configDir, "gemini_api_key")
-			if _, err := os.Lstat(savedKeyPath); err == nil {
-				k, err := readSavedKey(savedKeyPath)
-				if err != nil {
+			k, err := readSavedKey(savedKeyPath)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
 					return llm.Config{}, "", fmt.Errorf("reading saved gemini_api_key: %w", err)
 				}
-				if k != "" {
-					apiKey = k
-					keySource = "saved"
-				}
+			} else if k != "" {
+				apiKey = k
+				keySource = "saved"
 			}
 		}
 	} else {
@@ -345,15 +351,14 @@ func LoadEffectiveConfig(configDir string) (llm.Config, string, error) {
 			keySource = "env_file"
 		} else {
 			savedKeyPath := filepath.Join(configDir, "api_key")
-			if _, err := os.Lstat(savedKeyPath); err == nil {
-				k, err := readSavedKey(savedKeyPath)
-				if err != nil {
+			k, err := readSavedKey(savedKeyPath)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
 					return llm.Config{}, "", fmt.Errorf("reading saved api_key: %w", err)
 				}
-				if k != "" {
-					apiKey = k
-					keySource = "saved"
-				}
+			} else if k != "" {
+				apiKey = k
+				keySource = "saved"
 			}
 		}
 	}

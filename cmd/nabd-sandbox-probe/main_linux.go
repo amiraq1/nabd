@@ -9,10 +9,8 @@ package main
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -29,10 +27,13 @@ func main() {
 	if err := os.WriteFile("/workspace/must-not-exist", []byte("x"), 0o600); err == nil {
 		fail("workspace was writable in a read-only profile")
 	}
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:9", 500*time.Millisecond)
-	if err == nil {
-		_ = conn.Close()
-		fail("network namespace did not block loopback connections")
+	if err := verifyNetIsolation(
+		os.Getenv("EXPECT_BLOCKED_ADDR"),
+		os.Getenv("EXPECT_HOST_NETNS"),
+		func() (string, error) { return os.Readlink("/proc/self/ns/net") },
+		snapshotSystemInterfaces,
+	); err != nil {
+		fail("%v", err)
 	}
 	expectMem, err := strconv.ParseUint(os.Getenv("EXPECT_MEM"), 10, 64)
 	if err != nil {

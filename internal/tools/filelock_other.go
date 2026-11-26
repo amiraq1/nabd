@@ -2,11 +2,14 @@
 
 package tools
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 type processLock struct{}
 
-func acquireProcessLock(string) (*processLock, error) {
+func acquireProcessLock(*os.Root) (*processLock, error) {
 	return nil, fmt.Errorf("cross-process edit locking is unsupported on this platform")
 }
 

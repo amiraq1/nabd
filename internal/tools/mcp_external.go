@@ -128,9 +128,15 @@ func callExternalMCPServer(ctx context.Context, dir string, b sandbox.Backend, s
 		outer = server.Config.UserGuard
 		targetArgs = append([]string{guard}, append(targetArgs, server.Config.UserGuardArgs...)...)
 	}
+	maskedDirs, maskedFiles, err := collectSensitiveWorkspaceMasks(dir)
+	if err != nil {
+		return "", err
+	}
 	profile := sandbox.Profile{
 		WorkDir:            dir,
 		WritableWorkspace:  false,
+		MaskedDirs:         maskedDirs,
+		MaskedFiles:        maskedFiles,
 		Env:                MCPEnvironment(server.Config),
 		MemoryLimitBytes:   sandbox.DefaultMemoryLimit(),
 		ProcessLimit:       32,

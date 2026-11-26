@@ -615,25 +615,36 @@ type webFetchArgs struct {
 	URL string `json:"url"`
 }
 
+// CanonicalWebFetchURL validates rawArgs for web_fetch with strict JSON
+// decoding and external HTTPS rules, returning the canonical URL string,
+// parsed URL, and canonical approval identity digest.
+func CanonicalWebFetchURL(rawArgs json.RawMessage) (canonicalURL string, parsed *url.URL, identity string, err error) {
+	var p webFetchArgs
+	if err := decodeStrictJSONObject(rawArgs, &p); err != nil {
+		return "", nil, "", fmt.Errorf("invalid web_fetch arguments: %w", err)
+	}
+	targetURL, err := validateExternalURL(p.URL)
+	if err != nil {
+		return "", nil, "", err
+	}
+	canonical := targetURL.String()
+	return canonical, targetURL, "webfetch:sha256:" + hashBytes([]byte(canonical)), nil
+}
+
 func (r *Registry) executeWebFetch(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 	if r.webConfig == nil {
 		return "", errors.New("web_fetch is disabled")
 	}
 
-	var p webFetchArgs
-	if err := decodeStrictJSONObject(rawArgs, &p); err != nil {
-		return "", fmt.Errorf("invalid web_fetch arguments: %w", err)
-	}
-
 	cfg := r.webConfig
 	secretKey := cfg.APIKey.raw()
 
-	targetURL, err := validateExternalURL(p.URL)
+	canonicalURL, targetURL, _, err := CanonicalWebFetchURL(rawArgs)
 	if err != nil {
 		return "", sanitizeNetworkError(err, secretKey)
 	}
 
-	safeDisplayURL := redactURLWithoutQuery(targetURL.String())
+	safeDisplayURL := redactURLWithoutQuery(canonicalURL)
 
 	if cfg.Provider == "firecrawl" {
 		reqCtx, cancel := context.WithTimeout(ctx, webFirecrawlScrapeTimeout)
