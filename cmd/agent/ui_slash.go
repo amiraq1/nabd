@@ -10,6 +10,8 @@ import (
 type slashCommand struct {
 	Name        string // without "/", e.g. "status"
 	Description string
+	IsProject   bool
+	Source      string
 }
 
 // slashCommands is the single source of truth for both the interactive palette and /help.
@@ -46,30 +48,40 @@ var slashCommands = []slashCommand{
 
 // slashPalette tracks the interactive state of the command palette.
 type slashPalette struct {
-	open           bool
-	selectedIndex  int
-	filtered       []slashCommand
-	dismissedInput string // input text when user explicitly pressed Esc
+	open            bool
+	selectedIndex   int
+	filtered        []slashCommand
+	dismissedInput  string // input text when user explicitly pressed Esc
+	projectCommands []slashCommand
 }
 
-// filterSlashCommands performs pure, case-insensitive filtering on commands.
+func (p *slashPalette) setProjectCommands(cmds []slashCommand) {
+	p.projectCommands = append([]slashCommand(nil), cmds...)
+}
+
+// filterSlashCommands performs pure, case-insensitive filtering on built-in commands.
 // Prefix matches appear first, followed by substring matches, preserving definition order (stable).
 // It also preserves the previous selected command if it remains in the results.
 func filterSlashCommands(query string, prevSelected string) ([]slashCommand, int) {
+	return filterSlashCommandsWithExtras(query, prevSelected, nil)
+}
+
+func filterSlashCommandsWithExtras(query string, prevSelected string, extras []slashCommand) ([]slashCommand, int) {
 	q := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(query)), "/")
 	if q == "" {
-		// Empty query after "/" returns all commands
+		// Empty query after "/" returns built-ins first, then project commands
+		res := make([]slashCommand, 0, len(slashCommands)+len(extras))
+		res = append(res, slashCommands...)
+		res = append(res, extras...)
 		idx := 0
 		if prevSelected != "" {
-			for i, cmd := range slashCommands {
+			for i, cmd := range res {
 				if cmd.Name == prevSelected {
 					idx = i
 					break
 				}
 			}
 		}
-		res := make([]slashCommand, len(slashCommands))
-		copy(res, slashCommands)
 		return res, idx
 	}
 
@@ -77,6 +89,14 @@ func filterSlashCommands(query string, prevSelected string) ([]slashCommand, int
 	var substringMatches []slashCommand
 
 	for _, cmd := range slashCommands {
+		lowerName := strings.ToLower(cmd.Name)
+		if strings.HasPrefix(lowerName, q) {
+			prefixMatches = append(prefixMatches, cmd)
+		} else if strings.Contains(lowerName, q) {
+			substringMatches = append(substringMatches, cmd)
+		}
+	}
+	for _, cmd := range extras {
 		lowerName := strings.ToLower(cmd.Name)
 		if strings.HasPrefix(lowerName, q) {
 			prefixMatches = append(prefixMatches, cmd)
@@ -104,8 +124,12 @@ func filterSlashCommands(query string, prevSelected string) ([]slashCommand, int
 	return result, idx
 }
 
-// shouldOpenPalette evaluates whether the command palette should open.
+// shouldOpenPalette evaluates whether the command palette should open for built-in commands.
 func shouldOpenPalette(input string, busy bool, awaitingApproval bool, pendingDisclosure bool, dismissedInput string) bool {
+	return shouldOpenPaletteWithExtras(input, busy, awaitingApproval, pendingDisclosure, dismissedInput, nil)
+}
+
+func shouldOpenPaletteWithExtras(input string, busy bool, awaitingApproval bool, pendingDisclosure bool, dismissedInput string, extras []slashCommand) bool {
 	if busy || awaitingApproval || pendingDisclosure {
 		return false
 	}
@@ -118,7 +142,7 @@ func shouldOpenPalette(input string, busy bool, awaitingApproval bool, pendingDi
 		return false
 	}
 	// Must have at least one match
-	filtered, _ := filterSlashCommands(input, "")
+	filtered, _ := filterSlashCommandsWithExtras(input, "", extras)
 	return len(filtered) > 0
 }
 
@@ -128,7 +152,7 @@ func (p *slashPalette) updatePalette(input string, busy bool, awaitingApproval b
 		p.dismissedInput = ""
 	}
 
-	if !shouldOpenPalette(input, busy, awaitingApproval, pendingDisclosure, p.dismissedInput) {
+	if !shouldOpenPaletteWithExtras(input, busy, awaitingApproval, pendingDisclosure, p.dismissedInput, p.projectCommands) {
 		p.open = false
 		p.filtered = nil
 		p.selectedIndex = 0
@@ -140,7 +164,7 @@ func (p *slashPalette) updatePalette(input string, busy bool, awaitingApproval b
 		prevName = p.filtered[p.selectedIndex].Name
 	}
 
-	filtered, selIdx := filterSlashCommands(input, prevName)
+	filtered, selIdx := filterSlashCommandsWithExtras(input, prevName, p.projectCommands)
 	if len(filtered) == 0 {
 		p.open = false
 		p.filtered = nil
@@ -243,6 +267,10 @@ func renderSlashPalette(p *slashPalette, width int, maxRows int) string {
 
 		if width >= 45 && availDesc > 5 {
 			desc := cmd.Description
+			if cmd.IsProject {
+				desc = "[project] " + desc
+			}
+			desc = sanitizeForDisplay(desc)
 			if lipgloss.Width(desc) > availDesc {
 				desc = truncateEnd(desc, availDesc)
 			}
