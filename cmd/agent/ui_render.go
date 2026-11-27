@@ -307,7 +307,7 @@ func renderFooter(m *uiModel, width int) string {
 	if m.pendingDisclosure != nil {
 		var hintPart string
 		check := activeCheckGlyph()
-		if m.viewport.AtBottom() {
+		if m.disclosureAtBottom() {
 			if width >= 44 {
 				hintPart = renderStyledSpan(scrollBottomReadyStyle, "At Bottom "+check+" (Press Y to send / N to reject)")
 			} else {

@@ -762,3 +762,390 @@ func TestTUIPolishTextPreviews(t *testing.T) {
 		t.Logf("=== EXPANDED %d COLS (ASCII) ===\n%s\n%s", w, stripTestANSI(renderMessages(sampleMsgs, w, true)), previewFooter(w, true))
 	}
 }
+
+func makeScrollableTestModel(t *testing.T, totalLines, vpHeight int) (uiModel, int) {
+	t.Helper()
+	dir := t.TempDir()
+	reg, err := tools.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	m := initialModel(reg, &mockClient{})
+	m.viewport.Width = 60
+	m.viewport.Height = vpHeight
+	lines := make([]string, totalLines)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line-%02d", i+1)
+	}
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+	m.viewport.GotoTop()
+	maxOffset := max(0, totalLines-vpHeight)
+	return m, maxOffset
+}
+
+func TestMouseWheelScrollingAndBounds(t *testing.T) {
+	cases := []struct {
+		name        string
+		startOffset int
+		events      []tea.MouseMsg
+		wantYOffset int
+	}{
+		{
+			name:        "wheel_down_moves_3_lines",
+			startOffset: 10,
+			events: []tea.MouseMsg{
+				{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown},
+			},
+			wantYOffset: 13,
+		},
+		{
+			name:        "wheel_up_moves_3_lines",
+			startOffset: 10,
+			events: []tea.MouseMsg{
+				{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp},
+			},
+			wantYOffset: 7,
+		},
+		{
+			name:        "wheel_up_clamps_at_zero_with_less_than_3_lines_left",
+			startOffset: 2,
+			events: []tea.MouseMsg{
+				{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp},
+				{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp},
+			},
+			wantYOffset: 0,
+		},
+		{
+			name:        "wheel_down_clamps_at_max_with_less_than_3_lines_left",
+			startOffset: 48, // maxOffset is 50 (60 lines, height 10)
+			events: []tea.MouseMsg{
+				{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown},
+				{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown},
+			},
+			wantYOffset: 50,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, maxOff := makeScrollableTestModel(t, 60, 10)
+			if maxOff != 50 {
+				t.Fatalf("expected maxOffset 50, got %d", maxOff)
+			}
+			m.viewport.SetYOffset(tc.startOffset)
+			for _, ev := range tc.events {
+				upd, cmd := m.Update(ev)
+				if cmd != nil {
+					t.Fatalf("expected nil cmd on wheel event, got non-nil")
+				}
+				m = upd.(uiModel)
+			}
+			if m.viewport.YOffset != tc.wantYOffset {
+				t.Fatalf("YOffset = %d, want %d", m.viewport.YOffset, tc.wantYOffset)
+			}
+		})
+	}
+}
+
+func TestMouseWheelSingleEventNoDoubleScroll(t *testing.T) {
+	m, _ := makeScrollableTestModel(t, 60, 10)
+	if !m.viewport.MouseWheelEnabled {
+		t.Fatal("expected bubbles viewport default MouseWheelEnabled=true to ensure explicit handling avoids double scroll")
+	}
+	m.viewport.SetYOffset(15)
+
+	upd, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	if cmd != nil {
+		t.Fatal("expected nil cmd")
+	}
+	m = upd.(uiModel)
+	if m.viewport.YOffset != 18 {
+		t.Fatalf("single wheel down moved by %d lines (expected 3, no double scroll)", m.viewport.YOffset-15)
+	}
+
+	upd, cmd = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	if cmd != nil {
+		t.Fatal("expected nil cmd")
+	}
+	m = upd.(uiModel)
+	if m.viewport.YOffset != 15 {
+		t.Fatalf("single wheel up moved to %d (expected 15, no double scroll)", m.viewport.YOffset)
+	}
+}
+
+func TestMouseWheelPreservesInputCursorHistoryAndPalette(t *testing.T) {
+	m, _ := makeScrollableTestModel(t, 60, 10)
+	m.history = []string{"first command", "second command"}
+	m.historyIdx = 1
+	m.historyDraft = "draft text"
+	m.textArea.SetValue("line one\nline two")
+	m.textArea.CursorStart()
+	m.viewport.SetYOffset(10)
+
+	wantVal := m.textArea.Value()
+	wantLine := m.textArea.Line()
+	wantInfo := m.textArea.LineInfo()
+	wantHistIdx := m.historyIdx
+	wantHist := append([]string(nil), m.history...)
+
+	for _, ev := range []tea.MouseMsg{
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown},
+	} {
+		upd, cmd := m.Update(ev)
+		if cmd != nil {
+			t.Fatal("expected nil cmd")
+		}
+		m = upd.(uiModel)
+	}
+
+	if m.viewport.YOffset != 13 {
+		t.Fatalf("expected YOffset 13 after wheel sequence, got %d", m.viewport.YOffset)
+	}
+	if m.textArea.Value() != wantVal {
+		t.Fatalf("textArea value changed: %q -> %q", wantVal, m.textArea.Value())
+	}
+	if m.textArea.Line() != wantLine || m.textArea.LineInfo() != wantInfo {
+		t.Fatalf("cursor moved during mouse scroll: line %d->%d info %+v->%+v",
+			wantLine, m.textArea.Line(), wantInfo, m.textArea.LineInfo())
+	}
+	if m.historyIdx != wantHistIdx || !reflect.DeepEqual(m.history, wantHist) {
+		t.Fatalf("history mutated during mouse scroll: idx %d->%d hist %v->%v",
+			wantHistIdx, m.historyIdx, wantHist, m.history)
+	}
+
+	// Verify open slash palette selection & openness remain untouched during wheel scroll.
+	m.textArea.SetValue("/")
+	m.palette.updatePalette("/", false, false, false)
+	m.palette.navigateDown()
+	wantSelected := m.palette.selectedIndex
+	if !m.palette.open {
+		t.Fatal("expected palette to be open")
+	}
+	upd, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	if cmd != nil {
+		t.Fatal("expected nil cmd with open palette")
+	}
+	m = upd.(uiModel)
+	if !m.palette.open || m.palette.selectedIndex != wantSelected {
+		t.Fatalf("wheel scroll mutated open slash palette: open=%v sel=%d (want %d)",
+			m.palette.open, m.palette.selectedIndex, wantSelected)
+	}
+	if m.viewport.YOffset != 10 {
+		t.Fatalf("expected YOffset 10 after WheelUp with palette open, got %d", m.viewport.YOffset)
+	}
+}
+
+func TestMouseWheelDisclosureGateScrollAndAtBottom(t *testing.T) {
+	_, m := testModel(t)
+	m.viewport.Width = 40
+	m.viewport.Height = 5
+	m.messages = append(m.messages, Message{Role: "user", Content: "initial conversation"})
+	msgCountBefore := len(m.messages)
+
+	tc := testToolCall("read_file", `{"path":"long.txt"}`)
+	tc.ID = "disc_wheel_1"
+	m.pendingTools = []ToolCall{tc}
+	longOut := strings.Repeat("confidential-line-", 40)
+	upd, _ := m.Update(toolExecutedMsg{toolMsg: Message{Role: "tool", ToolCallID: tc.ID, Content: longOut}})
+	m = upd.(uiModel)
+	if m.pendingDisclosure == nil {
+		t.Fatal("expected pendingDisclosure")
+	}
+	if m.disclosureAtBottom() {
+		t.Fatal("expected long disclosure to start not at bottom")
+	}
+
+	// Partial wheel down must NOT mark at bottom, and pressing 'y' must still refuse.
+	upd, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	if cmd != nil {
+		t.Fatal("expected nil cmd")
+	}
+	m = upd.(uiModel)
+	if m.viewport.YOffset != 3 {
+		t.Fatalf("expected disclosure viewport YOffset=3, got %d", m.viewport.YOffset)
+	}
+	if m.disclosureAtBottom() {
+		t.Fatal("expected disclosure not at bottom after single 3-line scroll")
+	}
+	upd, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = upd.(uiModel)
+	if m.pendingDisclosure == nil || m.status != "Scroll to the end before approving disclosure" {
+		t.Fatalf("expected approval blocked before bottom, got disclosure=%v status=%q", m.pendingDisclosure, m.status)
+	}
+
+	// Scroll to bottom via wheel: updates at-bottom status, does NOT auto-approve.
+	for i := 0; i < 40 && !m.disclosureAtBottom(); i++ {
+		upd, cmd = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+		if cmd != nil {
+			t.Fatal("expected nil cmd")
+		}
+		m = upd.(uiModel)
+	}
+	if !m.disclosureAtBottom() {
+		t.Fatal("expected wheel down to reach bottom of disclosure")
+	}
+	if m.pendingDisclosure == nil {
+		t.Fatal("wheel scroll must NEVER auto-approve disclosure")
+	}
+	if m.status == "Scroll to the end before approving disclosure" {
+		t.Fatalf("expected status reminder cleared after reaching bottom via wheel, got %q", m.status)
+	}
+	if !strings.Contains(stripTestANSI(renderFooter(&m, 60)), "At Bottom") {
+		t.Fatalf("expected footer to show At Bottom after wheel scroll:\n%s", renderFooter(&m, 60))
+	}
+	if len(m.messages) != msgCountBefore {
+		t.Fatalf("conversation history mutated during disclosure scroll: %d -> %d", msgCountBefore, len(m.messages))
+	}
+
+	// Wheel up leaves bottom again -> 'y' refuses; scrolling back down allows 'y'.
+	upd, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	m = upd.(uiModel)
+	if m.disclosureAtBottom() {
+		t.Fatal("expected WheelUp to move away from bottom")
+	}
+	upd, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = upd.(uiModel)
+	if m.pendingDisclosure == nil {
+		t.Fatal("expected 'y' to refuse after scrolling up away from bottom")
+	}
+
+	upd, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	m = upd.(uiModel)
+	if !m.disclosureAtBottom() {
+		t.Fatal("expected WheelDown back to bottom")
+	}
+	upd, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = upd.(uiModel)
+	if m.pendingDisclosure != nil || len(m.messages) != msgCountBefore+1 {
+		t.Fatalf("expected explicit 'y' at bottom to disclose payload cleanly")
+	}
+}
+
+func TestMouseWheelDuringApprovalPreviewDoesNotApproveOrReject(t *testing.T) {
+	m, _ := makeScrollableTestModel(t, 40, 10)
+	tc := makeTestToolCall("app_1", "edit_file", `{"path":"a.go","old_text":"x","new_text":"y"}`)
+	m.pendingTools = []ToolCall{tc}
+	m.awaitingApproval = true
+	m.approval = approvalPreview{Summary: "path: a.go\n-x\n+y"}
+	m.status = "Approval required [y/n]"
+	m.viewport.SetYOffset(12)
+	msgCount := len(m.messages)
+
+	// Approval preview has no independent viewport; m.viewport scrolls conversation
+	// safely while approval state remains completely intact.
+	for _, btn := range []tea.MouseButton{tea.MouseButtonWheelUp, tea.MouseButtonWheelDown, tea.MouseButtonWheelDown} {
+		upd, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: btn})
+		if cmd != nil {
+			t.Fatal("expected nil cmd during approval preview mouse event")
+		}
+		m = upd.(uiModel)
+	}
+	if m.viewport.YOffset != 15 {
+		t.Fatalf("expected conversation YOffset=15, got %d", m.viewport.YOffset)
+	}
+	if !m.awaitingApproval || len(m.pendingTools) != 1 || m.status != "Approval required [y/n]" || len(m.messages) != msgCount {
+		t.Fatalf("mouse event altered approval state: awaiting=%v pending=%d status=%q msgs=%d",
+			m.awaitingApproval, len(m.pendingTools), m.status, len(m.messages))
+	}
+}
+
+func TestNonWheelMouseEventsIgnored(t *testing.T) {
+	m, _ := makeScrollableTestModel(t, 60, 10)
+	m.viewport.SetYOffset(10)
+	m.history = []string{"cmd1"}
+	m.historyIdx = 0
+	m.textArea.SetValue("keep me")
+	m.textArea.CursorEnd()
+	tc := testToolCall("read_file", `{"path":"x"}`)
+	m.pendingTools = []ToolCall{tc}
+	m.pendingDisclosure = &Message{Role: "tool", ToolCallID: tc.ID, Content: "x"}
+	m.awaitingApproval = true
+
+	wantVal := m.textArea.Value()
+	wantLine := m.textArea.Line()
+	wantInfo := m.textArea.LineInfo()
+	wantHistIdx := m.historyIdx
+	wantHist := append([]string(nil), m.history...)
+	wantAtBottom := m.disclosureAtBottom()
+
+	ignored := []tea.MouseMsg{
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 5, Y: 5},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonMiddle, X: 5, Y: 5},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonRight, X: 5, Y: 5},
+		{Action: tea.MouseActionRelease, Button: tea.MouseButtonNone, X: 5, Y: 5},
+		{Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft, X: 6, Y: 7},
+		{Action: tea.MouseActionMotion, Button: tea.MouseButtonNone, X: 8, Y: 9},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelLeft},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelRight},
+		{Action: tea.MouseActionRelease, Button: tea.MouseButtonWheelUp},
+		{Action: tea.MouseActionMotion, Button: tea.MouseButtonWheelDown},
+	}
+
+	for i, ev := range ignored {
+		upd, cmd := m.Update(ev)
+		if cmd != nil {
+			t.Fatalf("case %d (%+v): expected nil cmd, got non-nil", i, ev)
+		}
+		got := upd.(uiModel)
+		if got.viewport.YOffset != 10 {
+			t.Fatalf("case %d (%+v): YOffset changed to %d", i, ev, got.viewport.YOffset)
+		}
+		if got.textArea.Value() != wantVal || got.textArea.Line() != wantLine || got.textArea.LineInfo() != wantInfo {
+			t.Fatalf("case %d (%+v): input/cursor mutated", i, ev)
+		}
+		if got.historyIdx != wantHistIdx || !reflect.DeepEqual(got.history, wantHist) {
+			t.Fatalf("case %d (%+v): history mutated", i, ev)
+		}
+		if got.disclosureAtBottom() != wantAtBottom || got.pendingDisclosure == nil || !got.awaitingApproval {
+			t.Fatalf("case %d (%+v): security gate state mutated", i, ev)
+		}
+	}
+}
+
+func TestMouseTrackingEnvOption(t *testing.T) {
+	cases := []struct {
+		name        string
+		setEnv      bool
+		val         string
+		wantEnabled bool
+		wantOpts    int
+	}{
+		{name: "unset_enables_mouse", setEnv: false, wantEnabled: true, wantOpts: 3},
+		{name: "empty_enables_mouse", setEnv: true, val: "", wantEnabled: true, wantOpts: 3},
+		{name: "zero_enables_mouse", setEnv: true, val: "0", wantEnabled: true, wantOpts: 3},
+		{name: "true_enables_mouse", setEnv: true, val: "true", wantEnabled: true, wantOpts: 3},
+		{name: "yes_enables_mouse", setEnv: true, val: "yes", wantEnabled: true, wantOpts: 3},
+		{name: "one_disables_mouse", setEnv: true, val: "1", wantEnabled: false, wantOpts: 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.setEnv {
+				t.Setenv(disableMouseEnv, tc.val)
+			} else {
+				// Ensure unset even if host shell exported it.
+				prev, had := os.LookupEnv(disableMouseEnv)
+				_ = os.Unsetenv(disableMouseEnv)
+				t.Cleanup(func() {
+					if had {
+						_ = os.Setenv(disableMouseEnv, prev)
+					} else {
+						_ = os.Unsetenv(disableMouseEnv)
+					}
+				})
+			}
+
+			if got := mouseTrackingEnabled(os.Getenv); got != tc.wantEnabled {
+				t.Fatalf("mouseTrackingEnabled = %v, want %v", got, tc.wantEnabled)
+			}
+			opts := programOptions(os.Stdout, os.Getenv)
+			if len(opts) != tc.wantOpts {
+				t.Fatalf("len(programOptions) = %d, want %d", len(opts), tc.wantOpts)
+			}
+		})
+	}
+}
