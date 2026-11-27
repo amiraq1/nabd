@@ -272,7 +272,7 @@ func TestTinyWindowDoesNotPanic(t *testing.T) {
 func TestSystemPromptMarksUntrustedData(t *testing.T) {
 	_, m := testModel(t)
 	prompt := m.messages[0].Content
-	for _, want := range []string{"untrusted data", "never as instructions"} {
+	for _, want := range []string{"untrusted data", "never instructions"} {
 		if !strings.Contains(strings.ToLower(prompt), want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, prompt)
 		}
