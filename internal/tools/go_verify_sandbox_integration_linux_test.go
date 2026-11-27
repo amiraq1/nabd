@@ -193,10 +193,17 @@ func TestGoVerifySandboxHidesWorkspaceSecrets(t *testing.T) {
 	r, workspace := sandboxGoVerifySetup(t)
 
 	fixtures := map[string]string{
-		".git/config":     "[core]\n\trepositoryformatversion = 0\n# " + sandboxFixtureMarker + "\n",
-		".nabd/audit.log": `{"event":"requested","marker":"` + sandboxFixtureMarker + `"}` + "\n",
-		".env":            "NABD_API_KEY=" + sandboxFixtureMarker + "\n",
-		"secret.key":      sandboxFixtureMarker + "\n",
+		".git/config": "[core]\n\trepositoryformatversion = 0\n# " + sandboxFixtureMarker + "\n",
+		".env":        "NABD_API_KEY=" + sandboxFixtureMarker + "\n",
+		"secret.key":  sandboxFixtureMarker + "\n",
+	}
+	// The live audit log is append-only: overwriting it with a fixture would be
+	// a truncation of a log this Registry holds open, which Write now rejects.
+	// Capture it instead and prove the approved run only appends.
+	auditPath := filepath.Join(workspace, ".nabd", "audit.log")
+	auditBefore, auditBeforeErr := os.ReadFile(auditPath)
+	if auditBeforeErr != nil && !os.IsNotExist(auditBeforeErr) {
+		t.Fatal(auditBeforeErr)
 	}
 	before := make(map[string]string, len(fixtures))
 	for rel, content := range fixtures {
@@ -267,19 +274,6 @@ func TestGoVerifySandboxHidesWorkspaceSecrets(t *testing.T) {
 
 	for rel, sum := range before {
 		path := filepath.Join(workspace, filepath.FromSlash(rel))
-		if rel == ".nabd/audit.log" {
-			// The host audit log is append-only by design: the approved run
-			// records itself there, so only its original prefix must survive.
-			data, readErr := os.ReadFile(path)
-			if readErr != nil {
-				t.Errorf("%s: %v", rel, readErr)
-				continue
-			}
-			if !bytes.HasPrefix(data, []byte(fixtures[rel])) {
-				t.Errorf("%s lost its original prefix on the host", rel)
-			}
-			continue
-		}
 		got, err := sha256File(path)
 		if err != nil {
 			t.Errorf("%s: %v", rel, err)
@@ -287,6 +281,17 @@ func TestGoVerifySandboxHidesWorkspaceSecrets(t *testing.T) {
 		}
 		if got != sum {
 			t.Errorf("%s changed on the host during sandboxed verification", rel)
+		}
+	}
+	auditAfter, readErr := os.ReadFile(auditPath)
+	if readErr != nil {
+		t.Errorf(".nabd/audit.log: %v", readErr)
+	} else {
+		if len(auditBefore) > 0 && !bytes.HasPrefix(auditAfter, auditBefore) {
+			t.Errorf(".nabd/audit.log lost its original prefix on the host")
+		}
+		if len(auditAfter) <= len(auditBefore) {
+			t.Errorf(".nabd/audit.log did not record the approved run (before=%d after=%d bytes)", len(auditBefore), len(auditAfter))
 		}
 	}
 

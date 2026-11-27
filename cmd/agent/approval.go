@@ -121,30 +121,21 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 		return approvalPreview{Summary: clip(sanitizeForDisplay(summary), maxApprovalChars)}
 
 	case "web_search":
-		var p struct {
-			Query      string `json:"query"`
-			MaxResults *int   `json:"max_results"`
+		query, maxRes, id, err := reg.CanonicalWebSearch(json.RawMessage(tc.Function.Arguments))
+		if err != nil {
+			return approvalPreview{Summary: "web_search: " + sanitizeForDisplay(err.Error())}
 		}
-		_ = json.Unmarshal([]byte(tc.Function.Arguments), &p)
-		provider := "disabled"
-		destHost := "(unknown)"
+		provider, destHost := "disabled", "(unknown)"
 		if reg != nil {
 			provider = reg.WebSearchProvider()
 			if h := reg.WebSearchDestinationHost(); h != "" {
 				destHost = h
 			}
 		}
-		maxRes := 5
-		if p.MaxResults != nil {
-			maxRes = *p.MaxResults
+		return approvalPreview{
+			Summary:        formatWebSearchApprovalSummary(query, maxRes, provider, destHost),
+			IdentitySHA256: id,
 		}
-		var b strings.Builder
-		fmt.Fprintf(&b, "outbound network request: web search via %s\n", sanitizeForDisplay(provider))
-		fmt.Fprintf(&b, "destination: %s\n", sanitizeForDisplay(destHost))
-		b.WriteString("warning: search query leaves your machine to the external search provider; ensure no secrets are included\n")
-		fmt.Fprintf(&b, "query (%d bytes): %s\n", len(p.Query), sanitizeForDisplay(p.Query))
-		fmt.Fprintf(&b, "max_results: %d", maxRes)
-		return approvalPreview{Summary: clip(sanitizeForDisplay(b.String()), maxApprovalChars)}
 
 	case "web_fetch":
 		canonicalURL, u, id, urlErr := tools.CanonicalWebFetchURL(json.RawMessage(tc.Function.Arguments))
@@ -198,6 +189,37 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 				return approvalPreview{}, fmt.Errorf("command cannot be fully displayed for approval")
 			}
 		}
+		if tc.Function.Name == "web_search" {
+			query, maxRes, id, err := reg.CanonicalWebSearch(json.RawMessage(raw))
+			if err != nil {
+				return approvalPreview{}, err
+			}
+			// Check the decoded query, not the raw JSON: \u200b / \u202E escapes
+			// decode into characters that would be hidden or reordered on screen.
+			if sanitizeForDisplay(query) != query {
+				return approvalPreview{}, fmt.Errorf("web_search query contains control, bidirectional or invisible characters that cannot be displayed faithfully; rewrite it in plain text")
+			}
+			wrapped := wrapApprovalText(query, webSearchApprovalWrapWidth)
+			if len(wrapped) > webSearchApprovalMaxLines {
+				return approvalPreview{}, fmt.Errorf("web_search query is too long to display in full for approval (%d wrapped lines, limit %d); shorten it and retry", len(wrapped), webSearchApprovalMaxLines)
+			}
+			provider, destHost := "disabled", "(unknown)"
+			if reg != nil {
+				provider = reg.WebSearchProvider()
+				if h := reg.WebSearchDestinationHost(); h != "" {
+					destHost = h
+				}
+			}
+			fullSummary := formatWebSearchApprovalSummary(query, maxRes, provider, destHost)
+			if sanitizeForDisplay(fullSummary) != fullSummary {
+				return approvalPreview{}, fmt.Errorf("web_search approval preview contains undisplayable control characters")
+			}
+			if len(fullSummary) > maxApprovalArgs {
+				return approvalPreview{}, fmt.Errorf("web_search approval preview exceeds the %d-byte limit; shorten the query", maxApprovalArgs)
+			}
+			p.Summary = fullSummary
+			p.IdentitySHA256 = id
+		}
 		if tc.Function.Name == "web_fetch" {
 			canonicalURL, u, id, urlErr := tools.CanonicalWebFetchURL(json.RawMessage(raw))
 			if urlErr != nil {
@@ -226,6 +248,46 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 		return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; split the request", maxApprovalArgs)
 	}
 	return p, nil
+}
+
+const (
+	webSearchApprovalWrapWidth = 72
+	webSearchApprovalMaxLines  = 12
+)
+
+// formatWebSearchApprovalSummary renders every byte of the canonical query in
+// a bounded, explicitly wrapped form. It never clips: callers reject a query
+// that would exceed the display bound instead of showing a shortened one.
+func formatWebSearchApprovalSummary(query string, maxResults int, provider, destHost string) string {
+	wrapped := wrapApprovalText(query, webSearchApprovalWrapWidth)
+	var b strings.Builder
+	fmt.Fprintf(&b, "outbound network request: web search via %s\n", sanitizeForDisplay(provider))
+	fmt.Fprintf(&b, "destination: %s\n", sanitizeForDisplay(destHost))
+	fmt.Fprintf(&b, "max_results: %d\n", maxResults)
+	fmt.Fprintf(&b, "query (%d bytes, %d characters, %d wrapped lines):\n", len(query), utf8.RuneCountInString(query), len(wrapped))
+	for _, line := range wrapped {
+		b.WriteString("query: ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("warning: the search query leaves your machine to the external search provider; verify it before approving")
+	return b.String()
+}
+
+func wrapApprovalText(text string, width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return []string{""}
+	}
+	lines := make([]string, 0, len(runes)/width+1)
+	for len(runes) > width {
+		lines = append(lines, string(runes[:width]))
+		runes = runes[width:]
+	}
+	return append(lines, string(runes))
 }
 
 func formatWebFetchApprovalSummary(reg *tools.Registry, u *url.URL, canonicalURL string, urlErr error) string {

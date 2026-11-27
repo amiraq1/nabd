@@ -450,7 +450,8 @@ func renderApprovalSummary(summary string, width int) string {
 			strings.HasPrefix(line, "command:") || strings.HasPrefix(line, "tool:") ||
 			strings.HasPrefix(line, "destination:") || strings.HasPrefix(line, "firecrawl_endpoint:") ||
 			strings.HasPrefix(line, "delegation_limit:") || strings.HasPrefix(line, "query_string:") ||
-			strings.HasPrefix(line, "max_results:"):
+			strings.HasPrefix(line, "max_results:") || strings.HasPrefix(line, "query (") ||
+			strings.HasPrefix(line, "query:"):
 			b.WriteString(diffInfoStyle.Render(line))
 		default:
 			b.WriteString(line)

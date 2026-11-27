@@ -21,6 +21,7 @@ import (
 
 const (
 	baseDir          = ".nabd/shadow"
+	parentDir        = ".nabd"
 	metaSuffix       = ".json"
 	backupExt        = ".bak"
 	metaTmpPrefix    = ".tmp-"
@@ -39,6 +40,11 @@ const (
 
 // ErrNotFound reports that no usable shadow entry exists for the request.
 var ErrNotFound = errors.New("no shadow entry found")
+
+// ErrDirSyncUnsupported reports that the platform cannot fsync a directory.
+// It is never surfaced to callers on Unix; on such platforms the store records
+// a documented durability limitation instead of claiming the rename was synced.
+var ErrDirSyncUnsupported = errors.New("shadow: directory sync is unsupported on this platform")
 
 // Entry describes one pre-edit backup.
 type Entry struct {
@@ -60,9 +66,11 @@ type Store struct {
 	now           func() time.Time
 	retention     *retentionState
 	retentionDone chan struct{}
-	// removeFile is a test seam for injecting deletion failures. Production
-	// leaves it nil so removals go straight to the confined root.
+	// removeFile and syncDir are test seams. Production leaves removeFile nil
+	// and uses the platform directory sync; per-store fields keep tests free of
+	// the data races a package-level hook would introduce.
 	removeFile func(name string) error
+	syncDir    func(*os.File) error
 	cleanup    cleanupState
 }
 
@@ -98,7 +106,7 @@ func Open(root *os.Root) (*Store, error) {
 	if root == nil {
 		return nil, errors.New("shadow: nil root")
 	}
-	return &Store{root: root, now: time.Now}, nil
+	return &Store{root: root, now: time.Now, syncDir: syncDirectory}, nil
 }
 
 // StartRetention runs cleanup immediately and then on the supplied interval.
@@ -187,6 +195,9 @@ func (s *Store) Cleanup(now time.Time) error {
 // cleanupLocked runs one sweep and records its outcome.
 func (s *Store) cleanupLocked(now time.Time) error {
 	err := s.pruneLocked(now)
+	if syncErr := s.syncStoreDirLocked(); syncErr != nil {
+		err = errors.Join(err, syncErr)
+	}
 	s.cleanup.at = now
 	if err != nil {
 		s.cleanup.err = err
@@ -228,8 +239,14 @@ func (s *Store) Backup(relPath string, original []byte, mode os.FileMode, update
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.root.MkdirAll(baseDir, 0o700); err != nil {
-		return Entry{}, fmt.Errorf("shadow: create directory: %w", err)
+	created, err := s.ensureStoreDirLocked()
+	if err != nil {
+		return Entry{}, err
+	}
+	if created {
+		if syncErr := s.syncParentDirLocked(); syncErr != nil {
+			return Entry{}, syncErr
+		}
 	}
 
 	now := s.now().UTC()
@@ -269,6 +286,12 @@ func (s *Store) Backup(relPath string, original []byte, mode os.FileMode, update
 	if err := s.writeNewLocked(backupName(entry.ID), original); err != nil {
 		_ = s.root.Remove(backupName(entry.ID))
 		return Entry{}, fmt.Errorf("shadow: write backup: %w", err)
+	}
+	// The data file and its directory entry must be durable before metadata can
+	// advertise it, so a crash can never leave a "healthy" entry whose bytes
+	// were lost.
+	if err := s.syncStoreDirLocked(); err != nil {
+		return Entry{}, err
 	}
 	if err := s.writeMetaLocked(entry); err != nil {
 		_ = s.root.Remove(backupName(entry.ID))
@@ -361,7 +384,9 @@ func (s *Store) writeMetaLocked(entry Entry) error {
 		_ = s.root.Remove(tmp)
 		return fmt.Errorf("shadow: replace metadata: %w", err)
 	}
-	return nil
+	// Sync the directory so the rename (the commit point that makes the entry
+	// visible) survives a crash before Backup reports success.
+	return s.syncStoreDirLocked()
 }
 
 func (s *Store) writeNewLocked(name string, data []byte) error {
@@ -656,6 +681,60 @@ func (s *Store) listStoreFilesLocked() ([]storeFile, error) {
 		}
 	}
 	return files, nil
+}
+
+// DirectorySyncSupported reports whether this platform can fsync the shadow
+// store directory. When false, /status warns that the newest backup is not
+// guaranteed to survive a sudden power loss.
+func (s *Store) DirectorySyncSupported() bool {
+	return directorySyncSupported
+}
+
+func (s *Store) directorySync() func(*os.File) error {
+	if s != nil && s.syncDir != nil {
+		return s.syncDir
+	}
+	return syncDirectory
+}
+
+// ensureStoreDirLocked creates the store directory when missing and reports
+// whether it had to create it (so the parent directory can be synced too).
+func (s *Store) ensureStoreDirLocked() (bool, error) {
+	if _, err := s.root.Lstat(baseDir); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("shadow: inspect directory: %w", err)
+	}
+	if err := s.root.MkdirAll(baseDir, 0o700); err != nil {
+		return false, fmt.Errorf("shadow: create directory: %w", err)
+	}
+	return true, nil
+}
+
+// syncStoreDirLocked syncs the store directory after a create, rename or
+// removal. Platform limitation is reported through DirectorySyncSupported and
+// deliberately does not fail writes on platforms without directory fsync.
+func (s *Store) syncStoreDirLocked() error { return s.syncNamedDirLocked(baseDir) }
+
+// syncParentDirLocked syncs .nabd after creating the store directory.
+func (s *Store) syncParentDirLocked() error { return s.syncNamedDirLocked(parentDir) }
+
+func (s *Store) syncNamedDirLocked(name string) error {
+	f, err := s.root.Open(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("shadow: open %s for sync: %w", name, err)
+	}
+	defer f.Close()
+	if err := s.directorySync()(f); err != nil {
+		if errors.Is(err, ErrDirSyncUnsupported) {
+			return nil
+		}
+		return fmt.Errorf("shadow: sync %s directory: %w", name, err)
+	}
+	return nil
 }
 
 // removeLocked deletes one store entry, going through the test seam when set.

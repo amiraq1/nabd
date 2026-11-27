@@ -148,7 +148,7 @@ func TestWebToolsAutoApproveAllBehaviorAndFailClosedDisplay(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reg.Close() })
 
-	// AutoApproveAll bypasses manual prompt per policy, while preserving fail-closed display checks
+	// web_search requires a human decision even in AutoApproveAll mode.
 	mAll := initialModel(reg, &mockClient{}, AutoApproveAll)
 	mAll.pendingTools = []ToolCall{{
 		ID: "call-all-1",
@@ -162,16 +162,11 @@ func TestWebToolsAutoApproveAllBehaviorAndFailClosedDisplay(t *testing.T) {
 	}}
 	nextM, cmd := mAll.advance()
 	uiAll := nextM.(uiModel)
-	if uiAll.awaitingApproval || cmd == nil {
-		t.Fatal("expected AutoApproveAll to proceed without manual prompt")
+	if !uiAll.awaitingApproval || cmd != nil {
+		t.Fatal("AutoApproveAll bypassed manual approval for web_search")
 	}
-	auditBytes, aErr := os.ReadFile(filepath.Join(dir, ".nabd", "audit.log"))
-	if aErr != nil {
-		t.Fatalf("read audit.log: %v", aErr)
-	}
-	auditText := string(auditBytes)
-	if !strings.Contains(auditText, "[auto_approved:all]") || strings.Contains(auditText, `"golang"`) {
-		t.Fatalf("expected [auto_approved:all] tag without raw query in audit.log: %s", auditText)
+	if _, aErr := os.Stat(filepath.Join(dir, ".nabd", "audit.log")); !os.IsNotExist(aErr) {
+		t.Fatalf("web_search must not be auto-approved or executed: audit.log err=%v", aErr)
 	}
 	// Fail closed on ANSI control sequences during disclosure even in AutoApproveAll mode
 	uiAll.pendingTools = []ToolCall{{
