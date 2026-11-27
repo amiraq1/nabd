@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -42,25 +41,11 @@ func shouldShowWelcome(m *uiModel) bool {
 }
 
 func welcomeColorDisabled() bool {
-	if os.Getenv("TERM") == "dumb" {
-		return true
-	}
-	if v, ok := os.LookupEnv("NO_COLOR"); ok && v != "" {
-		return true
-	}
-	if clicolor, ok := os.LookupEnv("CLICOLOR"); ok && clicolor == "0" {
-		if force := os.Getenv("CLICOLOR_FORCE"); force == "" || force == "0" {
-			return true
-		}
-	}
-	return false
+	return isColorDisabled()
 }
 
 func renderWelcomeSpan(style lipgloss.Style, text string) string {
-	if text == "" || welcomeColorDisabled() {
-		return text
-	}
-	return style.Render(text)
+	return renderStyledSpan(style, text)
 }
 
 func sanitizeWelcomeField(s string) string {

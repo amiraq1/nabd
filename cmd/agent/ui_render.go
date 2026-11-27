@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
@@ -204,62 +205,166 @@ func truncateEnd(s string, maxLen int) string {
 	return string(runes) + "…"
 }
 
-// renderFooter builds a quiet, minimal footer with status and key hints.
+// truncateEndWithEllipsis truncates a string from the end using the active
+// ellipsis glyph ("…" in Unicode mode, "..." in ASCII mode).
+func truncateEndWithEllipsis(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxLen {
+		return s
+	}
+	ell := activeEllipsisGlyph()
+	ellW := lipgloss.Width(ell)
+	if maxLen <= ellW {
+		if isASCIIMode() {
+			return ell[:maxLen]
+		}
+		if maxLen == 1 {
+			return "…"
+		}
+		return ""
+	}
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes)+ell) > maxLen {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + ell
+}
+
+// formatTurnDuration formats a completed turn's elapsed duration for local
+// display. Sub-second turns return "" so they stay hidden.
+func formatTurnDuration(d time.Duration) string {
+	if d < time.Second {
+		return ""
+	}
+	totalSecs := int64(d / time.Second)
+	mins := totalSecs / 60
+	secs := totalSecs % 60
+	if mins == 0 {
+		return fmt.Sprintf("Worked for %ds", secs)
+	}
+	hours := mins / 60
+	remMins := mins % 60
+	if hours > 0 {
+		return fmt.Sprintf("Worked for %dh %dm %ds", hours, remMins, secs)
+	}
+	return fmt.Sprintf("Worked for %dm %ds", mins, secs)
+}
+
+// renderFooter builds a quiet, minimal footer with status, optional local turn
+// timer, and responsive key hints. Security/approval instructions always take
+// priority over staying on a single line.
 func renderFooter(m *uiModel, width int) string {
 	if width <= 0 {
 		width = 80
 	}
 
+	sep := activeInlineSep()
+	isSecurityPrompt := m.pendingDisclosure != nil || m.awaitingApproval
+
 	var statusPart string
 	statusText := sanitizeSingleLineDisplay(m.status)
 	if m.busy {
-		statusPart = m.spinner.View() + " " + footerStatusStyle.Render(statusText)
-	} else if statusText != "" {
-		statusPart = footerStatusStyle.Render(statusText)
-	} else {
-		statusPart = footerStatusStyle.Render("Ready")
-	}
-
-	fullHint := "Enter send · Alt+Enter newline · Esc cancel · Ctrl+O tool · /help"
-	compactHint := "Enter send · Esc cancel · /help"
-
-	var hintPart string
-	if m.pendingDisclosure != nil {
-		if m.viewport.AtBottom() {
-			if width >= 44 {
-				hintPart = scrollBottomReadyStyle.Render("At Bottom ✓ (Press Y to send / N to reject)")
-			} else {
-				hintPart = scrollBottomReadyStyle.Render("At Bottom ✓ (Y send / N reject)")
-			}
-		} else {
-			pct := int(m.viewport.ScrollPercent() * 100)
-			if width >= 44 {
-				hintPart = scrollPercentStyle.Render(fmt.Sprintf("Scroll: %d%% (Scroll to end before Y)", pct))
-			} else {
-				hintPart = scrollPercentStyle.Render(fmt.Sprintf("Scroll: %d%% (Scroll to end)", pct))
-			}
+		spin := m.spinner.View()
+		if isASCIIMode() {
+			spin = "*"
+		} else if isColorDisabled() {
+			spin = sanitizeForDisplay(spin)
 		}
-	} else if m.awaitingApproval {
-		hintPart = footerKeyHintStyle.Render("Y approve · N reject")
+		spinW := lipgloss.Width(spin)
+		if !isSecurityPrompt && lipgloss.Width(statusText)+spinW+1 > width {
+			statusText = truncateEndWithEllipsis(statusText, max(1, width-spinW-1))
+		}
+		statusPart = spin + " " + renderStyledSpan(footerStatusStyle, statusText)
 	} else {
-		if width >= lipgloss.Width(fullHint) {
-			hintPart = footerKeyHintStyle.Render(fullHint)
+		if statusText == "" {
+			statusText = "Ready"
+		}
+		worked := ""
+		if m.hasLastTurnDuration {
+			worked = formatTurnDuration(m.lastTurnDuration)
+		}
+		if worked != "" {
+			suffix := sep + worked
+			if isSecurityPrompt || lipgloss.Width(statusText+suffix) <= width {
+				statusPart = renderStyledSpan(footerStatusStyle, statusText) + renderStyledSpan(toolHintStyle, suffix)
+			} else if rem := width - lipgloss.Width(suffix); rem >= 4 {
+				statusPart = renderStyledSpan(footerStatusStyle, truncateEndWithEllipsis(statusText, rem)) + renderStyledSpan(toolHintStyle, suffix)
+			} else {
+				statusPart = renderStyledSpan(footerStatusStyle, truncateEndWithEllipsis(statusText+suffix, width))
+			}
 		} else {
-			hintPart = footerKeyHintStyle.Render(compactHint)
+			if !isSecurityPrompt && lipgloss.Width(statusText) > width {
+				statusText = truncateEndWithEllipsis(statusText, width)
+			}
+			statusPart = renderStyledSpan(footerStatusStyle, statusText)
 		}
 	}
 
 	wStatus := lipgloss.Width(statusPart)
-	wHint := lipgloss.Width(hintPart)
 
-	// Single line if both fit comfortably with at least 2 spaces gap
-	if wStatus+wHint+2 <= width {
-		gap := width - wStatus - wHint
-		return statusPart + strings.Repeat(" ", gap) + hintPart
+	if m.pendingDisclosure != nil {
+		var hintPart string
+		check := activeCheckGlyph()
+		if m.viewport.AtBottom() {
+			if width >= 44 {
+				hintPart = renderStyledSpan(scrollBottomReadyStyle, "At Bottom "+check+" (Press Y to send / N to reject)")
+			} else {
+				hintPart = renderStyledSpan(scrollBottomReadyStyle, "At Bottom "+check+" (Y send / N reject)")
+			}
+		} else {
+			pct := int(m.viewport.ScrollPercent() * 100)
+			if width >= 44 {
+				hintPart = renderStyledSpan(scrollPercentStyle, fmt.Sprintf("Scroll: %d%% (Scroll to end before Y)", pct))
+			} else {
+				hintPart = renderStyledSpan(scrollPercentStyle, fmt.Sprintf("Scroll: %d%% (Scroll to end)", pct))
+			}
+		}
+		wHint := lipgloss.Width(hintPart)
+		if wStatus+wHint+2 <= width {
+			return statusPart + strings.Repeat(" ", width-wStatus-wHint) + hintPart
+		}
+		return statusPart + "\n" + hintPart
 	}
 
-	// Two lines if narrow
-	return statusPart + "\n" + hintPart
+	if m.awaitingApproval {
+		hintPart := renderStyledSpan(footerKeyHintStyle, "Y approve"+sep+"N reject")
+		wHint := lipgloss.Width(hintPart)
+		if wStatus+wHint+2 <= width {
+			return statusPart + strings.Repeat(" ", width-wStatus-wHint) + hintPart
+		}
+		return statusPart + "\n" + hintPart
+	}
+
+	hintCandidates := []string{
+		"Enter send" + sep + "Alt+Enter newline" + sep + "Esc cancel" + sep + "Ctrl+O tool" + sep + "/help",
+		"Enter send" + sep + "Ctrl+O expand" + sep + "/help",
+		"Enter send" + sep + "Esc cancel" + sep + "/help",
+		"Enter send" + sep + "/help",
+		"Enter" + sep + "/help",
+		"/help",
+	}
+
+	for _, cand := range hintCandidates {
+		wHint := lipgloss.Width(cand)
+		if wStatus+wHint+2 <= width {
+			hintPart := renderStyledSpan(footerKeyHintStyle, cand)
+			return statusPart + strings.Repeat(" ", width-wStatus-wHint) + hintPart
+		}
+	}
+
+	fallback := "Enter send" + sep + "/help"
+	if width >= lipgloss.Width("Enter send"+sep+"Esc cancel"+sep+"/help") {
+		fallback = "Enter send" + sep + "Esc cancel" + sep + "/help"
+	} else if lipgloss.Width(fallback) > width {
+		if lipgloss.Width("/help") <= width {
+			fallback = "/help"
+		} else {
+			fallback = truncateEndWithEllipsis("/help", width)
+		}
+	}
+	return statusPart + "\n" + renderStyledSpan(footerKeyHintStyle, fallback)
 }
 
 // formatToolSummary produces a clear, structured one-line summary of a tool execution.
@@ -787,7 +892,47 @@ func wrapIndented(prefix, indent, text string, totalWidth int) string {
 const (
 	toolGroupFoldThreshold = 5
 	toolGroupKeepVisible   = 3
+	maxExpandedToolBytes   = 4000
+	maxExpandedToolLines   = 24
 )
+
+type toolBadgeMeta struct {
+	label string
+	style lipgloss.Style
+}
+
+// toolBadgeCatalog maps tool names to purely visual category badges.
+// Visual badges never affect approval, disclosure, or model tool execution;
+// grep_search and undo are included solely for display classification.
+var toolBadgeCatalog = map[string]toolBadgeMeta{
+	"read_file":   {label: "READ", style: toolBadgeReadStyle},
+	"list_dir":    {label: "LIST", style: toolBadgeReadStyle},
+	"repo_map":    {label: "MAP", style: toolBadgeReadStyle},
+	"grep_search": {label: "GREP", style: toolBadgeReadStyle},
+	"create_file": {label: "CREATE", style: toolBadgeEditStyle},
+	"edit_file":   {label: "EDIT", style: toolBadgeEditStyle},
+	"undo":        {label: "UNDO", style: toolBadgeEditStyle},
+	"web_search":  {label: "WEB", style: toolBadgeWebStyle},
+	"web_fetch":   {label: "FETCH", style: toolBadgeWebStyle},
+	"go_verify":   {label: "VERIFY", style: toolBadgeVerifyStyle},
+	"mcp_call":    {label: "MCP", style: toolBadgeVerifyStyle},
+}
+
+func lookupToolBadge(toolName string) toolBadgeMeta {
+	clean := strings.TrimSpace(toolName)
+	if meta, ok := toolBadgeCatalog[clean]; ok {
+		return meta
+	}
+	if strings.HasPrefix(clean, "rea:") {
+		return toolBadgeCatalog["mcp_call"]
+	}
+	return toolBadgeMeta{label: "TOOL", style: toolBadgeNeutralStyle}
+}
+
+func renderToolBadge(toolName string) string {
+	meta := lookupToolBadge(toolName)
+	return renderStyledSpan(meta.style, "["+meta.label+"]")
+}
 
 // isToolFailure reports whether a tool message represents a failure, rejection,
 // or blocked action based on reliable control-plane and summary signals.
@@ -852,21 +997,24 @@ func isExpandableToolOutput(msg Message) bool {
 
 func toolLinePrefixes(glyphRendered string) (prefix, indent string) {
 	bar := activeBarGlyph()
-	prefix = toolBarStyle.Render(bar+" ") + glyphRendered + " "
-	indent = toolBarStyle.Render(bar + "   ")
+	prefix = renderStyledSpan(toolBarStyle, bar+" ") + glyphRendered + " "
+	indent = renderStyledSpan(toolBarStyle, bar+"   ")
 	return prefix, indent
 }
 
 func toolStatusPrefix(msg Message) (prefix, indent string) {
 	if isToolFailure(msg) {
-		return toolLinePrefixes(toolErrorStyle.Render(activeCrossGlyph()))
+		return toolLinePrefixes(renderStyledSpan(toolErrorStyle, activeCrossGlyph()))
 	}
-	return toolLinePrefixes(toolSuccessStyle.Render(activeCheckGlyph()))
+	return toolLinePrefixes(renderStyledSpan(toolSuccessStyle, activeCheckGlyph()))
 }
 
 func toolWaitLine(name string, width int) string {
-	prefix, indent := toolLinePrefixes(toolPendingStyle.Render(activeEllipsisGlyph()))
-	return wrapIndented(prefix, indent, toolPendingStyle.Render(sanitizeForDisplay(name)), width)
+	prefix, indent := toolLinePrefixes(renderStyledSpan(toolPendingStyle, activeEllipsisGlyph()))
+	cleanName := sanitizeForDisplay(name)
+	badge := renderToolBadge(cleanName)
+	text := renderStyledSpan(toolPendingStyle, cleanName) + " " + badge
+	return wrapIndented(prefix, indent, text, width)
 }
 
 func resolveToolName(msg Message, toolNamesByID map[string]string) string {
@@ -888,6 +1036,9 @@ func resolveToolName(msg Message, toolNamesByID map[string]string) string {
 		if candidate != "" && !strings.ContainsAny(candidate, " \t\n") {
 			return sanitizeForDisplay(candidate)
 		}
+	}
+	if d != "" && !strings.ContainsAny(d, " \t\n") {
+		return sanitizeForDisplay(d)
 	}
 	return "tool"
 }
@@ -923,7 +1074,7 @@ func renderAssistantMessage(msg Message, resolvedIDs map[string]bool, width int)
 	var b strings.Builder
 	if strings.TrimSpace(msg.Content) != "" {
 		rendered := renderMarkdownSafe(msg.Content, max(10, width-3))
-		prefix := asstPrefixStyle.Render(activeIdentityGlyph() + "  ")
+		prefix := renderStyledSpan(asstPrefixStyle, activeIdentityGlyph()+"  ")
 		indent := "   "
 		b.WriteString(wrapIndented(prefix, indent, rendered, width))
 	}
@@ -937,15 +1088,161 @@ func renderAssistantMessage(msg Message, resolvedIDs map[string]bool, width int)
 		if tc.ID != "" {
 			b.WriteString(toolWaitLine(tc.Function.Name, width))
 		} else {
-			bar := toolBarStyle.Render(activeBarGlyph() + "  ")
-			callLine := fmt.Sprintf("call: %s", sanitizeForDisplay(tc.Function.Name))
-			b.WriteString(wrapIndented(bar, bar, toolNameStyle.Render(callLine), width))
+			bar := renderStyledSpan(toolBarStyle, activeBarGlyph()+"  ")
+			cleanName := sanitizeForDisplay(tc.Function.Name)
+			callLine := fmt.Sprintf("call: %s ", cleanName)
+			b.WriteString(wrapIndented(bar, bar, renderStyledSpan(toolNameStyle, callLine)+renderToolBadge(cleanName), width))
 		}
 	}
 	return b.String()
 }
 
+// compactArgPath shortens directory prefixes inside a tool argument path while
+// preserving the basename and indicating truncation with the active ellipsis.
+func compactArgPath(arg string, maxLen int) string {
+	if maxLen <= 0 || lipgloss.Width(arg) <= maxLen {
+		return arg
+	}
+	ell := activeEllipsisGlyph()
+	if strings.Contains(arg, "/") {
+		base := filepath.Base(arg)
+		if base != "" && base != "." && base != "/" {
+			cand := ell + "/" + base
+			if lipgloss.Width(cand) <= maxLen {
+				return cand
+			}
+		}
+	}
+	return truncateEndWithEllipsis(arg, maxLen)
+}
+
+// compactToolDisplay shortens non-security parts of a successful tool summary
+// on narrow screens so each collapsed tool stays on a single line when possible.
+func compactToolDisplay(disp, toolName string, avail int) string {
+	if avail <= 0 || lipgloss.Width(disp) <= avail {
+		return disp
+	}
+	// Try shortening path/argument inside name(arg) -> rhs first.
+	callPart, rhs, hasArrow := strings.Cut(disp, " -> ")
+	if openIdx := strings.IndexByte(callPart, '('); openIdx > 0 && strings.HasSuffix(callPart, ")") {
+		fn := callPart[:openIdx]
+		arg := callPart[openIdx+1 : len(callPart)-1]
+		if hasArrow {
+			overhead := lipgloss.Width(fn) + lipgloss.Width("() -> ") + lipgloss.Width(rhs)
+			minUsefulArg := 8
+			if strings.Contains(arg, "/") {
+				base := filepath.Base(arg)
+				if w := lipgloss.Width(activeEllipsisGlyph() + "/" + base); w > minUsefulArg {
+					minUsefulArg = min(w, 16)
+				}
+			}
+			if avail-overhead >= minUsefulArg {
+				compactedArg := compactArgPath(arg, avail-overhead)
+				cand := fmt.Sprintf("%s(%s) -> %s", fn, compactedArg, rhs)
+				if lipgloss.Width(cand) <= avail {
+					return cand
+				}
+			}
+			if argAvail := avail - lipgloss.Width(fn) - 2; argAvail >= 4 {
+				compactedArg := compactArgPath(arg, argAvail)
+				cand := fmt.Sprintf("%s(%s)", fn, compactedArg)
+				if lipgloss.Width(cand) <= avail {
+					return cand
+				}
+			}
+		} else if argAvail := avail - lipgloss.Width(fn) - 2; argAvail >= 4 {
+			compactedArg := compactArgPath(arg, argAvail)
+			cand := fmt.Sprintf("%s(%s)", fn, compactedArg)
+			if lipgloss.Width(cand) <= avail {
+				return cand
+			}
+		}
+	}
+
+	if lipgloss.Width(toolName)+lipgloss.Width(activeEllipsisGlyph()) <= avail {
+		return truncateEndWithEllipsis(disp, avail)
+	}
+	return disp
+}
+
+// renderExpandedToolTree renders sanitized tool output using quiet muted tree
+// connectors ("│ " / "└─ ", or "| " / "+- " in ASCII mode).
+func renderExpandedToolTree(rawContent, disp, indent string, width int) string {
+	sanitized := sanitizeForDisplay(rawContent)
+	byteCapped := false
+	preview := sanitized
+	if len(preview) > maxExpandedToolBytes {
+		cut := maxExpandedToolBytes
+		for cut > 0 && !utf8.RuneStart(preview[cut]) {
+			cut--
+		}
+		preview = preview[:cut]
+		byteCapped = true
+	}
+
+	midPrefix := indent + renderStyledSpan(toolTreeStyle, activeTreeMidPrefix())
+	lastPrefix := indent + renderStyledSpan(toolTreeStyle, activeTreeLastPrefix())
+	lastContIndent := indent + "   "
+
+	if !byteCapped && strings.TrimSpace(preview) == "" {
+		return wrapIndented(lastPrefix, lastContIndent, renderStyledSpan(toolHintStyle, "(empty output)"), width)
+	}
+
+	if !byteCapped {
+		preview = strings.TrimRight(preview, "\n")
+	}
+	lines := strings.Split(preview, "\n")
+
+	upstreamTruncated := strings.Contains(disp, "(truncated") ||
+		strings.Contains(sanitized, "[truncated;") ||
+		strings.Contains(sanitized, compactMarkerPrefix) ||
+		(len(rawContent) >= maxLLMToolOutput && strings.HasSuffix(rawContent, "..."))
+
+	var tailNotice string
+	visible := lines
+	if byteCapped {
+		if len(visible) > maxExpandedToolLines {
+			visible = visible[:maxExpandedToolLines]
+			tailNotice = fmt.Sprintf("... (output preview capped at %d chars; showing first %d lines)", maxExpandedToolBytes, maxExpandedToolLines)
+		} else {
+			tailNotice = fmt.Sprintf("... (output preview capped at %d chars)", maxExpandedToolBytes)
+		}
+	} else if len(lines) > maxExpandedToolLines {
+		visible = lines[:maxExpandedToolLines]
+		if upstreamTruncated {
+			tailNotice = "... (additional lines omitted; output truncated)"
+		} else {
+			tailNotice = fmt.Sprintf("+%d more lines", len(lines)-maxExpandedToolLines)
+		}
+	} else if upstreamTruncated {
+		tailNotice = "... (output truncated)"
+	}
+
+	var b strings.Builder
+	for i, line := range visible {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		if i == len(visible)-1 && tailNotice == "" {
+			b.WriteString(wrapIndented(lastPrefix, lastContIndent, line, width))
+		} else {
+			b.WriteString(wrapIndented(midPrefix, midPrefix, line, width))
+		}
+	}
+	if tailNotice != "" {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(wrapIndented(lastPrefix, lastContIndent, renderStyledSpan(toolHintStyle, tailNotice), width))
+	}
+	return b.String()
+}
+
 func renderToolMessage(msg Message, width int, showCtrlO bool, expanded bool) string {
+	return renderToolMessageWithName(msg, resolveToolName(msg, nil), width, showCtrlO, expanded)
+}
+
+func renderToolMessageWithName(msg Message, toolName string, width int, showCtrlO bool, expanded bool) string {
 	if width <= 0 {
 		width = 80
 	}
@@ -955,39 +1252,46 @@ func renderToolMessage(msg Message, width int, showCtrlO bool, expanded bool) st
 	}
 	disp = sanitizeForDisplay(disp)
 	prefix, indent := toolStatusPrefix(msg)
+	badge := renderToolBadge(toolName)
 	eligible := isExpandableToolOutput(msg)
 
 	if showCtrlO && expanded && eligible {
-		full := sanitizeForDisplay(msg.Content)
-		if len(full) > 4000 {
-			cut := 4000
-			for cut > 0 && !utf8.RuneStart(full[cut]) {
-				cut--
-			}
-			full = full[:cut] + "\n...[output preview capped at 4000 chars]"
-		}
-		headerText := toolNameStyle.Render(disp) + "  " + toolHintStyle.Render("(Ctrl+O to collapse)")
+		collapseHint := renderStyledSpan(toolHintStyle, "(Ctrl+O to collapse)")
+		headerCore := badge + " " + renderStyledSpan(toolNameStyle, disp)
 		bannerText := "─── Full Output ───"
-		if lipgloss.Width(bannerText) > max(1, width-lipgloss.Width(indent)) {
-			bannerText = truncateEnd(bannerText, max(1, width-lipgloss.Width(indent)))
+		if isASCIIMode() {
+			bannerText = "--- Full Output ---"
 		}
-		banner := toolHintStyle.Render(bannerText)
+		if availBanner := max(1, width-lipgloss.Width(indent)); lipgloss.Width(bannerText) > availBanner {
+			bannerText = truncateEndWithEllipsis(bannerText, availBanner)
+		}
+		banner := renderStyledSpan(toolHintStyle, bannerText)
 
 		var b strings.Builder
-		b.WriteString(wrapIndented(prefix, indent, headerText, width) + "\n")
-		b.WriteString(wrapIndented(indent, indent, banner, width))
-
-		fullLines := strings.Split(full, "\n")
-		for _, fl := range fullLines {
-			b.WriteString("\n" + wrapIndented(indent, indent, fl, width))
+		if lipgloss.Width(prefix)+lipgloss.Width(headerCore)+2+lipgloss.Width(collapseHint) <= width {
+			b.WriteString(wrapIndented(prefix, indent, headerCore+"  "+collapseHint, width) + "\n")
+		} else {
+			b.WriteString(wrapIndented(prefix, indent, headerCore, width) + "\n")
+			b.WriteString(wrapIndented(indent, indent, collapseHint, width) + "\n")
 		}
+		b.WriteString(wrapIndented(indent, indent, banner, width) + "\n")
+		b.WriteString(renderExpandedToolTree(msg.Content, disp, indent, width))
 		return b.String()
 	}
 
-	toolLine := toolNameStyle.Render(disp)
+	summaryText := disp
+	hintText := ""
 	if showCtrlO && eligible {
-		toolLine += "  " + toolHintStyle.Render("(Ctrl+O)")
+		hintText = "  " + renderStyledSpan(toolHintStyle, "(Ctrl+O)")
 	}
+	if !isToolFailure(msg) {
+		avail := width - lipgloss.Width(prefix) - lipgloss.Width(badge) - 1 - lipgloss.Width(hintText)
+		if avail > 0 {
+			summaryText = compactToolDisplay(summaryText, toolName, avail)
+		}
+	}
+
+	toolLine := badge + " " + renderStyledSpan(toolNameStyle, summaryText) + hintText
 	return wrapIndented(prefix, indent, toolLine, width)
 }
 
@@ -1077,14 +1381,15 @@ func renderMessages(messages []Message, width int, expandLastTool bool) string {
 			if len(group) > toolGroupFoldThreshold {
 				cut := len(group) - toolGroupKeepVisible
 				summary := formatFoldSummary(group[:cut], toolNamesByID)
-				prefix, indent := toolLinePrefixes(toolPendingStyle.Render(activeEllipsisGlyph()))
-				groupLines = append(groupLines, wrapIndented(prefix, indent, toolPendingStyle.Render(summary), width))
+				prefix, indent := toolLinePrefixes(renderStyledSpan(toolPendingStyle, activeEllipsisGlyph()))
+				groupLines = append(groupLines, wrapIndented(prefix, indent, renderStyledSpan(toolPendingStyle, summary), width))
 				visOffset = cut
 			}
 			for k := visOffset; k < len(group); k++ {
 				globalIdx := i + k
 				isTarget := globalIdx == expandableIdx
-				groupLines = append(groupLines, renderToolMessage(group[k], width, isTarget, isTarget && expandLastTool))
+				toolName := resolveToolName(group[k], toolNamesByID)
+				groupLines = append(groupLines, renderToolMessageWithName(group[k], toolName, width, isTarget, isTarget && expandLastTool))
 			}
 			blocks = append(blocks, strings.Join(groupLines, "\n"))
 			i = j

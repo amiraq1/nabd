@@ -163,6 +163,14 @@ type uiModel struct {
 	keySource   string
 	projectCtx  projectContextSnapshot
 	cache       cacheStats
+
+	// UI-only turn timer state; never sent to the LLM or stored in messages/audit logs.
+	// Measures total wall-clock elapsed turn duration (including network, tools, and user approvals).
+	nowFn               func() time.Time
+	turnActive          bool
+	turnStart           time.Time
+	lastTurnDuration    time.Duration
+	hasLastTurnDuration bool
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -206,7 +214,9 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = lipgloss.NewStyle().Foreground(colorAccent)
+	if !isColorDisabled() {
+		sp.Style = lipgloss.NewStyle().Foreground(colorAccent)
+	}
 
 	vp := viewport.New(80, 20)
 
@@ -320,6 +330,7 @@ func initialModel(reg *tools.Registry, client llm.Client, autoMode ...AutoApprov
 		baseHeight:    20,
 		palette:       pal,
 		projectCtx:    projectCtx,
+		nowFn:         time.Now,
 	}
 	m.refresh()
 	return m
@@ -613,6 +624,8 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
 		m.iteration++
 		if len(msg.assistantMsg.ToolCalls) == 0 {
+			m.completeTurnTimer()
+			m.taskGen++
 			m.busy = false
 			m.status = "Ready"
 			m.refresh()
@@ -627,6 +640,8 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					Display:    "Skipped: iteration limit",
 				})
 			}
+			m.resetTurnTimer()
+			m.taskGen++
 			m.busy = false
 			m.status = "Iteration limit"
 			m.refresh()
@@ -651,6 +666,8 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.toolQueueMode = m.autoApprove
 		m.refresh()
 		if len(m.pendingTools) == 0 {
+			m.resetTurnTimer()
+			m.taskGen++
 			m.busy = false
 			m.status = "Blocked repeated tool call"
 			m.refresh()
@@ -872,6 +889,41 @@ func (m *uiModel) issueApproval(tc ToolCall, autoMode string) (tools.Approval, e
 	}
 }
 
+func (m *uiModel) now() time.Time {
+	if m != nil && m.nowFn != nil {
+		return m.nowFn()
+	}
+	return time.Now()
+}
+
+func (m *uiModel) resetTurnTimer() {
+	m.turnActive = false
+	m.turnStart = time.Time{}
+	m.lastTurnDuration = 0
+	m.hasLastTurnDuration = false
+}
+
+func (m *uiModel) startTurnTimer() {
+	m.turnActive = true
+	m.turnStart = m.now()
+	m.lastTurnDuration = 0
+	m.hasLastTurnDuration = false
+}
+
+func (m *uiModel) completeTurnTimer() {
+	if !m.turnActive {
+		return
+	}
+	elapsed := m.now().Sub(m.turnStart)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	m.turnActive = false
+	m.turnStart = time.Time{}
+	m.lastTurnDuration = elapsed
+	m.hasLastTurnDuration = true
+}
+
 func (m *uiModel) finishRequest() {
 	if m.requestCancel != nil {
 		m.requestCancel()
@@ -887,6 +939,7 @@ func (m *uiModel) cancelActiveTask() {
 	m.approval = approvalPreview{}
 	m.pendingDisclosure = nil
 	m.busy = false
+	m.resetTurnTimer()
 }
 
 func (m *uiModel) launchTool(tc ToolCall, approval *tools.Approval) tea.Cmd {
@@ -1302,9 +1355,11 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 				Message{Role: "user", Content: expanded},
 			)
 			m.clearInput()
+			m.taskGen++
 			m.busy = true
 			m.iteration = 0
 			m.callCounts = make(map[string]int)
+			m.startTurnTimer()
 			m.status = "Thinking..."
 			m.refresh()
 			return m.startLLM()
@@ -1314,9 +1369,11 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
 	m.messages = append(m.messages, Message{Role: "user", Content: input})
 	m.clearInput()
+	m.taskGen++
 	m.busy = true
 	m.iteration = 0
 	m.callCounts = make(map[string]int)
+	m.startTurnTimer()
 	m.status = "Thinking..."
 	m.refresh()
 	return m.startLLM()
