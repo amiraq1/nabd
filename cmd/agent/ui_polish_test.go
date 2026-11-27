@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1148,4 +1149,198 @@ func TestMouseTrackingEnvOption(t *testing.T) {
 			}
 		})
 	}
+}
+
+type chunkedTestReader struct {
+	chunks [][]byte
+	idx    int
+}
+
+func (r *chunkedTestReader) Read(p []byte) (int, error) {
+	if r.idx >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	chunk := r.chunks[r.idx]
+	n := copy(p, chunk)
+	if n < len(chunk) {
+		r.chunks[r.idx] = chunk[n:]
+	} else {
+		r.idx++
+	}
+	return n, nil
+}
+
+func TestSGRMouseNormalizerArabicAndPersianDigits(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "arabic_wheel_down",
+			in:   "\x1b[<٦٥;٥٦;٦٧M",
+			want: "\x1b[<65;56;67M",
+		},
+		{
+			name: "arabic_wheel_up",
+			in:   "\x1b[<٦٤;٥٦;٦٧M",
+			want: "\x1b[<64;56;67M",
+		},
+		{
+			name: "arabic_click_and_release",
+			in:   "\x1b[<٠;٥٠;٦٦M\x1b[<٠;٥٠;٦٦m",
+			want: "\x1b[<0;50;66M\x1b[<0;50;66m",
+		},
+		{
+			name: "persian_wheel_and_click",
+			in:   "\x1b[<۶۵;۵۶;۶۷M\x1b[<۶۴;۵۶;۶۷M\x1b[<۰;۵۰;۶۶M\x1b[<۰;۵۰;۶۶m",
+			want: "\x1b[<65;56;67M\x1b[<64;56;67M\x1b[<0;50;66M\x1b[<0;50;66m",
+		},
+		{
+			name: "plain_arabic_text_with_digits_untouched",
+			in:   "مرحباً ١٢٣ ۰۱۲",
+			want: "مرحباً ١٢٣ ۰۱۲",
+		},
+		{
+			name: "mixed_arabic_text_and_sgr_mouse",
+			in:   "مرحباً \x1b[<٦٥;٥٦;٦٧M١٢٣",
+			want: "مرحباً \x1b[<65;56;67M١٢٣",
+		},
+		{
+			name: "invalid_or_aborted_sgr_untouched",
+			in:   "\x1b[<٦٥;٥٦;bad\x1b[<M\x1b[<١٢;٣٤M\x1b[A\x1b",
+			want: "\x1b[<٦٥;٥٦;bad\x1b[<M\x1b[<١٢;٣٤M\x1b[A\x1b",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newSGRMouseReader(strings.NewReader(tc.in))
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("ReadAll failed: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("got %q, want %q", string(got), tc.want)
+			}
+		})
+	}
+}
+
+func TestSGRMouseNormalizerPartialReads(t *testing.T) {
+	full := "مرحباً ١٢٣" + "\x1b[<٦٥;٥٦;٦٧M" + "\x1b[<٦٤;٥٦;٦٧M" + "\x1b[<۰;۵۰;۶۶m" + "٤٥٦"
+	want := "مرحباً ١٢٣" + "\x1b[<65;56;67M" + "\x1b[<64;56;67M" + "\x1b[<0;50;66m" + "٤٥٦"
+
+	t.Run("one_byte_source_chunks_and_small_caller_buf", func(t *testing.T) {
+		raw := []byte(full)
+		chunks := make([][]byte, len(raw))
+		for i, b := range raw {
+			chunks[i] = []byte{b}
+		}
+		r := newSGRMouseReader(&chunkedTestReader{chunks: chunks})
+		var got bytes.Buffer
+		buf := make([]byte, 3)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				got.Write(buf[:n])
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+		}
+		if got.String() != want {
+			t.Fatalf("partial 1-byte reads mismatch:\ngot:  %q\nwant: %q", got.String(), want)
+		}
+	})
+
+	t.Run("split_across_esc_csi_and_utf8_digit_boundaries", func(t *testing.T) {
+		digit5 := []byte("٥") // 2-byte UTF-8: 0xD9 0xA5
+		chunks := [][]byte{
+			[]byte("\x1b"),
+			[]byte("["),
+			[]byte("<"),
+			[]byte("٦"),
+			{digit5[0]},
+			{digit5[1]},
+			[]byte(";٥٦;"),
+			[]byte("٦٧"),
+			[]byte("Mمرحباً ١٢٣"),
+		}
+		r := newSGRMouseReader(&chunkedTestReader{chunks: chunks})
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("ReadAll failed: %v", err)
+		}
+		wantSplit := "\x1b[<65;56;67Mمرحباً ١٢٣"
+		if string(got) != wantSplit {
+			t.Fatalf("split boundary mismatch: got %q, want %q", string(got), wantSplit)
+		}
+	})
+}
+
+func TestArabicSGRMouseEndToEndBubbleTeaProgram(t *testing.T) {
+	runPipeProgram := func(t *testing.T, writes [][]byte) uiModel {
+		t.Helper()
+		m, _ := makeScrollableTestModel(t, 60, 10)
+		m.messages = append(m.messages,
+			Message{Role: "user", Content: "scroll test"},
+			Message{Role: "assistant", Content: strings.Repeat("line\n", 55)},
+		)
+		m.refresh()
+		m.viewport.SetYOffset(10)
+
+		pr, pw := io.Pipe()
+		go func() {
+			defer pw.Close()
+			for _, w := range writes {
+				_, _ = pw.Write(w)
+			}
+		}()
+
+		var out bytes.Buffer
+		opts := append(
+			programInputOptions(pr, &out, func(string) string { return "" }),
+			tea.WithoutRenderer(),
+			tea.WithoutSignals(),
+		)
+		p := tea.NewProgram(m, opts...)
+		finalModel, err := p.Run()
+		if err != nil {
+			t.Fatalf("Program.Run failed: %v", err)
+		}
+		return finalModel.(uiModel)
+	}
+
+	t.Run("arabic_and_persian_sgr_mouse_scrolls_viewport_without_textarea_garbage", func(t *testing.T) {
+		got := runPipeProgram(t, [][]byte{
+			[]byte("\x1b[<٦٥;٥٦;٦٧M"),              // +3 -> 13
+			[]byte("\x1b[<٦٥"),                     // split partial read
+			[]byte(";٥٦;٦٧M"),                      // +3 -> 16
+			[]byte("\x1b[<٦٤;٥٦;٦٧M"),              // -3 -> 13
+			[]byte("\x1b[<٠;٥٠;٦٦M\x1b[<٠;٥٠;٦٦m"), // click/release ignored
+			[]byte("\x1b[<۶۵;۵۶;۶۷M"),              // Persian +3 -> 16
+			[]byte("\x1b[<۰;۵۰;۶۶M\x1b[<۰;۵۰;۶۶m"), // Persian click/release ignored
+			{0x03}, // Ctrl+C
+		})
+		if got.viewport.YOffset != 16 {
+			t.Fatalf("expected final YOffset=16 after Arabic/Persian SGR wheel events, got %d", got.viewport.YOffset)
+		}
+		if got.textArea.Value() != "" {
+			t.Fatalf("expected empty textArea after mouse events, got %q", got.textArea.Value())
+		}
+	})
+
+	t.Run("normal_arabic_text_with_arabic_indic_digits_preserved", func(t *testing.T) {
+		got := runPipeProgram(t, [][]byte{
+			[]byte("مرحباً ١٢٣ ۰۱۲"),
+			{0x03}, // Ctrl+C
+		})
+		if got.textArea.Value() != "مرحباً ١٢٣ ۰۱۲" {
+			t.Fatalf("expected textArea.Value() == %q, got %q", "مرحباً ١٢٣ ۰۱۲", got.textArea.Value())
+		}
+	})
 }

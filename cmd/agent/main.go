@@ -1768,6 +1768,18 @@ func programOptions(ttyOut io.Writer, getenv func(string) string) []tea.ProgramO
 	return opts
 }
 
+func programInputOptions(in io.Reader, ttyOut io.Writer, getenv func(string) string) []tea.ProgramOption {
+	opts := programOptions(ttyOut, getenv)
+	if mouseTrackingEnabled(getenv) && in != nil {
+		if f, ok := in.(*os.File); ok {
+			opts = append(opts, tea.WithInput(newSGRMouseFile(f)))
+		} else {
+			opts = append(opts, tea.WithInput(newSGRMouseReader(in)))
+		}
+	}
+	return opts
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
 		os.Exit(RunSetup(os.Stdin, os.Stdout, os.Stderr, defaultConfigDir(), os.Args[2:]))
@@ -1838,7 +1850,7 @@ func main() {
 	model := initialModel(reg, client, autoMode)
 	model.ttyWriter = ttyOut
 	model.setKeySource(keySource)
-	p := tea.NewProgram(model, programOptions(ttyOut, os.Getenv)...)
+	p := tea.NewProgram(model, programInputOptions(os.Stdin, ttyOut, os.Getenv)...)
 	_, runErr := p.Run()
 	model.lifecycle.stop()
 	if !model.lifecycle.wait(5 * time.Second) {
