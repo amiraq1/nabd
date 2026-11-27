@@ -142,6 +142,7 @@ Profile المُنفَّذ على Linux:
 - **شبكة كود الاختبار**: `GOPROXY=off` يمنع تنزيل وحدات Go فقط؛ في غياب العزل يستطيع كود الاختبار فتح sockets.
 - **`mcp_call`**: الحارس seccomp يحجب `setsid` و`setpgid` (بعد التحقق من المعمارية وضبط البت 30)، وهذا لا يمنع كل الانفصالات ولا يعد عزلاً للملفات أو الشبكة بحد ذاته. هوية الملف التنفيذي والحارس مرتبطة بالموافقة، ويبقى نافذ قصير يمكن فيه مستخدم محلي تبديل ملف بعد التحقق (لا `fexecve`).
 - **تسريب المحتوى إلى LLM**: أي أداة تُفصح عن مخرجاتها ترسلها للـendpoint؛ إن كان بعيداً خرجت البيانات من الجهاز.
+- **إحصاءات الكاش**: أرقام `Cache` في `/status` هي ما يبلّغ عنه المزوّد فقط؛ قد تكون غائبة أو جزئية أو خاصة بنسخة/إعداد، ولا تثبت إصابة كاش ولا تُترجم إلى وفورات. لا تُستخدم لأي قرار أمني أو مالي. في `llama.cpp` قد يعكس `cache_n` تطابق بادئة عميل آخر على slot مشترك، فلا يُفسَّر كضمان خصوصية.
 - **TOCTOU داخل الجذر**: بين preview والتنفيذ قد يتغيّر محتوى الملف؛ hash guard يخفف ولا يوجد قفل CAS ذري مقابل كاتب خارجي. في `create_file` يُستعمل `RENAME_NOREPLACE` (على Linux/Android) أو `os.Root.Link` (على باقي المنصات) للنشر الحصري الذري؛ أما على أنظمة الملفات التي لا تدعمهما (`ENOTSUP`/`ENOSYS`/`EPERM` مثل `/sdcard` أو FAT32) فتتراجع الأداة إلى فحص `Lstat` أخير داخل `withProcessLock` ثم `Rename` (بينما يبقى `EEXIST` فشلاً مغلقاً دائماً)، ما يترك نافذة سباق ميكروثانية أمام كاتب خارجي في تلك الأنظمة فقط.
 - **حدود الحجم**: صفحة قراءة 3584 بايت، إنشاء/تعديل ونسخة shadow الاحتياطية 2MiB، سجل `go_verify` يحتفظ بـ64KiB من بدايته ونهايته، ووسائط الموافقة ومعاينتها 4000 بايت، وعمق مجلدات `create_file` حتى 15 مستوى أب (512 بايت للمسار النسبي).
 - **لا حدود معدل أو حصص** لاستدعاءات الأدوات أو الـLLM.
@@ -178,6 +179,8 @@ Profile المُنفَّذ على Linux:
 - ترتيب متانة النسخ وفشل المزامنة → `TestBackupSyncsDataThenMetadata`, `TestBackupFailsClosedWhenRequiredSyncFails`, `TestCleanupReportsDirectorySyncFailureAndRecovers`.
 - تزامن سجل التدقيق بين عمليتين → `TestConcurrentProcessesShareOneChain` (عمليتان عبر `os/exec` في وضعي sha256 وHMAC)، ورفض الاقتطاع/الاستبدال/السطر الناقص → `TestWriteRefusesTruncationReplacementAndPartialTail`، وقفل/روابط/ـFIFO → `TestAuditLockRejectsSymlinksAndNonRegularFiles`, `TestAuditLockRejectsFIFO`.
 - هوية البحث والموافقة اليدوية → `TestCanonicalWebSearchIdentityIsStableAndFieldBound`, `TestWebToolsRequireManualApprovalInEveryMode`, `TestWebSearchApprovalTokenIsBoundToEveryField`, `TestWebSearchApprovalPreviewShowsCompleteCanonicalRequest`, `TestWebSearchQueryRejectsInvisibleAndControlCharacters`, `TestWebSearchLongUnicodeQueryIsShownFullyWithoutClipping`.
+- ثبات بادئة الطلب → `TestOpenAIToolsPrefixIsDeterministic`, `TestOpenAIRequestPrefixIsDeterministicAndAppendOnly`, `TestGeminiRequestPrefixIsDeterministicAndAppendOnly`.
+- قراءة usage والكاش وعرضه → `TestOpenAIUsageCacheFieldParsing`, `TestGeminiUsageCacheFieldParsing`, `TestCacheStatsUsesSumsNotAverageOfRatios`, `TestCacheStatsCoverageInvalidAndNoData`, `TestLateLLMResponseDoesNotPolluteCacheStats`, `TestCacheStatsResetOnClear`, `TestStatusShowsCacheWithoutConversationText`.
 - حد مسار الكنس → `TestCleanupNeverTouchesFilesOutsideTheStore`.
 - undo بعد تغيير الملف → `TestUndoRefusesAfterDrift`.
 

@@ -375,13 +375,78 @@ func redactSecret(text, secret string) string {
 	return b.String()
 }
 
+// openAIUsageWire keeps every counter optional so a sparse or malformed usage
+// object can be diagnosed without failing an otherwise successful completion.
+type openAIUsageWire struct {
+	PromptTokens         json.Number `json:"prompt_tokens"`
+	CompletionTokens     json.Number `json:"completion_tokens"`
+	TotalTokens          json.Number `json:"total_tokens"`
+	PromptCacheHitTokens json.Number `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails  *struct {
+		CachedTokens json.Number `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func parseOpenAIUsage(raw json.RawMessage) Usage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return Usage{}
+	}
+	var wire openAIUsageWire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return Usage{Reported: true, Invalid: true}
+	}
+	usage := Usage{Reported: true}
+	var ok bool
+	usage.PromptTokens, usage.PromptReported, ok = parseTokenCount(wire.PromptTokens)
+	if !ok {
+		usage.Invalid = true
+	}
+	usage.CompletionTokens, _, ok = parseTokenCount(wire.CompletionTokens)
+	if !ok {
+		usage.Invalid = true
+	}
+	usage.TotalTokens, _, ok = parseTokenCount(wire.TotalTokens)
+	if !ok {
+		usage.Invalid = true
+	}
+	if wire.PromptTokensDetails != nil {
+		if value, present, valid := parseTokenCount(wire.PromptTokensDetails.CachedTokens); present {
+			if !valid {
+				usage.Invalid = true
+			} else {
+				usage.CachedPromptTokens = &value
+			}
+		}
+	}
+	if value, present, valid := parseTokenCount(wire.PromptCacheHitTokens); present {
+		if !valid {
+			usage.Invalid = true
+		} else {
+			usage.PromptCacheHitTokens = &value
+		}
+	}
+	if usage.CachedPromptTokens != nil && usage.PromptCacheHitTokens != nil &&
+		*usage.CachedPromptTokens != *usage.PromptCacheHitTokens {
+		usage.Invalid = true
+	}
+	if usage.PromptReported {
+		if usage.CachedPromptTokens != nil && *usage.CachedPromptTokens > usage.PromptTokens {
+			usage.Invalid = true
+		}
+		if usage.PromptCacheHitTokens != nil && *usage.PromptCacheHitTokens > usage.PromptTokens {
+			usage.Invalid = true
+		}
+	}
+	return usage
+}
+
 func parseResponse(data []byte) (*Response, error) {
 	var result struct {
 		Choices []struct {
 			Message      Message `json:"message"`
 			FinishReason string  `json:"finish_reason"`
 		} `json:"choices"`
-		Usage Usage `json:"usage"`
+		Usage json.RawMessage `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
@@ -422,7 +487,7 @@ func parseResponse(data []byte) (*Response, error) {
 			return nil, fmt.Errorf("tool call arguments must be a JSON object")
 		}
 	}
-	return &Response{Message: msg, FinishReason: choice.FinishReason, Usage: result.Usage}, nil
+	return &Response{Message: msg, FinishReason: choice.FinishReason, Usage: parseOpenAIUsage(result.Usage)}, nil
 }
 
 func (c *OpenAIClient) backoff(attempt int) time.Duration {
