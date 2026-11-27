@@ -40,10 +40,6 @@ func shouldShowWelcome(m *uiModel) bool {
 	return true
 }
 
-func welcomeColorDisabled() bool {
-	return isColorDisabled()
-}
-
 func renderWelcomeSpan(style lipgloss.Style, text string) string {
 	return renderStyledSpan(style, text)
 }
