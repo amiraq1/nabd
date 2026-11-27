@@ -4,6 +4,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -61,6 +62,55 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+
+	// Reported distinguishes an absent usage object from a reported one whose
+	// counters are all zero.
+	Reported bool `json:"-"`
+	// PromptReported distinguishes an absent prompt count from a reported zero.
+	PromptReported bool `json:"-"`
+	// CachedPromptTokens is OpenAI's usage.prompt_tokens_details.cached_tokens.
+	CachedPromptTokens *int `json:"-"`
+	// PromptCacheHitTokens is the DeepSeek-style prompt_cache_hit_tokens.
+	PromptCacheHitTokens *int `json:"-"`
+	// Invalid marks negative, conflicting or out-of-range counts. The response
+	// still succeeds; only its cache numbers are excluded from statistics.
+	Invalid bool `json:"-"`
+}
+
+// CacheTokens returns the provider-reported cached prompt token count without
+// ever adding two provider fields together. cached_tokens takes precedence over
+// prompt_cache_hit_tokens; conflicting or invalid reports return false.
+func (u Usage) CacheTokens() (int, bool) {
+	if u.Invalid {
+		return 0, false
+	}
+	if u.CachedPromptTokens != nil && u.PromptCacheHitTokens != nil && *u.CachedPromptTokens != *u.PromptCacheHitTokens {
+		return 0, false
+	}
+	if u.CachedPromptTokens != nil {
+		return *u.CachedPromptTokens, true
+	}
+	if u.PromptCacheHitTokens != nil {
+		return *u.PromptCacheHitTokens, true
+	}
+	return 0, false
+}
+
+// parseTokenCount decodes one optional non-negative token count. present says
+// whether the field existed; ok is false for negative, non-integer or
+// overflowing values, which callers mark invalid instead of trusting.
+func parseTokenCount(raw json.Number) (count int, present, ok bool) {
+	if raw == "" {
+		return 0, false, true
+	}
+	value, err := strconv.ParseInt(raw.String(), 10, 64)
+	if err != nil || value < 0 {
+		return 0, true, false
+	}
+	if value > int64(^uint(0)>>1) {
+		return 0, true, false
+	}
+	return int(value), true, true
 }
 
 // Response is a single chat completion response.

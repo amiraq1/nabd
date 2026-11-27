@@ -127,6 +127,7 @@ type uiModel struct {
 	copyCancel  context.CancelFunc
 	keySource   string
 	projectCtx  projectContextSnapshot
+	cache       cacheStats
 }
 
 func buildSystemPrompt(reg *tools.Registry) string {
@@ -296,6 +297,7 @@ func (m uiModel) Init() tea.Cmd {
 type llmResponseMsg struct {
 	gen          uint64
 	assistantMsg Message
+	usage        llm.Usage
 }
 type toolExecutedMsg struct {
 	gen     uint64
@@ -571,6 +573,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.finishRequest()
+		m.cache.observe(msg.usage)
 		m.messages = append(m.messages, msg.assistantMsg)
 		m.messages = pruneSessionMessages(m.messages, defaultSessionUnitsLimit, m.awaitingApproval || m.pendingDisclosure != nil)
 		m.iteration++
@@ -969,7 +972,7 @@ func callLLMCmdPrepared(client llm.Client, toolDefs []map[string]any, snapshot [
 		if msg.Role == "" {
 			msg.Role = "assistant"
 		}
-		return llmResponseMsg{gen: gen, assistantMsg: msg}
+		return llmResponseMsg{gen: gen, assistantMsg: msg, usage: resp.Usage}
 	}
 }
 
@@ -1195,6 +1198,7 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	if input == "clear" || input == "/clear" {
 		m.cancelActiveTask()
 		m.cancelCopy()
+		m.cache.reset()
 		m.messages = []Message{{Role: "system", Content: buildSystemPrompt(m.registry)}}
 		if m.projectCtx.HasRules() {
 			m.messages = append(m.messages, Message{
@@ -1561,6 +1565,7 @@ func (m *uiModel) formatStatus() string {
 	fmt.Fprintf(&b, "Project Commands: %s\n", formatProjectCommandsStatus(m.projectCtx))
 	fmt.Fprintf(&b, "Iteration: %d / %d\n", m.iteration, m.maxIterations)
 	fmt.Fprintf(&b, "Context tokens: ~%d / %d (~%.1f%%)\n", tokens, budget, float64(tokens)*100.0/float64(budget))
+	b.WriteString(m.cache.statusLine() + "\n")
 	fmt.Fprintf(&b, "Messages in history: %d\n", len(m.messages))
 	b.WriteString(formatMemoryStatus() + "\n")
 	if m.registry != nil {

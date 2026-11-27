@@ -390,11 +390,7 @@ func parseGeminiResponse(data []byte) (*Response, error) {
 				} `json:"groundingChunks"`
 			} `json:"groundingMetadata"`
 		} `json:"candidates"`
-		UsageMetadata struct {
-			PromptTokenCount     int `json:"promptTokenCount"`
-			CandidatesTokenCount int `json:"candidatesTokenCount"`
-			TotalTokenCount      int `json:"totalTokenCount"`
-		} `json:"usageMetadata"`
+		UsageMetadata json.RawMessage `json:"usageMetadata"`
 	}
 
 	if err := json.Unmarshal(data, &result); err != nil {
@@ -472,17 +468,55 @@ func parseGeminiResponse(data []byte) (*Response, error) {
 		ToolCalls: toolCalls,
 	}
 
-	usage := Usage{
-		PromptTokens:     result.UsageMetadata.PromptTokenCount,
-		CompletionTokens: result.UsageMetadata.CandidatesTokenCount,
-		TotalTokens:      result.UsageMetadata.TotalTokenCount,
-	}
-
 	return &Response{
 		Message:      msg,
 		FinishReason: candidate.FinishReason,
-		Usage:        usage,
+		Usage:        parseGeminiUsage(result.UsageMetadata),
 	}, nil
+}
+
+// geminiUsageWire keeps every counter optional. promptTokenCount includes any
+// cached content, per the GenerateContentResponse contract.
+type geminiUsageWire struct {
+	PromptTokenCount        json.Number `json:"promptTokenCount"`
+	CandidatesTokenCount    json.Number `json:"candidatesTokenCount"`
+	TotalTokenCount         json.Number `json:"totalTokenCount"`
+	CachedContentTokenCount json.Number `json:"cachedContentTokenCount"`
+}
+
+func parseGeminiUsage(raw json.RawMessage) Usage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return Usage{}
+	}
+	var wire geminiUsageWire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return Usage{Reported: true, Invalid: true}
+	}
+	usage := Usage{Reported: true}
+	var ok bool
+	usage.PromptTokens, usage.PromptReported, ok = parseTokenCount(wire.PromptTokenCount)
+	if !ok {
+		usage.Invalid = true
+	}
+	usage.CompletionTokens, _, ok = parseTokenCount(wire.CandidatesTokenCount)
+	if !ok {
+		usage.Invalid = true
+	}
+	usage.TotalTokens, _, ok = parseTokenCount(wire.TotalTokenCount)
+	if !ok {
+		usage.Invalid = true
+	}
+	if value, present, valid := parseTokenCount(wire.CachedContentTokenCount); present {
+		if !valid {
+			usage.Invalid = true
+		} else {
+			usage.CachedPromptTokens = &value
+		}
+	}
+	if usage.CachedPromptTokens != nil && usage.PromptReported && *usage.CachedPromptTokens > usage.PromptTokens {
+		usage.Invalid = true
+	}
+	return usage
 }
 
 // CheckModel verifies that cfg.Model exists in GET {base}/models and supports generateContent.
