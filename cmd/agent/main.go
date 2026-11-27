@@ -29,6 +29,8 @@ const (
 	defaultHistoryTokens = 24000
 	maxLLMToolOutput     = 8 << 10 // 8 KiB
 	maxUIDisplayChars    = 400
+	mouseWheelLines      = 3
+	disableMouseEnv      = "NABD_NO_MOUSE"
 )
 
 const baseSystemPrompt = `You are NabdCoder, a careful senior software engineer working inside the Nabd workspace jail.
@@ -363,6 +365,20 @@ type clipboardResultMsg struct {
 
 func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		if msg.Action != tea.MouseActionPress {
+			return m, nil
+		}
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.viewport.LineUp(mouseWheelLines)
+		case tea.MouseButtonWheelDown:
+			m.viewport.LineDown(mouseWheelLines)
+			if m.pendingDisclosure != nil {
+				m.syncDisclosureAfterScroll()
+			}
+		}
+		return m, nil
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -397,7 +413,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pendingDisclosure != nil && len(m.pendingTools) > 0 {
 			key := strings.ToLower(msg.String())
 			if key == "y" || key == "yes" {
-				if !m.viewport.AtBottom() {
+				if !m.disclosureAtBottom() {
 					m.status = "Scroll to the end before approving disclosure"
 					return m, nil
 				}
@@ -430,6 +446,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Type != tea.KeyCtrlC {
 				var cmd tea.Cmd
 				m.viewport, cmd = m.viewport.Update(msg)
+				m.syncDisclosureAfterScroll()
 				return m, cmd
 			}
 		}
@@ -922,6 +939,16 @@ func (m *uiModel) completeTurnTimer() {
 	m.turnStart = time.Time{}
 	m.lastTurnDuration = elapsed
 	m.hasLastTurnDuration = true
+}
+
+func (m *uiModel) disclosureAtBottom() bool {
+	return m.viewport.AtBottom()
+}
+
+func (m *uiModel) syncDisclosureAfterScroll() {
+	if m.pendingDisclosure != nil && m.disclosureAtBottom() && m.status == "Scroll to the end before approving disclosure" {
+		m.status = "Review tool output; scroll to end, then approve [y/n]"
+	}
 }
 
 func (m *uiModel) finishRequest() {
@@ -1723,6 +1750,24 @@ func disableUnsandboxedTools(reg *tools.Registry) {
 	reg.Disable("mcp_call", "go_verify")
 }
 
+func mouseTrackingEnabled(getenv func(string) string) bool {
+	if getenv == nil {
+		return true
+	}
+	return getenv(disableMouseEnv) != "1"
+}
+
+func programOptions(ttyOut io.Writer, getenv func(string) string) []tea.ProgramOption {
+	opts := []tea.ProgramOption{
+		tea.WithAltScreen(),
+		tea.WithOutput(ttyOut),
+	}
+	if mouseTrackingEnabled(getenv) {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	return opts
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
 		os.Exit(RunSetup(os.Stdin, os.Stdout, os.Stderr, defaultConfigDir(), os.Args[2:]))
@@ -1793,7 +1838,7 @@ func main() {
 	model := initialModel(reg, client, autoMode)
 	model.ttyWriter = ttyOut
 	model.setKeySource(keySource)
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithOutput(ttyOut))
+	p := tea.NewProgram(model, programOptions(ttyOut, os.Getenv)...)
 	_, runErr := p.Run()
 	model.lifecycle.stop()
 	if !model.lifecycle.wait(5 * time.Second) {
