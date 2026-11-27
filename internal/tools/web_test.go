@@ -598,9 +598,14 @@ func TestWebSearchValidation(t *testing.T) {
 
 	for _, tc := range invalidCases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := runWebToolApproved(t, reg, "web_search", tc.args)
-			if !strings.Contains(out, "Error:") {
-				t.Fatalf("expected validation error for %s, got: %s", tc.name, out)
+			raw, err := json.Marshal(tc.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Approval computes the canonical request identity, so invalid
+			// arguments are refused before any token exists.
+			if _, err := reg.Approve("web_search", raw); err == nil {
+				t.Fatalf("expected approval-time validation error for %s", tc.name)
 			}
 		})
 	}
@@ -1076,8 +1081,11 @@ func TestWebHTMLHardeningAndShortQueryRedaction(t *testing.T) {
 	if !strings.Contains(outTrailing, "Error:") {
 		t.Fatalf("expected trailing JSON error or approval refusal, got: %s", outTrailing)
 	}
-	outTrailingApproved := runWebToolApproved(t, reg, "web_search", map[string]any{"query": "bad\x1b[31mtext"})
-	if !strings.Contains(outTrailingApproved, "control characters") {
-		t.Fatalf("expected control char rejection, got: %s", outTrailingApproved)
+	badRaw, err := json.Marshal(map[string]any{"query": "bad\x1b[31mtext"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Approve("web_search", badRaw); err == nil || !strings.Contains(err.Error(), "control characters") {
+		t.Fatalf("expected control char rejection at approval, got: %v", err)
 	}
 }

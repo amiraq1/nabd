@@ -1523,6 +1523,9 @@ func (m *uiModel) formatStatus() string {
 			fmt.Fprintf(&b, "Shadow cleanup: ok (%s)\n", last.UTC().Format("2006-01-02T15:04:05Z"))
 		}
 	}
+	if m.registry != nil && !m.registry.ShadowDirectorySyncSupported() {
+		b.WriteString("Shadow durability: directory sync unsupported on this platform; the newest backup may not survive a sudden power loss (see docs/THREAT_MODEL.md)\n")
+	}
 	fmt.Fprintf(&b, "Provider: %s\n", m.provider)
 	if m.provider == "gemini" {
 		searchStatus := "off"

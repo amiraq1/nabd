@@ -283,8 +283,10 @@ func (r *Registry) RequiresApproval(name string) bool {
 // scoped to exactly these tools: it says nothing about whether other tools
 // start subprocesses under their own policy.
 var manuallyApprovedTools = map[string]struct{}{
-	"go_verify": {},
-	"mcp_call":  {},
+	"go_verify":  {},
+	"mcp_call":   {},
+	"web_search": {},
+	"web_fetch":  {},
 }
 
 // RequiresManualApproval reports whether auto-approval is refused for this
@@ -309,6 +311,16 @@ func (r *Registry) NeedsApproval(name string) bool { return r.RequiresApproval(n
 func (r *Registry) Has(name string) bool {
 	_, ok := r.handlers[name]
 	return ok
+}
+
+// ShadowDirectorySyncSupported reports whether this platform can fsync the
+// shadow store directory. False means the newest backup is not guaranteed to
+// survive a sudden power loss; the UI shows this limitation explicitly.
+func (r *Registry) ShadowDirectorySyncSupported() bool {
+	if r == nil || r.shadow == nil {
+		return true
+	}
+	return r.shadow.DirectorySyncSupported()
 }
 
 // ShadowCleanupStatus reports retention-sweep health for the UI and any health
@@ -1100,6 +1112,16 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 		}
 		identity = canonicalID
 	}
+	if name == "web_search" {
+		_, _, canonicalID, err := r.CanonicalWebSearch(rawArgs)
+		if err != nil {
+			return Approval{}, err
+		}
+		if identity != "" && identity != canonicalID {
+			return Approval{}, fmt.Errorf("web_search canonical request identity mismatch")
+		}
+		identity = canonicalID
+	}
 
 	hash := hashBytes(rawArgs)
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: r.toolDetail(name, rawArgs)}); err != nil {
@@ -1226,6 +1248,12 @@ func (r *Registry) expectedApprovalIdentity(name string, rawArgs json.RawMessage
 		return identity, nil
 	case "web_fetch":
 		_, _, identity, err := CanonicalWebFetchURL(rawArgs)
+		if err != nil {
+			return "", err
+		}
+		return identity, nil
+	case "web_search":
+		_, _, identity, err := r.CanonicalWebSearch(rawArgs)
 		if err != nil {
 			return "", err
 		}

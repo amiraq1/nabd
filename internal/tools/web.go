@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -321,12 +322,37 @@ func parseWebSearchArgs(raw json.RawMessage) (string, int, error) {
 	return q, maxRes, nil
 }
 
+// CanonicalWebSearch validates web_search arguments with exactly the rules the
+// executor applies and returns a stable approval identity covering the
+// provider, destination endpoint, query and result limit. The preview, the
+// approval token and execution all derive their values from this one function,
+// so switching any of those fields after approval invalidates the token. API
+// keys are never part of the identity or of any displayed value.
+func (r *Registry) CanonicalWebSearch(rawArgs json.RawMessage) (query string, maxResults int, identity string, err error) {
+	query, maxResults, err = parseWebSearchArgs(rawArgs)
+	if err != nil {
+		return "", 0, "", err
+	}
+	provider, host := "disabled", ""
+	if r != nil && r.webConfig != nil {
+		provider = r.webConfig.Provider
+		if u, parseErr := url.Parse(r.webConfig.Endpoint); parseErr == nil {
+			host = u.Host
+		}
+	}
+	var canonical strings.Builder
+	for _, field := range []string{"websearch-v1", provider, host, query, strconv.Itoa(maxResults)} {
+		fmt.Fprintf(&canonical, "%d:%s", len(field), field)
+	}
+	return query, maxResults, "websearch:sha256:" + hashBytes([]byte(canonical.String())), nil
+}
+
 func (r *Registry) executeWebSearch(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 	if r.webConfig == nil {
 		return "", errors.New("web_search is disabled")
 	}
 
-	query, maxResults, err := parseWebSearchArgs(rawArgs)
+	query, maxResults, _, err := r.CanonicalWebSearch(rawArgs)
 	if err != nil {
 		return "", err
 	}

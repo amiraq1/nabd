@@ -8,22 +8,33 @@
 // chain uses unkeyed SHA-256 (`mode: "sha256"`) for integrity against non-hostile
 // corruption only.
 //
+// Appends are serialized across processes with .nabd/audit.lock. Under that lock
+// the writer re-checks the log's file identity, size, modification time and last
+// record before extending the chain, so a cooperating second process cannot
+// duplicate a sequence number. The lock only coordinates writers that honor it:
+// a process with write access can still edit the file outside it.
+//
 // Tail-truncation limitation: because there is no external out-of-band
 // checkpoint, a local attacker with write access to .nabd/audit.log can delete
 // trailing events (or delete the entire log) between separate runs without
 // detection by a fresh Open/Verify. Within a single running Log instance, Verify
-// still detects truncation below the in-memory sequence counter. A local user
-// who can write both the log and NABD_AUDIT_ANCHOR can also recompute the chain.
+// still detects truncation below the in-memory sequence counter. A same-length
+// rewrite of an earlier prefix is only detected by a full Open/Verify scan or an
+// independent checkpoint; the incremental append path does not re-read the whole
+// file. A local user who can write both the log and NABD_AUDIT_ANCHOR can also
+// recompute the chain.
 package audit
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -33,10 +44,15 @@ import (
 const (
 	dir            = ".nabd"
 	fileName       = ".nabd/audit.log"
+	lockName       = "audit.lock"
 	AnchorEnv      = "NABD_AUDIT_ANCHOR"
 	eventVersion1  = 1
 	modeSHA256     = "sha256"
 	modeHMACSHA256 = "hmac-sha256"
+
+	defaultLockWait    = 10 * time.Second
+	lockRetryInterval  = 10 * time.Millisecond
+	maxAppendVerifyLen = 32 << 20
 )
 
 // Event is one JSON line in the audit log.
@@ -71,22 +87,56 @@ type hashInput struct {
 
 // Log appends events inside an already-jailed workspace root.
 type Log struct {
-	root     *os.Root
-	mu       sync.Mutex
-	now      func() time.Time
+	root *os.Root
+	mu   sync.Mutex
+	now  func() time.Time
+
 	prevHash string
 	sequence uint64
 	mode     string
 	hmacKey  []byte // derived in memory from NABD_AUDIT_ANCHOR; never persisted
+
+	anchor   chainAnchor
+	anchored bool
+	lockWait time.Duration
+
+	// syncFile and syncDir are test seams. Production uses f.Sync and the
+	// platform directory sync; neither is a package-level hook, so tests never
+	// share mutable state with concurrent tests.
+	syncFile func(*os.File) error
+	syncDir  func(*os.File) error
 }
 
-// Open binds a log to root. Nothing is created until the first Write, so a
-// read-only workspace can still be used for reading.
+// chainAnchor records the verified end of the chain, so an append can detect a
+// replaced, truncated or rewritten tail without re-reading the whole file.
+type chainAnchor struct {
+	offset  int64
+	tail    []byte
+	modTime time.Time
+	id      fileID
+}
+
+type chainState struct {
+	lastHash string
+	seq      uint64
+	size     int64
+	tail     []byte
+}
+
+// Open binds a log to root. It does not create the log (or its lock) until the
+// first Write, so a workspace without an existing log can still be read.
 func Open(root *os.Root) (*Log, error) {
 	if root == nil {
 		return nil, errors.New("audit: nil root")
 	}
-	l := &Log{root: root, now: time.Now, mode: modeSHA256}
+	l := &Log{
+		root:     root,
+		now:      time.Now,
+		mode:     modeSHA256,
+		lockWait: defaultLockWait,
+		syncFile: func(f *os.File) error { return f.Sync() },
+		syncDir:  syncDirectory,
+	}
 	if value := os.Getenv(AnchorEnv); value != "" {
 		sum := sha256.Sum256([]byte(value))
 		key := make([]byte, len(sum))
@@ -101,60 +151,120 @@ func Open(root *os.Root) (*Log, error) {
 }
 
 func (l *Log) loadChain() error {
-	lastHash, lastSeq, err := l.scanChain(true)
+	if _, err := l.root.Lstat(fileName); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			l.prevHash, l.sequence = l.genesis(), 0
+			l.anchored = false
+			return nil
+		}
+		return fmt.Errorf("audit: inspect log: %w", err)
+	}
+
+	lock, err := acquireAuditLock(l.root, l.lockWait)
 	if err != nil {
 		return err
 	}
-	l.prevHash, l.sequence = lastHash, lastSeq
-	return nil
-}
+	defer lock.close()
 
-func (l *Log) scanChain(initialLoad bool) (string, uint64, error) {
 	f, err := l.root.Open(fileName)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return l.genesis(), 0, nil
+			// The log disappeared between Lstat and the locked open. Start from
+			// genesis; no chain was verified, so nothing is trusted yet.
+			l.prevHash, l.sequence = l.genesis(), 0
+			l.anchored = false
+			return nil
 		}
-		return "", 0, fmt.Errorf("audit: read chain: %w", err)
+		return fmt.Errorf("audit: read chain: %w", err)
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64<<10), 1<<20)
-	lastHash := l.genesis()
-	var lastSeq uint64
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var event Event
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			if initialLoad {
-				return "", 0, fmt.Errorf("audit: decode existing event: %w", err)
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("audit: stat chain: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("audit: log is not a regular file")
+	}
+	id, err := fileIdentity(f)
+	if err != nil {
+		return fmt.Errorf("audit: identify log: %w", err)
+	}
+	state, err := l.scanFrom(f, 0, l.genesis(), 0, false)
+	if err != nil {
+		return err
+	}
+	l.prevHash, l.sequence = state.lastHash, state.seq
+	l.anchor = chainAnchor{offset: state.size, tail: state.tail, modTime: info.ModTime(), id: id}
+	l.anchored = true
+	return nil
+}
+
+// scanFrom verifies a section of the log. start must be a record boundary;
+// baseHash/baseSeq identify the verified state immediately before start.
+// requireFinalNewline rejects a partially written trailing record, which is
+// only acceptable while loading an existing file.
+func (l *Log) scanFrom(f *os.File, start int64, baseHash string, baseSeq uint64, requireFinalNewline bool) (chainState, error) {
+	state := chainState{lastHash: baseHash, seq: baseSeq, size: start}
+	if start < 0 {
+		return state, errors.New("audit: invalid scan offset")
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return state, fmt.Errorf("audit: stat chain: %w", err)
+	}
+	end := info.Size()
+	if start > end {
+		return state, fmt.Errorf("audit: log is shorter than the verified chain (%d < %d bytes)", end, start)
+	}
+	if start == end {
+		return state, nil
+	}
+
+	reader := bufio.NewReaderSize(io.NewSectionReader(f, start, end-start), 64<<10)
+	pos := start
+	for {
+		raw, readErr := reader.ReadBytes('\n')
+		if len(raw) > 0 {
+			complete := raw[len(raw)-1] == '\n'
+			line := raw
+			if complete {
+				line = raw[:len(raw)-1]
 			}
-			return "", 0, fmt.Errorf("audit: invalid event at line %d: %w", lastSeq+1, err)
+			if !complete && requireFinalNewline {
+				return chainState{}, fmt.Errorf("audit: incomplete trailing record at offset %d", pos)
+			}
+			trimmed := strings.TrimSpace(string(line))
+			if trimmed != "" {
+				var event Event
+				if err := json.Unmarshal([]byte(trimmed), &event); err != nil {
+					return chainState{}, fmt.Errorf("audit: invalid event at offset %d: %w", pos, err)
+				}
+				state.seq++
+				if err := l.validateEventPolicy(event, state.seq); err != nil {
+					return chainState{}, err
+				}
+				if event.Sequence != state.seq || event.PrevHash != state.lastHash {
+					return chainState{}, fmt.Errorf("audit: broken chain at sequence %d", state.seq)
+				}
+				want, err := l.computeEventHash(event)
+				if err != nil || !hmac.Equal([]byte(want), []byte(event.Hash)) {
+					return chainState{}, fmt.Errorf("audit: hash mismatch at sequence %d", state.seq)
+				}
+				state.lastHash = event.Hash
+				state.tail = append([]byte(nil), raw...)
+			}
+			pos += int64(len(raw))
+			state.size = pos
 		}
-		lastSeq++
-		if err := l.validateEventPolicy(event, lastSeq); err != nil {
-			return "", 0, err
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return chainState{}, fmt.Errorf("audit: scan chain: %w", readErr)
 		}
-		if event.Sequence != lastSeq || event.PrevHash != lastHash {
-			return "", 0, fmt.Errorf("audit: broken chain at sequence %d", lastSeq)
-		}
-		want, err := l.computeEventHash(event)
-		if err != nil || !hmac.Equal([]byte(want), []byte(event.Hash)) {
-			return "", 0, fmt.Errorf("audit: hash mismatch at sequence %d", lastSeq)
-		}
-		lastHash = event.Hash
 	}
-	if err := scanner.Err(); err != nil {
-		if initialLoad {
-			return "", 0, fmt.Errorf("audit: scan existing chain: %w", err)
-		}
-		return "", 0, err
-	}
-	return lastHash, lastSeq, nil
+	return state, nil
 }
 
 func (l *Log) validateEventPolicy(event Event, seq uint64) error {
@@ -219,11 +329,58 @@ func (l *Log) computeEventHash(event Event) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// Write appends one event, links it to the previous hash and fsyncs it. A
-// failed write does not advance the in-memory chain.
-func (l *Log) Write(event Event) error {
+// Write appends one event, links it to the previous hash, and fsyncs it while
+// holding .nabd/audit.lock. The chain is re-verified under that lock, so a
+// concurrent writer cannot reuse a sequence number. A failed write does not
+// advance the in-memory chain.
+func (l *Log) Write(event Event) (err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	lock, lockErr := acquireAuditLock(l.root, l.lockWait)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() {
+		if closeErr := lock.close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("audit: release lock: %w", closeErr))
+		}
+	}()
+
+	existed := true
+	if _, statErr := l.root.Lstat(fileName); statErr != nil {
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("audit: inspect log: %w", statErr)
+		}
+		existed = false
+	}
+	if err := l.root.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("audit: create directory: %w", err)
+	}
+	f, err := l.root.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("audit: open log: %w", err)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("audit: close log: %w", closeErr))
+		}
+	}()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("audit: stat log: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("audit: log is not a regular file")
+	}
+	id, err := fileIdentity(f)
+	if err != nil {
+		return fmt.Errorf("audit: identify log: %w", err)
+	}
+	if err := l.verifyAppendPoint(f, info, id); err != nil {
+		return err
+	}
 
 	if event.Time.IsZero() {
 		event.Time = l.now().UTC()
@@ -242,22 +399,133 @@ func (l *Log) Write(event Event) error {
 		return fmt.Errorf("audit: encode event: %w", err)
 	}
 	data = append(data, '\n')
+	line := append([]byte(nil), data...)
+	expectedSize := l.anchor.offset + int64(len(data))
 
-	if err := l.root.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("audit: create directory: %w", err)
-	}
-	f, err := l.root.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-	if err != nil {
-		return fmt.Errorf("audit: open log: %w", err)
-	}
-	_, writeErr := f.Write(data)
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("audit: append event: %w", err)
 	}
+	if err := l.syncFile(f); err != nil {
+		return fmt.Errorf("audit: sync log: %w", err)
+	}
+	written, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("audit: stat appended log: %w", err)
+	}
+	if written.Size() != expectedSize {
+		return fmt.Errorf("audit: append size mismatch (%d bytes, expected %d)", written.Size(), expectedSize)
+	}
+
+	// The record is on disk and synced. Advance the in-memory chain before any
+	// directory sync so a retry cannot append the same event twice.
 	l.sequence = event.Sequence
 	l.prevHash = event.Hash
+	l.anchor = chainAnchor{offset: written.Size(), tail: line, modTime: written.ModTime(), id: id}
+	l.anchored = true
+
+	if !existed {
+		if syncErr := l.syncLogDirectory(); syncErr != nil {
+			return syncErr
+		}
+	}
+	return nil
+}
+
+// verifyAppendPoint revalidates the log under the cross-process lock, verifies
+// any records another writer appended since the last known offset, and refreshes
+// the in-memory chain head.
+func (l *Log) verifyAppendPoint(f *os.File, info os.FileInfo, id fileID) error {
+	size := info.Size()
+
+	if l.anchored && id != l.anchor.id {
+		return errors.New("audit: log file identity changed since it was opened (possible replacement); refusing to append")
+	}
+	if size < l.anchor.offset {
+		return fmt.Errorf("audit: log shrank from %d to %d bytes; refusing to append", l.anchor.offset, size)
+	}
+
+	if !l.anchored {
+		if size > 0 {
+			state, err := l.scanFrom(f, 0, l.genesis(), 0, true)
+			if err != nil {
+				return err
+			}
+			l.prevHash, l.sequence = state.lastHash, state.seq
+			l.anchor = chainAnchor{offset: state.size, tail: state.tail, modTime: info.ModTime(), id: id}
+		}
+		l.anchor.id = id
+		l.anchor.modTime = info.ModTime()
+		l.anchored = true
+		return nil
+	}
+
+	switch {
+	case size > l.anchor.offset:
+		if size-l.anchor.offset > maxAppendVerifyLen {
+			return fmt.Errorf("audit: %d unverified bytes appended; refusing to append", size-l.anchor.offset)
+		}
+		state, err := l.scanFrom(f, l.anchor.offset, l.prevHash, l.sequence, true)
+		if err != nil {
+			return err
+		}
+		l.prevHash, l.sequence = state.lastHash, state.seq
+		l.anchor.offset = state.size
+		l.anchor.tail = state.tail
+		l.anchor.modTime = info.ModTime()
+	case size == l.anchor.offset:
+		if !info.ModTime().Equal(l.anchor.modTime) {
+			// Metadata changed without a size change: a prefix may have been
+			// rewritten. Re-verify the whole file rather than trusting the tail.
+			state, err := l.scanFrom(f, 0, l.genesis(), 0, false)
+			if err != nil {
+				return err
+			}
+			if state.size != size {
+				return errors.New("audit: log changed while it was being verified")
+			}
+			l.prevHash, l.sequence = state.lastHash, state.seq
+			l.anchor.tail = state.tail
+			l.anchor.modTime = info.ModTime()
+			break
+		}
+		if len(l.anchor.tail) > 0 {
+			tailStart := l.anchor.offset - int64(len(l.anchor.tail))
+			if tailStart < 0 {
+				return errors.New("audit: invalid verified tail anchor")
+			}
+			buf := make([]byte, len(l.anchor.tail))
+			if _, err := f.ReadAt(buf, tailStart); err != nil {
+				return fmt.Errorf("audit: re-read last record: %w", err)
+			}
+			if !bytes.Equal(buf, l.anchor.tail) {
+				// A trailing blank line or a rewritten tail invalidates the fast
+				// path; re-verify the whole file before deciding to fail.
+				state, err := l.scanFrom(f, 0, l.genesis(), 0, false)
+				if err != nil {
+					return err
+				}
+				if state.size != size {
+					return errors.New("audit: log changed while it was being verified")
+				}
+				l.prevHash, l.sequence = state.lastHash, state.seq
+				l.anchor.tail = state.tail
+				l.anchor.modTime = info.ModTime()
+			}
+		}
+	}
+	l.anchor.id = id
+	return nil
+}
+
+func (l *Log) syncLogDirectory() error {
+	d, err := l.root.Open(dir)
+	if err != nil {
+		return fmt.Errorf("audit: open .nabd for sync: %w", err)
+	}
+	defer d.Close()
+	if err := l.syncDir(d); err != nil {
+		return fmt.Errorf("audit: sync .nabd directory: %w", err)
+	}
 	return nil
 }
 
@@ -265,15 +533,59 @@ func (l *Log) Write(event Event) error {
 // prevents silent forged appends when NABD_AUDIT_ANCHOR is held outside the
 // writable log, though without an external checkpoint a fresh Verify cannot
 // detect tail truncation across separate process runs.
-func (l *Log) Verify() error {
+func (l *Log) Verify() (err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, seq, err := l.scanChain(false)
+
+	lock, lockErr := acquireAuditLock(l.root, l.lockWait)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() {
+		if closeErr := lock.close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("audit: release lock: %w", closeErr))
+		}
+	}()
+
+	f, openErr := l.root.Open(fileName)
+	if openErr != nil {
+		if errors.Is(openErr, os.ErrNotExist) {
+			if l.sequence != 0 {
+				return fmt.Errorf("audit: log has 0 events, expected %d", l.sequence)
+			}
+			return nil
+		}
+		return fmt.Errorf("audit: read chain: %w", openErr)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("audit: stat chain: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("audit: log is not a regular file")
+	}
+	id, err := fileIdentity(f)
+	if err != nil {
+		return fmt.Errorf("audit: identify log: %w", err)
+	}
+	if l.anchored && id != l.anchor.id {
+		return errors.New("audit: log file identity changed since it was opened")
+	}
+
+	state, err := l.scanFrom(f, 0, l.genesis(), 0, false)
 	if err != nil {
 		return err
 	}
-	if seq != l.sequence {
-		return fmt.Errorf("audit: log has %d events, expected %d", seq, l.sequence)
+	// A cooperating process may have appended more events since this Log last
+	// wrote. That extends the verified chain and is legitimate; only a shorter
+	// log means events this instance saw are missing.
+	if state.seq < l.sequence {
+		return fmt.Errorf("audit: log has %d events, expected at least %d", state.seq, l.sequence)
 	}
+	l.prevHash, l.sequence = state.lastHash, state.seq
+	l.anchor = chainAnchor{offset: state.size, tail: state.tail, modTime: info.ModTime(), id: id}
+	l.anchored = true
 	return nil
 }
