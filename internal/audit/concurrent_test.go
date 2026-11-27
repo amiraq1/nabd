@@ -272,7 +272,13 @@ func TestWriteDetectsPrefixRewriteWhenMetadataChanges(t *testing.T) {
 	if err := os.WriteFile(path, modified, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Writing changes mtime, which forces the full re-verification path.
+	// Advance mtime explicitly beyond coarse filesystem timestamp ticks (e.g.
+	// Android/Linux jiffy ticks, 1s ext3/HFS+, 2s FAT) so the metadata-change
+	// re-verification path is exercised deterministically.
+	nextMod := log.anchor.modTime.Add(10 * time.Second)
+	if err := os.Chtimes(path, nextMod, nextMod); err != nil {
+		t.Fatal(err)
+	}
 	if err := log.Write(Event{Event: "applied", Tool: "edit_file"}); err == nil {
 		t.Fatal("prefix rewrite with a changed mtime was accepted")
 	}
