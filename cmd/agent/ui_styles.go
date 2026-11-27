@@ -21,6 +21,11 @@ var (
 	colorAssistant = lipgloss.CompleteColor{TrueColor: "#4ADE80", ANSI256: "78", ANSI: "2"}
 	// Danger - errors, warnings, and diff -
 	colorDanger = lipgloss.CompleteColor{TrueColor: "#F87171", ANSI256: "203", ANSI: "1"}
+
+	// Quiet category tokens for visual tool badges (non-security indicators).
+	colorBadgeRead   = lipgloss.CompleteColor{TrueColor: "#79C0FF", ANSI256: "111", ANSI: "4"}
+	colorBadgeWeb    = lipgloss.CompleteColor{TrueColor: "#56D4DD", ANSI256: "80", ANSI: "6"}
+	colorBadgeVerify = lipgloss.CompleteColor{TrueColor: "#B392F0", ANSI256: "141", ANSI: "5"}
 )
 
 // Glyphs with ASCII fallbacks.
@@ -39,6 +44,10 @@ const (
 	glyphCrossASCII    = "x"
 	glyphEllipsis      = "…"
 	glyphEllipsisASCII = "..."
+	glyphTreeLast      = "└─ "
+	glyphTreeLastASCII = "+- "
+	glyphDotSep        = " · "
+	glyphDotSepASCII   = " | "
 )
 
 var (
@@ -49,6 +58,28 @@ var (
 
 func isASCIIMode() bool {
 	return os.Getenv("TERM") == "dumb" || os.Getenv("NABD_ASCII") == "1"
+}
+
+func isColorDisabled() bool {
+	if os.Getenv("TERM") == "dumb" {
+		return true
+	}
+	if v, ok := os.LookupEnv("NO_COLOR"); ok && v != "" {
+		return true
+	}
+	if clicolor, ok := os.LookupEnv("CLICOLOR"); ok && clicolor == "0" {
+		if force := os.Getenv("CLICOLOR_FORCE"); force == "" || force == "0" {
+			return true
+		}
+	}
+	return false
+}
+
+func renderStyledSpan(style lipgloss.Style, text string) string {
+	if text == "" || isColorDisabled() {
+		return text
+	}
+	return style.Render(text)
 }
 
 func activeIdentityGlyph() string {
@@ -93,6 +124,24 @@ func activeEllipsisGlyph() string {
 	return glyphEllipsis
 }
 
+func activeTreeMidPrefix() string {
+	return activeBarGlyph() + " "
+}
+
+func activeTreeLastPrefix() string {
+	if isASCIIMode() {
+		return glyphTreeLastASCII
+	}
+	return glyphTreeLast
+}
+
+func activeInlineSep() string {
+	if isASCIIMode() {
+		return glyphDotSepASCII
+	}
+	return glyphDotSep
+}
+
 func init() {
 	if isASCIIMode() {
 		symIdentity = glyphIdentityASCII
@@ -121,11 +170,18 @@ var (
 	toolSuccessStyle = lipgloss.NewStyle().Foreground(colorAssistant)
 	toolErrorStyle   = lipgloss.NewStyle().Foreground(colorDanger)
 	toolPendingStyle = lipgloss.NewStyle().Foreground(colorMuted)
-	errorBarStyle    = lipgloss.NewStyle().Foreground(colorDanger)
-	errorLabelStyle  = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
-	errorTextStyle   = lipgloss.NewStyle().Foreground(colorFg)
-	localBarStyle    = lipgloss.NewStyle().Foreground(colorSubtle)
-	localTextStyle   = lipgloss.NewStyle().Foreground(colorMuted)
+	toolTreeStyle    = lipgloss.NewStyle().Foreground(colorMuted)
+
+	toolBadgeReadStyle    = lipgloss.NewStyle().Foreground(colorBadgeRead).Bold(true)
+	toolBadgeEditStyle    = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	toolBadgeWebStyle     = lipgloss.NewStyle().Foreground(colorBadgeWeb).Bold(true)
+	toolBadgeVerifyStyle  = lipgloss.NewStyle().Foreground(colorBadgeVerify).Bold(true)
+	toolBadgeNeutralStyle = lipgloss.NewStyle().Foreground(colorMuted).Bold(true)
+	errorBarStyle         = lipgloss.NewStyle().Foreground(colorDanger)
+	errorLabelStyle       = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
+	errorTextStyle        = lipgloss.NewStyle().Foreground(colorFg)
+	localBarStyle         = lipgloss.NewStyle().Foreground(colorSubtle)
+	localTextStyle        = lipgloss.NewStyle().Foreground(colorMuted)
 
 	// Markdown-lite styling (no filled backgrounds)
 	mdHeading1Style   = lipgloss.NewStyle().Bold(true).Foreground(colorFg).MarginTop(1)
