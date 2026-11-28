@@ -974,7 +974,7 @@ func (m *uiModel) launchTool(tc ToolCall, approval *tools.Approval) tea.Cmd {
 	m.finishRequest()
 	ctx, cancel := context.WithCancel(m.lifecycle.ctx)
 	m.requestCancel = cancel
-	return m.lifecycle.wrap(executeToolCmdWith(ctx, m.registry, tc, approval, m.taskGen, m.runToolForTest))
+	return m.lifecycle.wrap(executeToolCmd(ctx, m.registry, tc, approval, m.taskGen, m.runToolForTest))
 }
 
 func (m uiModel) startLLM() (tea.Model, tea.Cmd) {
@@ -1231,11 +1231,7 @@ func toolFingerprint(tc ToolCall) string {
 	return sha256Hex(tc.Function.Name + "\x00" + tc.Function.Arguments)
 }
 
-func executeToolCmd(ctx context.Context, reg *tools.Registry, tc ToolCall, approval *tools.Approval, gen uint64) tea.Cmd {
-	return executeToolCmdWith(ctx, reg, tc, approval, gen, nil)
-}
-
-func executeToolCmdWith(ctx context.Context, reg *tools.Registry, tc ToolCall, approval *tools.Approval, gen uint64, run func(context.Context, *tools.Registry, ToolCall, *tools.Approval) string) tea.Cmd {
+func executeToolCmd(ctx context.Context, reg *tools.Registry, tc ToolCall, approval *tools.Approval, gen uint64, run func(context.Context, *tools.Registry, ToolCall, *tools.Approval) string) tea.Cmd {
 	return func() tea.Msg {
 		var result string
 		if ctx.Err() != nil {
