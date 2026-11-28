@@ -1794,6 +1794,17 @@ func (r *Registry) registerOtherTools() {
 		},
 	}
 
+	r.handlers["grep_search"] = ToolSpec{
+		Name:           "grep_search",
+		Description:    "Search workspace text with a literal or RE2 regex query. Read-only and resource-bounded: replies are JSON with matches, total_matches, files_scanned, and truncated; skips binary files, symlinks, sensitive paths, and .git/.nabd/node_modules/vendor; budget 2000 files and 16 MiB of reads.",
+		ReadOnly:       true,
+		MaxOutputBytes: maxGrepOutputBytes,
+		Parameters:     json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Text to find (required, max 256 bytes); treated literally unless is_regex is true"},"path":{"type":"string","description":"Relative file or directory to search (default .)"},"is_regex":{"type":"boolean","description":"Interpret query as an RE2 regular expression (default false)"},"case_sensitive":{"type":"boolean","description":"Case-sensitive matching (default true)"},"file_glob":{"type":"string","description":"Optional glob filter on file name or relative path, e.g. *.go"},"max_results":{"type":"integer","minimum":1,"maximum":100,"description":"Maximum matches returned (default 50, max 100)"}},"required":["query"]}`),
+		Execute: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return r.grepSearch(ctx, args)
+		},
+	}
+
 	r.handlers["mcp_call"] = ToolSpec{
 		Name:        "mcp_call",
 		Description: "Call a tool on an external MCP server via stdio. Starts the server process, calls the tool, then closes it.",

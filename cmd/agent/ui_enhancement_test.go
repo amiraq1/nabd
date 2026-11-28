@@ -133,6 +133,13 @@ func TestFormatToolSummary(t *testing.T) {
 	if strings.Contains(sumRepoMap, "Ctrl+O") {
 		t.Fatalf("formatToolSummary(repo_map) must not embed Ctrl+O: %s", sumRepoMap)
 	}
+
+	// grep_search
+	grepResult := `{"matches":[{"path":"a.go","line":1,"text":"needle"}],"total_matches":3,"files_scanned":2,"truncated":true}`
+	sumGrep := formatToolSummary("grep_search", `{"query":"needle"}`, grepResult)
+	if sumGrep != "grep_search(needle) -> 3 matches in 2 files (truncated)" {
+		t.Fatalf("unexpected grep_search summary: %s", sumGrep)
+	}
 }
 
 func TestTrimHistoryKeepsToolCallsPaired(t *testing.T) {

@@ -48,6 +48,9 @@ func TestOpenAIToolsPrefixIsDeterministic(t *testing.T) {
 		}
 		seen[name] = true
 	}
+	if !seen["grep_search"] {
+		t.Fatalf("expected grep_search in default tool set, got %v", names)
+	}
 
 	for i := 0; i < 20; i++ {
 		next, err := json.Marshal(reg.OpenAITools())
