@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -369,9 +368,4 @@ func encodeEntriesJSONL(entries []Entry) ([]byte, error) {
 		}
 	}
 	return b.Bytes(), nil
-}
-
-// Helper for tests needing direct inspection of memory directory path.
-func isWhitespaceOnly(s string) bool {
-	return strings.TrimSpace(s) == ""
 }

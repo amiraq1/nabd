@@ -19,7 +19,9 @@ type memoryDeletePending struct {
 	Title string
 }
 
-var errRememberUsage = errors.New("Usage: /remember [decision:|bugfix:|handoff:|note:] <text>")
+const rememberSyntax = "/remember [decision:|bugfix:|handoff:|note:] <text>"
+
+var errRememberUsage = errors.New("usage: " + rememberSyntax)
 
 func isRememberKindToken(s string) bool {
 	if len(s) == 0 || len(s) > 32 {
@@ -105,7 +107,7 @@ func (m uiModel) handleRememberCommand(rawArgs string) (tea.Model, tea.Cmd) {
 	input, err := parseRememberCommandArgs(rawArgs)
 	if err != nil {
 		if errors.Is(err, errRememberUsage) {
-			m.messages = append(m.messages, Message{Role: "local", Content: errRememberUsage.Error()})
+			m.messages = append(m.messages, Message{Role: "local", Content: "Usage: " + rememberSyntax})
 		} else {
 			m.messages = append(m.messages, Message{Role: "local", Content: "Memory rejected: " + sanitizeSingleLineDisplay(err.Error())})
 		}
