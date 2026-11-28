@@ -45,13 +45,23 @@ func (b *boundedOutput) Write(p []byte) (int, error) {
 	return n, nil
 }
 func (b *boundedOutput) String() string {
+	head, omitted, tail := b.segments()
+	if omitted <= 0 {
+		return string(append(bytes.Clone(head), tail...))
+	}
+	return string(head) + fmt.Sprintf("\n... [%d bytes omitted] ...\n", omitted) + string(tail)
+}
+
+// segments returns the retained prefix, the number of dropped bytes between the
+// prefix and the tail, and the retained tail without inserting any separator.
+// Callers that must reason about the start and the end of a stream separately
+// (for example a summary that looks for failure markers) use this instead of
+// String, whose inline omission marker can itself be truncated away.
+func (b *boundedOutput) segments() (head []byte, omitted int64, tail []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	omitted := b.total - int64(len(b.head)+len(b.tail))
-	if omitted <= 0 {
-		return string(append(bytes.Clone(b.head), b.tail...))
-	}
-	return string(b.head) + fmt.Sprintf("\n... [%d bytes omitted] ...\n", omitted) + string(b.tail)
+	omitted = b.total - int64(len(b.head)+len(b.tail))
+	return bytes.Clone(b.head), omitted, bytes.Clone(b.tail)
 }
 
 // openRegularSingleLink checks before and after a nonblocking open on Unix.

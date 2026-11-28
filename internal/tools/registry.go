@@ -1877,7 +1877,8 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	if err != nil && !isGoTestFailure(tCtx, err) {
 		return "", err
 	}
-	return summarizeGoTest(status, out.String(), err), nil
+	head, omitted, tail := out.segments()
+	return summarizeGoTest(status, string(head), omitted, string(tail), err), nil
 }
 
 // goVerifyCommand builds the verifier command. Without a proven sandbox the
@@ -1982,10 +1983,44 @@ const (
 	maxSummaryLine    = 180
 )
 
+// isGoTestSignal reports whether a trimmed output line indicates a test failure,
+// a build failure or a panic. The summary keeps these even when the output is
+// far larger than the retained buffer.
+func isGoTestSignal(trimmed string) bool {
+	// "FAIL" as a whole line is the package verdict, "FAIL\t<pkg>" its summary
+	// line. A plain "go: downloading ..." line is routine noise and must not
+	// consume a signal slot, so only toolchain errors are matched under "go: ".
+	if trimmed == "FAIL" ||
+		strings.HasPrefix(trimmed, "FAIL\t") ||
+		strings.HasPrefix(trimmed, "--- FAIL:") ||
+		strings.HasPrefix(trimmed, "panic:") ||
+		strings.HasPrefix(trimmed, "--- build failed") ||
+		strings.HasPrefix(trimmed, "go: build") ||
+		strings.HasPrefix(trimmed, "go: error") ||
+		strings.HasPrefix(trimmed, "go: cannot") {
+		return true
+	}
+	return strings.Contains(trimmed, "build failed") ||
+		strings.Contains(trimmed, "cannot find") ||
+		strings.Contains(trimmed, "undefined:") ||
+		strings.Contains(trimmed, "panic:")
+}
+
 // summarizeGoTest returns a small, structured result instead of raw logs: a
-// status line, the first failure signals, and the tail of the output.
-func summarizeGoTest(status, output string, err error) string {
-	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+// status line, the leading output lines with the first failure signals, and the
+// tail of the output.
+//
+// head, omitted and tail come from boundedOutput.segments, so the beginning and
+// the end of the stream are analysed separately. Building the summary from the
+// flattened string instead would lose both: the inline omission marker sits
+// between the two retained halves and can itself be truncated away, and signal
+// lines that were dropped from the middle of a huge log stay invisible.
+func summarizeGoTest(status, head string, omitted int64, tail string, err error) string {
+	headLines := splitSummaryLines(head)
+	tailLines := splitSummaryLines(tail)
+	// Head and tail describe the same output when nothing was dropped; then only
+	// the head is printed once.
+	showTail := omitted > 0
 
 	var b strings.Builder
 	b.WriteString(status)
@@ -1996,41 +2031,124 @@ func summarizeGoTest(status, output string, err error) string {
 	}
 	b.WriteString("\n")
 
+	// Signals are collected from the beginning first, so a failing build or the
+	// first subtest failure is never hidden behind output that was dropped. The
+	// tail keeps a reserved share so a late failure is still reported when the
+	// head alone would use up the budget.
+	headBudget := maxSummarySignals
+	if showTail {
+		headBudget = maxSummarySignals / 2
+	}
 	signals := 0
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
+	seen := make(map[string]bool, maxSummarySignals)
+	emit := func(line string) {
+		clipped := clipSummary(strings.TrimSpace(line), maxSummaryLine)
+		if seen[clipped] {
+			return
 		}
-		if strings.HasPrefix(trimmed, "--- FAIL:") ||
-			strings.Contains(trimmed, "build failed") ||
-			strings.Contains(trimmed, "cannot find") ||
-			strings.Contains(trimmed, "undefined:") ||
-			strings.Contains(trimmed, "panic:") {
-			if signals >= maxSummarySignals {
-				break
-			}
-			b.WriteString("  ")
-			b.WriteString(clipSummary(trimmed, maxSummaryLine))
-			b.WriteString("\n")
-			signals++
+		seen[clipped] = true
+		b.WriteString("  ")
+		b.WriteString(clipped)
+		b.WriteString("\n")
+		signals++
+	}
+	for _, line := range signalLines(head, headBudget) {
+		emit(line)
+	}
+	if showTail {
+		for _, line := range signalLines(tail, maxSummarySignals-signals) {
+			emit(line)
 		}
 	}
 
-	b.WriteString("--- tail ---\n")
-	if len(lines) == 1 && lines[0] == "" {
+	if len(headLines) == 0 {
+		headLines = tailLines
+		showTail = false
+	}
+	b.WriteString("--- head ---\n")
+	if len(headLines) == 0 {
 		b.WriteString("(no output)\n")
 		return b.String()
 	}
-	start := len(lines) - maxSummaryTail
-	if start < 0 {
-		start = 0
+	for _, line := range headLines {
+		b.WriteString(clipSummary(line, maxSummaryLine))
+		b.WriteString("\n")
 	}
-	for _, line := range lines[start:] {
+
+	if !showTail {
+		return b.String()
+	}
+	b.WriteString(fmt.Sprintf("... [%d bytes omitted] ...\n", omitted))
+	b.WriteString("--- tail ---\n")
+	for _, line := range lastLines(tail, maxSummarySegmentLines) {
 		b.WriteString(clipSummary(line, maxSummaryLine))
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// lastLines returns the final want lines of segment, without collapsing.
+func lastLines(segment string, want int) []string {
+	segment = strings.ReplaceAll(segment, "\r\n", "\n")
+	lines := strings.Split(segment, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if want <= 0 || len(lines) <= want {
+		return lines
+	}
+	return lines[len(lines)-want:]
+}
+
+// maxSummarySegmentLines bounds each printed segment (head and tail) to half of
+// maxSummaryTail, so head and tail together never exceed the budget the tests
+// and the docs promise.
+const maxSummarySegmentLines = maxSummaryTail / 2
+
+// signalLines returns the lines of a segment that look like failure markers.
+// It scans the whole segment rather than only the printed window: the "--- FAIL:"
+// line of a test normally sits a few lines above the trailing "FAIL"/"exit
+// status" lines, outside any fixed-size slice taken from the end.
+func signalLines(segment string, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	var kept []string
+	for _, raw := range strings.Split(strings.ReplaceAll(segment, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || !isGoTestSignal(trimmed) {
+			continue
+		}
+		kept = append(kept, trimmed)
+		if len(kept) >= limit {
+			break
+		}
+	}
+	return kept
+}
+
+// splitSummaryLines reduces a segment to a printable window of at most
+// maxSummarySegmentLines lines: the first half, an omission marker, and the last
+// half. Keeping the window fixed is what bounds the summary; the retained
+// buffer itself is 64 KiB.
+func splitSummaryLines(segment string) []string {
+	segment = strings.ReplaceAll(segment, "\r\n", "\n")
+	lines := strings.Split(segment, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for len(lines) > 0 && lines[0] == "" {
+		lines = lines[1:]
+	}
+	if len(lines) <= maxSummarySegmentLines {
+		return lines
+	}
+	edge := maxSummarySegmentLines / 2
+	trimmed := make([]string, 0, maxSummarySegmentLines+1)
+	trimmed = append(trimmed, lines[:edge]...)
+	trimmed = append(trimmed, "...")
+	trimmed = append(trimmed, lines[len(lines)-edge:]...)
+	return trimmed
 }
 
 func clipSummary(s string, n int) string {

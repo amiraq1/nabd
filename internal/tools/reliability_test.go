@@ -12,6 +12,7 @@ import (
 )
 
 func TestReliabilityGoVerifyBoundsOutput(t *testing.T) {
+	requirePOSIXShell(t)
 	root, r := newTestRegistry(t)
 	bin := t.TempDir()
 	script := "#!/bin/sh\nprintf 'beginning\\n'\nhead -c 2000000 /dev/zero | tr '\\000' x\nprintf '\\nending\\n'\n"

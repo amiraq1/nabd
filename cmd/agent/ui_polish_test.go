@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1283,6 +1284,14 @@ func TestSGRMouseNormalizerPartialReads(t *testing.T) {
 }
 
 func TestArabicSGRMouseEndToEndBubbleTeaProgram(t *testing.T) {
+	// bubbletea (v0.26.6) wraps a non-console input reader in
+	// localereader.NewReader, which transcodes the bytes with the ANSI/console
+	// code page (720 here). A UTF-8 Arabic string is therefore delivered
+	// mojibake'd on Windows before any Nabd code sees it, so this end-to-end
+	// assertion can only hold where that wrapper is a pass-through.
+	if runtime.GOOS == "windows" {
+		t.Skip("bubbletea transcode input via localereader on Windows; UTF-8 passthrough is untestable end-to-end")
+	}
 	runPipeProgram := func(t *testing.T, writes [][]byte) uiModel {
 		t.Helper()
 		m, _ := makeScrollableTestModel(t, 60, 10)
