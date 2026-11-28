@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,11 +18,26 @@ func approvalRegistry(t *testing.T, dir string) *Registry {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	t.Cleanup(func() { _ = r.Close() })
 	return r
+}
+
+// requirePOSIXShell skips a test that drives go_verify through a /bin/sh mock.
+// On Windows there is no sh, and exec.LookPath would resolve the real go
+// toolchain instead, so the mock never runs and the assertion is meaningless.
+func requirePOSIXShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("go_verify mock requires /bin/sh, which is unavailable on Windows")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skipf("sh not found: %v", err)
+	}
 }
 
 func installProbeGo(t *testing.T, script string) {
 	t.Helper()
+	requirePOSIXShell(t)
 	sh, err := exec.LookPath("sh")
 	if err != nil {
 		t.Fatalf("sh not found: %v", err)

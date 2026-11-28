@@ -12,6 +12,7 @@ import (
 )
 
 func TestReliabilityGoVerifyBoundsOutput(t *testing.T) {
+	requirePOSIXShell(t)
 	root, r := newTestRegistry(t)
 	r.allowUnsandboxedForTest = true
 	bin := t.TempDir()

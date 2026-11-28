@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,6 +26,9 @@ func mustRegistry(t *testing.T, dir string) *Registry {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	// Close before t.TempDir's own cleanup runs, or the open os.Root handle
+	// makes RemoveAll fail on Windows with "being used by another process".
+	t.Cleanup(func() { _ = r.Close() })
 	return r
 }
 
@@ -152,10 +156,16 @@ func TestEditFileUsesAtomicRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if os.SameFile(before, after) {
+	// os.SameFile compares the file ID (volume serial + index). Windows may
+	// hand the index back to the replacement file, so a pure os.Rename of a new
+	// file over the old one already reports SameFile=true there and the check
+	// proves nothing. Verify replacement by identity where it is meaningful and
+	// by content everywhere.
+	if runtime.GOOS != "windows" && os.SameFile(before, after) {
 		t.Fatal("edit_file wrote in place; expected atomic temp+rename")
 	}
-	if after.Mode().Perm() != 0600 {
+	// Windows has no POSIX mode bits; permissions come from the parent ACL.
+	if runtime.GOOS != "windows" && after.Mode().Perm() != 0600 {
 		t.Fatalf("mode changed: got %o want 0600", after.Mode().Perm())
 	}
 	got, err := os.ReadFile(p)
@@ -194,6 +204,7 @@ func TestEditFileRejectsAmbiguousAndSyntaxErrors(t *testing.T) {
 
 func fakeGo(t *testing.T, script string) {
 	t.Helper()
+	requirePOSIXShell(t)
 	sh, err := exec.LookPath("sh")
 	if err != nil {
 		t.Fatalf("sh not found: %v", err)

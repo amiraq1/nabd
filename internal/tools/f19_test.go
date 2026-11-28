@@ -88,7 +88,9 @@ func TestF19RunDoesNotWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	// Close before t.TempDir's cleanup, or the open os.Root handle blocks
+	// RemoveAll on Windows.
+	t.Cleanup(func() { _ = r.Close() })
 	args := json.RawMessage(`{"path":"a.txt","old_text":"old","new_text":"new"}`)
 	out := r.Run(context.Background(), "edit_file", args)
 	if !strings.Contains(out, "requires approval") {

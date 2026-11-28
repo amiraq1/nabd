@@ -108,15 +108,37 @@ func mapWindowsOpenErr(err error) error {
 	return err
 }
 
+// absolutePathCleanKept returns p as an absolute path with "." and ".."
+// components preserved. filepath.Abs cannot be used because it runs Clean,
+// which removes ".." together with the component in front of it and would let
+// a reparse point on that component go uninspected.
+func absolutePathCleanKept(p string) (string, error) {
+	if filepath.IsAbs(p) {
+		return p, nil
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return wd + `\` + p, nil
+}
+
 // OpenFileNoFollow verifies each directory component along path with
 // FILE_FLAG_OPEN_REPARSE_POINT and opens the regular leaf file without
 // following reparse points. POSIX permission/UID bits are not enforced on
 // Windows; access control depends on NTFS ACLs.
+//
+// Components are classified from the path as written. filepath.Abs applies
+// Clean, which removes ".." textually and drops the component before it: for
+// "symdir/../real/k" the "symdir" reparse point would never be inspected and
+// the protection silently disappears. POSIX opens every component with
+// O_NOFOLLOW and fails with ELOOP there; walking the raw components gives the
+// same answer on Windows.
 func OpenFileNoFollow(path string, pol OpenPolicy) (*os.File, os.FileInfo, error) {
 	if strings.TrimSpace(path) == "" || strings.ContainsAny(path, "\x00\r\n") {
 		return nil, nil, fmt.Errorf("%w: %q", ErrInvalidPath, path)
 	}
-	abs, err := filepath.Abs(path)
+	abs, err := absolutePathCleanKept(path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -128,22 +150,44 @@ func OpenFileNoFollow(path string, pol OpenPolicy) (*os.File, os.FileInfo, error
 	}
 	parts := strings.FieldsFunc(rest, func(r rune) bool { return r == '\\' || r == '/' })
 	cur := vol + `\`
+	last := -1
+	for i, part := range parts {
+		if part != "." && part != ".." {
+			last = i
+		}
+	}
+	if last < 0 {
+		return nil, nil, fmt.Errorf("%w: %s", ErrNotRegularFile, path)
+	}
 	var heldDirs []*os.File
 	defer func() {
 		for _, d := range heldDirs {
 			_ = d.Close()
 		}
 	}()
-	for i := 0; i < len(parts)-1; i++ {
-		cur = filepath.Join(cur, parts[i])
-		d, dErr := VerifyDirNoReparseWindows(cur)
+	for i, part := range parts {
+		switch part {
+		case ".":
+			continue
+		case "..":
+			// The parent was already verified as a real directory and is held
+			// open; resolving ".." against it stays inside the verified chain.
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, part)
+		if i == last {
+			cur = next
+			continue
+		}
+		d, dErr := VerifyDirNoReparseWindows(next)
 		if dErr != nil {
 			return nil, nil, dErr
 		}
 		heldDirs = append(heldDirs, d)
+		cur = next
 	}
-	fullLeaf := filepath.Join(cur, parts[len(parts)-1])
-	f, info, err := OpenRegularNoReparseWindows(fullLeaf)
+	f, info, err := OpenRegularNoReparseWindows(cur)
 	if err != nil {
 		return nil, nil, err
 	}
