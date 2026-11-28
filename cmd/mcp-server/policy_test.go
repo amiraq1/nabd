@@ -78,7 +78,7 @@ func TestPolicyMCP(t *testing.T) {
 			t.Errorf("%s exposed", name)
 		}
 	}
-	for _, name := range []string{"read_file", "list_dir"} {
+	for _, name := range []string{"read_file", "list_dir", "grep_search"} {
 		if !names[name] {
 			t.Errorf("%s missing", name)
 		}
@@ -102,6 +102,7 @@ func TestPolicyMCP(t *testing.T) {
 	}{
 		{"read_file", map[string]any{"path": "sample.txt"}, "before"},
 		{"list_dir", map[string]any{"path": "."}, "sample.txt"},
+		{"grep_search", map[string]any{"query": "before"}, "before"},
 	} {
 		result, err := call(t, c, tc.name, tc.args)
 		if err != nil || result == nil || result.IsError || !strings.Contains(fmt.Sprint(result.Content), tc.want) {

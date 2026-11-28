@@ -402,6 +402,29 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 		}
 		return fmt.Sprintf("read_file(%s) -> %d bytes", displayPath, len(result))
 
+	case "grep_search":
+		var p struct {
+			Query string `json:"query"`
+		}
+		_ = json.Unmarshal([]byte(rawArgs), &p)
+		displayQuery := p.Query
+		if displayQuery == "" {
+			displayQuery = "pattern"
+		}
+		var res struct {
+			TotalMatches int  `json:"total_matches"`
+			FilesScanned int  `json:"files_scanned"`
+			Truncated    bool `json:"truncated"`
+		}
+		if err := json.Unmarshal([]byte(result), &res); err != nil {
+			return fmt.Sprintf("grep_search(%s) -> %s", displayQuery, truncate(result, 80))
+		}
+		suffix := ""
+		if res.Truncated {
+			suffix = " (truncated)"
+		}
+		return fmt.Sprintf("grep_search(%s) -> %d matches in %d files%s", displayQuery, res.TotalMatches, res.FilesScanned, suffix)
+
 	case "edit_file", "create_file":
 		var p struct {
 			Path string `json:"path"`
@@ -903,7 +926,7 @@ type toolBadgeMeta struct {
 
 // toolBadgeCatalog maps tool names to purely visual category badges.
 // Visual badges never affect approval, disclosure, or model tool execution;
-// grep_search and undo are included solely for display classification.
+// undo is included solely for display classification.
 var toolBadgeCatalog = map[string]toolBadgeMeta{
 	"read_file":   {label: "READ", style: toolBadgeReadStyle},
 	"list_dir":    {label: "LIST", style: toolBadgeReadStyle},

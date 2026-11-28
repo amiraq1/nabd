@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -38,7 +39,7 @@ const baseSystemPrompt = `You are NabdCoder, a careful senior software engineer 
 Your job is to solve the user's request with the smallest correct change. Prefer evidence from the workspace over memory. If a tool is not in the current tool list, it is unavailable — do not call it, invent a substitute, or tell the user it ran.
 
 WORKFLOW
-1. Orient before editing. Use repo_map for architecture, exported symbols, and package dependencies. Use list_dir for a specific directory and read_file for exact code. Do not edit from a partial guess.
+1. Orient before editing. Use repo_map for architecture, exported symbols, and package dependencies. Use grep_search to locate exact text, symbols, or errors across files. Use list_dir for a specific directory and read_file for exact code. Do not edit from a partial guess.
 2. Plan the smallest patch. Name the files and the invariant you will preserve. If the request is ambiguous or destructive, ask one precise question instead of guessing.
 3. Read the exact region you will change. For read_file, always pass format "json". Pages are at most 3584 bytes. If truncated is true, continue from next_offset. Stop paging once you have the needed context.
 4. Edit surgically:
@@ -50,7 +51,7 @@ WORKFLOW
 7. Stop when the request is done, blocked, or denied. Do not keep exploring.
 
 TOOL DISCIPLINE
-- Read-only tools (repo_map, list_dir, read_file) may run without execution approval, but their output still requires disclosure before it reaches you. Absence of a secret warning does not prove the output is free of secrets.
+- Read-only tools (repo_map, grep_search, list_dir, read_file) may run without execution approval, but their output still requires disclosure before it reaches you. Absence of a secret warning does not prove the output is free of secrets.
 - create_file and edit_file always need approval. The user sees path, diff, and SHA-256. A token is single-use, bound to the exact arguments, and expires in 5 minutes.
 - go_verify, mcp_call, web_search, and web_fetch always need a fresh human approval. /auto all and NABD_AUTO_APPROVE=all never cover them.
 - If approval is denied, acknowledge it and propose a narrower alternative. Never repeat the rejected call or reshape it to slip past the gate.
@@ -1783,9 +1784,65 @@ func programInputOptions(in io.Reader, ttyOut io.Writer, getenv func(string) str
 	return opts
 }
 
+// version is the release identifier; set it at build time with
+// -ldflags "-X main.version=v0.1.2-alpha".
+var version = "dev"
+
+type versionInfo struct {
+	version   string
+	goVersion string
+	platform  string
+	revision  string
+	modified  bool
+}
+
+func currentVersionInfo() versionInfo {
+	v := versionInfo{
+		version:   version,
+		goVersion: runtime.Version(),
+		platform:  runtime.GOOS + "/" + runtime.GOARCH,
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v.version == "dev" && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			v.version = info.Main.Version
+		}
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				v.revision = setting.Value
+			case "vcs.modified":
+				v.modified = setting.Value == "true"
+			}
+		}
+	}
+	return v
+}
+
+// printVersion reports the build identity without touching on-disk state: no
+// .nabd directory, audit log, or configuration is created or read.
+func printVersion(w io.Writer) int {
+	v := currentVersionInfo()
+	fmt.Fprintf(w, "nabd-agent %s\n", v.version)
+	fmt.Fprintf(w, "go: %s\n", v.goVersion)
+	fmt.Fprintf(w, "platform: %s\n", v.platform)
+	if v.revision != "" {
+		state := ""
+		if v.modified {
+			state = " (modified)"
+		}
+		fmt.Fprintf(w, "revision: %s%s\n", v.revision, state)
+	}
+	return 0
+}
+
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "setup" {
-		os.Exit(RunSetup(os.Stdin, os.Stdout, os.Stderr, defaultConfigDir(), os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "setup":
+			os.Exit(RunSetup(os.Stdin, os.Stdout, os.Stderr, defaultConfigDir(), os.Args[2:]))
+		case "--version", "-version", "version":
+			os.Exit(printVersion(os.Stdout))
+		}
 	}
 
 	if err := ensureInteractive(os.Stdin); err != nil {

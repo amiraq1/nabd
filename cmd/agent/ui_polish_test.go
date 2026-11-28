@@ -28,13 +28,21 @@ func TestToolBadgesCategoriesASCIIAndNoColor(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reg.Close() })
 
-	// Verify grep_search and undo remain purely visual badge entries, not registered tools.
+	// Verify undo remains a purely visual badge entry, not a registered tool,
+	// while grep_search is registered in tools.Registry.
+	foundGrep := false
 	for _, entry := range reg.OpenAITools() {
 		fn, _ := entry["function"].(map[string]any)
 		name, _ := fn["name"].(string)
-		if name == "grep_search" || name == "undo" {
+		if name == "undo" {
 			t.Fatalf("visual-only badge entry %q unexpectedly registered in tools.Registry", name)
 		}
+		if name == "grep_search" {
+			foundGrep = true
+		}
+	}
+	if !foundGrep {
+		t.Fatal("expected grep_search to be registered in tools.Registry")
 	}
 
 	cases := []struct {
