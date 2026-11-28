@@ -587,8 +587,8 @@ func TestProjectSkillsDoNotAlterInitialPrefix(t *testing.T) {
 	mc2 := &mockClient{}
 	m2 := newProjectTestModel(t, dirSkills, mc2)
 
-	m1 = runTurn(t, m1, "hello", 10)
-	m2 = runTurn(t, m2, "hello", 10)
+	_ = runTurn(t, m1, "hello", 10)
+	_ = runTurn(t, m2, "hello", 10)
 
 	req1 := mc1.requestAt(0)
 	req2 := mc2.requestAt(0)
