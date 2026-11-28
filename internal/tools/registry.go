@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/amiraq1/nabd/internal/audit"
+	"github.com/amiraq1/nabd/internal/memory"
 	"github.com/amiraq1/nabd/internal/sandbox"
 	shadowstore "github.com/amiraq1/nabd/internal/shadow"
 )
@@ -58,6 +59,7 @@ type Registry struct {
 	workDir                 string
 	root                    *os.Root
 	shadow                  *shadowstore.Store
+	memory                  *memory.Store
 	auditLog                *audit.Log
 	approve                 ApprovalFunc
 	handlers                map[string]ToolSpec
@@ -116,6 +118,11 @@ func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
 		_ = root.Close()
 		return nil, err
 	}
+	memStore, err := memory.Open(root)
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
 	auditLog, err := audit.Open(root)
 	if err != nil {
 		_ = root.Close()
@@ -125,6 +132,7 @@ func NewRegistry(workDir string, approvers ...ApprovalFunc) (*Registry, error) {
 		workDir:  absRoot,
 		root:     root,
 		shadow:   store,
+		memory:   memStore,
 		auditLog: auditLog,
 		approve:  approve,
 		handlers: make(map[string]ToolSpec),
@@ -284,10 +292,11 @@ func (r *Registry) RequiresApproval(name string) bool {
 // scoped to exactly these tools: it says nothing about whether other tools
 // start subprocesses under their own policy.
 var manuallyApprovedTools = map[string]struct{}{
-	"go_verify":  {},
-	"mcp_call":   {},
-	"web_search": {},
-	"web_fetch":  {},
+	"go_verify":   {},
+	"mcp_call":    {},
+	"web_search":  {},
+	"web_fetch":   {},
+	"memory_save": {},
 }
 
 // RequiresManualApproval reports whether auto-approval is refused for this
@@ -1128,6 +1137,16 @@ func (r *Registry) approveWithState(name string, rawArgs json.RawMessage, state 
 		}
 		identity = canonicalID
 	}
+	if name == "memory_save" {
+		_, canonicalID, err := r.CanonicalMemorySave(rawArgs)
+		if err != nil {
+			return Approval{}, err
+		}
+		if identity != "" && identity != canonicalID {
+			return Approval{}, fmt.Errorf("memory_save canonical request identity mismatch")
+		}
+		identity = canonicalID
+	}
 
 	hash := hashBytes(rawArgs)
 	if err := r.logEvent(audit.Event{Event: "requested", Tool: name, ArgsSHA256: hash, Detail: r.toolDetail(name, rawArgs)}); err != nil {
@@ -1232,7 +1251,11 @@ func (r *Registry) execute(ctx context.Context, spec ToolSpec, name string, rawA
 		return result
 	}
 	result := truncateOutputWithCap(out, outCap)
-	if err := r.logEvent(audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result))}); err != nil && !spec.ReadOnly {
+	appliedDetail := ""
+	if name == "memory_save" {
+		appliedDetail = memorySaveAppliedAuditDetail(out)
+	}
+	if err := r.logEvent(audit.Event{Event: "applied", Tool: name, ArgsSHA256: hash, ResultSHA256: hashBytes([]byte(result)), Detail: appliedDetail}); err != nil && !spec.ReadOnly {
 		result += "\nWarning: audit log write failed"
 	}
 	return result
@@ -1260,6 +1283,12 @@ func (r *Registry) expectedApprovalIdentity(name string, rawArgs json.RawMessage
 		return identity, nil
 	case "web_search":
 		_, _, identity, err := r.CanonicalWebSearch(rawArgs)
+		if err != nil {
+			return "", err
+		}
+		return identity, nil
+	case "memory_save":
+		_, identity, err := r.CanonicalMemorySave(rawArgs)
 		if err != nil {
 			return "", err
 		}
@@ -1307,6 +1336,7 @@ func (r *Registry) toolDetail(name string, rawArgs json.RawMessage) string {
 		Command string  `json:"command"`
 		Query   string  `json:"query"`
 		URL     string  `json:"url"`
+		Kind    string  `json:"kind"`
 	}
 	_ = json.Unmarshal(rawArgs, &p)
 
@@ -1345,6 +1375,15 @@ func (r *Registry) toolDetail(name string, rawArgs json.RawMessage) string {
 			host = u.Hostname()
 		}
 		detail = "host=" + host
+	case "memory_save":
+		// Record kind only; never record title, body, tags, or secret-bearing arguments in audit logs.
+		detail = "kind=" + sanitizeMemoryKindForAudit(p.Kind)
+	case "memory_search":
+		// Record query length and optional kind only; never record raw query text in audit logs.
+		detail = fmt.Sprintf("query_len=%d", len(strings.TrimSpace(p.Query)))
+		if strings.TrimSpace(p.Kind) != "" {
+			detail += " kind=" + sanitizeMemoryKindForAudit(p.Kind)
+		}
 	}
 	if name == "list_dir" && detail == "" {
 		detail = "."
@@ -1390,6 +1429,7 @@ func (r *Registry) registerDefaults() {
 	r.registerEditTool()
 	r.registerOtherTools()
 	r.registerWebTools()
+	r.registerMemoryTools()
 }
 
 func (r *Registry) registerCreateTool() {

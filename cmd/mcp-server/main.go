@@ -62,6 +62,15 @@ func main() {
 	}
 }
 
+func isMCPDeniedTool(reg *tools.Registry, name string) bool {
+	if reg.RequiresApproval(name) {
+		return true
+	}
+	// Workspace memory tools are excluded from MCP by default because MCP clients
+	// bypass Nabd's interactive disclosure and secret-review gate.
+	return name == "memory_search" || name == "memory_save"
+}
+
 func newServer(reg *tools.Registry) (*server.MCPServer, error) {
 	s := server.NewMCPServer(
 		"NabdCoder Tools",
@@ -75,7 +84,7 @@ func newServer(reg *tools.Registry) (*server.MCPServer, error) {
 		if err != nil {
 			return nil, err
 		}
-		if reg.RequiresApproval(tool.Name) {
+		if isMCPDeniedTool(reg, tool.Name) {
 			continue
 		}
 		s.AddTool(tool, makeHandler(reg, tool.Name))
@@ -86,8 +95,8 @@ func newServer(reg *tools.Registry) (*server.MCPServer, error) {
 
 func makeHandler(reg *tools.Registry, name string) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		if reg.RequiresApproval(name) {
-			return mcp.NewToolResultError("tool requires approval and is unavailable via MCP"), nil
+		if isMCPDeniedTool(reg, name) {
+			return mcp.NewToolResultError("tool requires approval or is unavailable via MCP"), nil
 		}
 		args, _ := json.Marshal(request.GetArguments())
 		result := reg.Run(ctx, name, args)
