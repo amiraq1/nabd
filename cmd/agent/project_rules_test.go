@@ -367,7 +367,7 @@ func TestProjectCommandExpansionArabicArgsAndUI(t *testing.T) {
 	if !m.palette.open || len(m.palette.filtered) != len(slashCommands)+2 {
 		t.Fatalf("expected %d palette items, got %d", len(slashCommands)+2, len(m.palette.filtered))
 	}
-	rendered := renderSlashPalette(&m.palette, 80, 10)
+	rendered := renderSlashPalette(&m.palette, 80, len(m.palette.filtered))
 	if !strings.Contains(rendered, "[project]") {
 		t.Fatalf("palette missing [project] tag:\n%s", rendered)
 	}

@@ -52,6 +52,14 @@ var slashCommands = []slashCommand{
 		Name:        "skill",
 		Description: "Load a project skill on demand (/skill <name> [args])",
 	},
+	{
+		Name:        "remember",
+		Description: "Save a workspace memory (/remember [kind:] <text>)",
+	},
+	{
+		Name:        "memory",
+		Description: "List, search, or delete workspace memories (/memory [search <q> | delete <id>])",
+	},
 }
 
 // slashPalette tracks the interactive state of the command palette.

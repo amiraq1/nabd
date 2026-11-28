@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/amiraq1/nabd/internal/memory"
 	"github.com/amiraq1/nabd/internal/tools"
 )
 
@@ -145,6 +146,19 @@ func buildApprovalPreview(reg *tools.Registry, tc ToolCall) approvalPreview {
 			IdentitySHA256: id,
 		}
 
+	case "memory_save":
+		if reg == nil {
+			return approvalPreview{Summary: "memory_save: registry unavailable"}
+		}
+		canon, id, err := reg.CanonicalMemorySave(json.RawMessage(tc.Function.Arguments))
+		if err != nil {
+			return approvalPreview{Summary: "memory_save: " + sanitizeForDisplay(err.Error())}
+		}
+		return approvalPreview{
+			Summary:        formatMemorySaveApprovalSummary(canon),
+			IdentitySHA256: id,
+		}
+
 	default:
 		return approvalPreview{Summary: clip(sanitizeForDisplay("arguments: "+tc.Function.Arguments), maxApprovalChars)}
 	}
@@ -157,6 +171,9 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 	if len(raw) > maxApprovalArgs {
 		if tc.Function.Name == "create_file" {
 			return approvalPreview{}, fmt.Errorf("arguments are %d bytes, above the %d-byte approval limit; create a smaller file first and extend it with edit_file", len(raw), maxApprovalArgs)
+		}
+		if tc.Function.Name == "memory_save" {
+			return approvalPreview{}, fmt.Errorf("arguments are %d bytes, above the %d-byte approval limit; shorten title or body and retry", len(raw), maxApprovalArgs)
 		}
 		return approvalPreview{}, fmt.Errorf("arguments are %d bytes, above the %d-byte approval limit; split into smaller edits and retry", len(raw), maxApprovalArgs)
 	}
@@ -237,6 +254,23 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 			}
 			p.Summary = fullSummary
 			p.IdentitySHA256 = id
+		} else if tc.Function.Name == "memory_save" {
+			if reg == nil {
+				return approvalPreview{}, fmt.Errorf("memory_save requires an initialized registry")
+			}
+			canon, id, err := reg.CanonicalMemorySave(json.RawMessage(raw))
+			if err != nil {
+				return approvalPreview{}, err
+			}
+			fullSummary := formatMemorySaveApprovalSummary(canon)
+			if sanitizeForDisplay(fullSummary) != fullSummary {
+				return approvalPreview{}, fmt.Errorf("memory_save approval preview contains undisplayable control characters")
+			}
+			if len(fullSummary) > maxApprovalArgs {
+				return approvalPreview{}, fmt.Errorf("memory_save approval preview exceeds the %d-byte limit; shorten title or body", maxApprovalArgs)
+			}
+			p.Summary = fullSummary
+			p.IdentitySHA256 = id
 		} else if tc.Function.Name != "web_search" {
 			p.Summary += "\narguments: " + raw
 		}
@@ -245,9 +279,27 @@ func prepareApprovalPreview(reg *tools.Registry, tc ToolCall) (approvalPreview, 
 		if tc.Function.Name == "create_file" {
 			return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; create a smaller file first and extend it with edit_file", maxApprovalArgs)
 		}
+		if tc.Function.Name == "memory_save" {
+			return approvalPreview{}, fmt.Errorf("memory_save approval preview exceeds the %d-byte limit; shorten title or body", maxApprovalArgs)
+		}
 		return approvalPreview{}, fmt.Errorf("approval preview exceeds the %d-byte limit; split the request", maxApprovalArgs)
 	}
 	return p, nil
+}
+
+func formatMemorySaveApprovalSummary(canon memory.SaveInput) string {
+	tagsText := "(none)"
+	if len(canon.Tags) > 0 {
+		tagsText = strings.Join(canon.Tags, ", ")
+	}
+	var b strings.Builder
+	b.WriteString("local workspace memory write (.nabd/memory/entries.jsonl)\n")
+	fmt.Fprintf(&b, "kind: %s\n", canon.Kind)
+	fmt.Fprintf(&b, "title (%d bytes): %s\n", len(canon.Title), canon.Title)
+	fmt.Fprintf(&b, "tags (%d): %s\n", len(canon.Tags), tagsText)
+	fmt.Fprintf(&b, "body (%d bytes):\n%s\n", len(canon.Body), canon.Body)
+	b.WriteString("warning: stored as plain text under user-scoped permissions without encryption; do not store secrets")
+	return b.String()
 }
 
 const (

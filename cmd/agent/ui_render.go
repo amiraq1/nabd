@@ -549,6 +549,40 @@ func formatToolSummary(name string, rawArgs string, result string) string {
 		}
 		return fmt.Sprintf("web_fetch(%s) -> %d bytes", host, len(result))
 
+	case "memory_search":
+		if strings.HasPrefix(result, "Error:") || strings.HasPrefix(result, "Action rejected") {
+			return "memory_search -> " + truncate(sanitizeSingleLineDisplay(result), 80)
+		}
+		var res struct {
+			TotalMatches int  `json:"total_matches"`
+			Returned     int  `json:"returned"`
+			Truncated    bool `json:"truncated"`
+		}
+		if err := json.Unmarshal([]byte(result), &res); err == nil {
+			if res.Truncated {
+				return fmt.Sprintf("memory_search -> %d results (%d matches, truncated)", res.Returned, res.TotalMatches)
+			}
+			return fmt.Sprintf("memory_search -> %d results (%d matches)", res.Returned, res.TotalMatches)
+		}
+		return fmt.Sprintf("memory_search -> %d bytes", len(result))
+
+	case "memory_save":
+		if strings.HasPrefix(result, "Error:") || strings.HasPrefix(result, "Action rejected") || strings.HasPrefix(result, "Rejected:") {
+			return "memory_save -> " + truncate(sanitizeSingleLineDisplay(result), 80)
+		}
+		var res struct {
+			ID   string `json:"id"`
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal([]byte(result), &res); err == nil && res.ID != "" {
+			kind := sanitizeSingleLineDisplay(res.Kind)
+			if kind == "" {
+				kind = "note"
+			}
+			return fmt.Sprintf("memory_save(%s) -> saved %s", kind, sanitizeSingleLineDisplay(res.ID))
+		}
+		return fmt.Sprintf("memory_save -> %d bytes", len(result))
+
 	default:
 		return name + " -> " + truncate(result, maxUIDisplayChars)
 	}
@@ -579,7 +613,9 @@ func renderApprovalSummary(summary string, width int) string {
 			strings.HasPrefix(line, "destination:") || strings.HasPrefix(line, "firecrawl_endpoint:") ||
 			strings.HasPrefix(line, "delegation_limit:") || strings.HasPrefix(line, "query_string:") ||
 			strings.HasPrefix(line, "max_results:") || strings.HasPrefix(line, "query (") ||
-			strings.HasPrefix(line, "query:"):
+			strings.HasPrefix(line, "query:") || strings.HasPrefix(line, "kind:") ||
+			strings.HasPrefix(line, "title (") || strings.HasPrefix(line, "tags (") ||
+			strings.HasPrefix(line, "body ("):
 			b.WriteString(diffInfoStyle.Render(line))
 		default:
 			b.WriteString(line)
@@ -928,17 +964,19 @@ type toolBadgeMeta struct {
 // Visual badges never affect approval, disclosure, or model tool execution;
 // undo is included solely for display classification.
 var toolBadgeCatalog = map[string]toolBadgeMeta{
-	"read_file":   {label: "READ", style: toolBadgeReadStyle},
-	"list_dir":    {label: "LIST", style: toolBadgeReadStyle},
-	"repo_map":    {label: "MAP", style: toolBadgeReadStyle},
-	"grep_search": {label: "GREP", style: toolBadgeReadStyle},
-	"create_file": {label: "CREATE", style: toolBadgeEditStyle},
-	"edit_file":   {label: "EDIT", style: toolBadgeEditStyle},
-	"undo":        {label: "UNDO", style: toolBadgeEditStyle},
-	"web_search":  {label: "WEB", style: toolBadgeWebStyle},
-	"web_fetch":   {label: "FETCH", style: toolBadgeWebStyle},
-	"go_verify":   {label: "VERIFY", style: toolBadgeVerifyStyle},
-	"mcp_call":    {label: "MCP", style: toolBadgeVerifyStyle},
+	"read_file":     {label: "READ", style: toolBadgeReadStyle},
+	"list_dir":      {label: "LIST", style: toolBadgeReadStyle},
+	"repo_map":      {label: "MAP", style: toolBadgeReadStyle},
+	"grep_search":   {label: "GREP", style: toolBadgeReadStyle},
+	"memory_search": {label: "MEMORY", style: toolBadgeReadStyle},
+	"create_file":   {label: "CREATE", style: toolBadgeEditStyle},
+	"edit_file":     {label: "EDIT", style: toolBadgeEditStyle},
+	"memory_save":   {label: "MEM SAVE", style: toolBadgeEditStyle},
+	"undo":          {label: "UNDO", style: toolBadgeEditStyle},
+	"web_search":    {label: "WEB", style: toolBadgeWebStyle},
+	"web_fetch":     {label: "FETCH", style: toolBadgeWebStyle},
+	"go_verify":     {label: "VERIFY", style: toolBadgeVerifyStyle},
+	"mcp_call":      {label: "MCP", style: toolBadgeVerifyStyle},
 }
 
 func lookupToolBadge(toolName string) toolBadgeMeta {
@@ -1496,7 +1534,7 @@ func formatHelpWithProject(snap projectContextSnapshot) string {
 	b.WriteString("Auto-approval (NABD_AUTO_APPROVE or /auto):\n")
 	b.WriteString("  off      - every tool approval and disclosure needs a manual decision (default)\n")
 	b.WriteString("  readonly - read-only tool output is disclosed automatically unless the advisory secret heuristic matches; that heuristic is not a guarantee\n")
-	b.WriteString("  all      - needs an explicit y to enable; bypasses approvals and disclosure review, except go_verify and mcp_call which always need a manual approval\n")
+	b.WriteString("  all      - needs an explicit y to enable; bypasses approvals and disclosure review, except go_verify and mcp_call (and web_search, web_fetch, memory_save) which always need a manual approval\n")
 	b.WriteString("  A mode change never authorizes tool calls that were already requested.\n\n")
 	if snap.Disabled {
 		b.WriteString("Project Commands: disabled via NABD_NO_PROJECT_RULES=1\n")
