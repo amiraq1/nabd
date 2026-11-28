@@ -11,7 +11,10 @@ import (
 	"sort"
 )
 
-const projectSymlinkSupportNote = "fallback os.Root Lstat+Open (non-atomic on non-Unix/non-Windows platforms)"
+const (
+	projectSymlinkSupportNote      = "fallback os.Root Lstat+Open (non-atomic on non-Unix/non-Windows platforms)"
+	projectSkillsPlatformSupported = false
+)
 
 func readRootFileNoFollow(root *os.Root, name string, maxBytes int64) ([]byte, error) {
 	linfo, err := root.Lstat(name)
@@ -118,4 +121,17 @@ func scanCommandsDirNoFollow(
 		}
 	}
 	return incomplete, nil
+}
+
+func scanSkillsDirNoFollow(
+	_ context.Context,
+	_ *os.Root,
+	_ int,
+	_ func(name string, readHeaderFn func(maxBytes int64) ([]byte, bool, error)) bool,
+) (bool, error) {
+	return false, errProjectSkillsUnsupportedPlatform
+}
+
+func readSkillFileNoFollow(_ *os.Root, _ string, _ int64) ([]byte, error) {
+	return nil, errProjectSkillsUnsupportedPlatform
 }

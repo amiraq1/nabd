@@ -33,17 +33,19 @@ var (
 	errProjectInvalidUTF8    = errors.New("file is not valid UTF-8 or contains NUL")
 )
 
-var reservedLocalCommands = map[string]bool{
-	"status":  true,
-	"tools":   true,
-	"auto":    true,
-	"clear":   true,
-	"copy":    true,
-	"compact": true,
-	"help":    true,
-	"undo":    true,
-	"exit":    true,
-	"quit":    true,
+var nonSlashLocalCommands = []string{"undo", "exit", "quit"}
+
+var reservedLocalCommands = buildReservedLocalCommands()
+
+func buildReservedLocalCommands() map[string]bool {
+	m := make(map[string]bool, len(slashCommands)+len(nonSlashLocalCommands))
+	for _, cmd := range slashCommands {
+		m[strings.ToLower(strings.TrimSpace(cmd.Name))] = true
+	}
+	for _, name := range nonSlashLocalCommands {
+		m[name] = true
+	}
+	return m
 }
 
 type projectCommand struct {
@@ -55,6 +57,7 @@ type projectCommand struct {
 }
 
 type projectContextSnapshot struct {
+	WorkspaceRoot      string
 	Disabled           bool
 	ConfigError        string
 	RulesFile          string
@@ -68,6 +71,13 @@ type projectContextSnapshot struct {
 	CommandsTruncated  bool
 	SkippedCount       int
 	SkipReasons        []string
+	Skills             []projectSkillMeta
+	SkillsByName       map[string]projectSkillMeta
+	SkillsError        string
+	SkillsIncomplete   bool
+	SkillsTruncated    bool
+	SkillsSkippedCount int
+	SkillsSkipReasons  []string
 }
 
 func (s projectContextSnapshot) HasRules() bool {
@@ -226,7 +236,9 @@ func loadProjectContext(ctx context.Context, workspaceRoot string) projectContex
 	defer root.Close()
 
 	var snap projectContextSnapshot
+	snap.WorkspaceRoot = workspaceRoot
 	snap.CommandsByName = make(map[string]projectCommand)
+	snap.SkillsByName = make(map[string]projectSkillMeta)
 
 	// 1. Project rules precedence: NABD.md first, AGENTS.md ONLY if NABD.md does not exist.
 	loadRules := func(filename string) (found bool) {
@@ -356,6 +368,16 @@ func loadProjectContext(ctx context.Context, workspaceRoot string) projectContex
 		snap.CommandsIncomplete = true
 	}
 	sort.Strings(snap.SkipReasons)
+
+	// 3. Project skills metadata in .agents/skills/<name>/SKILL.md (lazy body read on /skill)
+	skillsRes := discoverProjectSkills(scanCtx, root)
+	snap.Skills = skillsRes.Skills
+	snap.SkillsByName = skillsRes.SkillsByName
+	snap.SkillsError = skillsRes.SkillsError
+	snap.SkillsIncomplete = skillsRes.SkillsIncomplete
+	snap.SkillsTruncated = skillsRes.SkillsTruncated
+	snap.SkillsSkippedCount = skillsRes.SkillsSkippedCount
+	snap.SkillsSkipReasons = skillsRes.SkillsSkipReasons
 	return snap
 }
 
