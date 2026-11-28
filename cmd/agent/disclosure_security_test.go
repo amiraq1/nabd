@@ -161,3 +161,13 @@ func TestAdvisorySecretDetectionIsExplicitlyLimited(t *testing.T) {
 		t.Fatal("advisory detector falsely claimed comprehensive detection")
 	}
 }
+
+func TestAdvisorySecretDetectsJWT(t *testing.T) {
+	jwtSample := "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	if warnings := advisorySecretWarnings(jwtSample); len(warnings) == 0 {
+		t.Fatal("advisory detector missed a JWT")
+	}
+	if warnings := advisorySecretWarnings("version 1.2.3 and example.eyJmissing.onlytwo"); len(warnings) != 0 {
+		t.Fatalf("unexpected warning for non-JWT text: %v", warnings)
+	}
+}

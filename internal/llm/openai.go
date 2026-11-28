@@ -506,14 +506,22 @@ func parseRetryAfter(value string) time.Duration {
 	if value == "" {
 		return 0
 	}
-	if seconds, err := strconv.Atoi(value); err == nil {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
 		if seconds <= 0 {
 			return 0
 		}
+		if seconds > int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
 		return time.Duration(seconds) * time.Second
+	} else if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(value, "-") {
+		return maxRetryAfter
 	}
 	if when, err := http.ParseTime(value); err == nil {
 		if delay := time.Until(when); delay > 0 {
+			if delay > maxRetryAfter {
+				return maxRetryAfter
+			}
 			return delay
 		}
 	}

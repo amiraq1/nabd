@@ -13,6 +13,7 @@ import (
 
 func TestReliabilityGoVerifyBoundsOutput(t *testing.T) {
 	root, r := newTestRegistry(t)
+	r.allowUnsandboxedForTest = true
 	bin := t.TempDir()
 	script := "#!/bin/sh\nprintf 'beginning\\n'\nhead -c 2000000 /dev/zero | tr '\\000' x\nprintf '\\nending\\n'\n"
 	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(script), 0755); err != nil {

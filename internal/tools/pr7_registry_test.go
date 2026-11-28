@@ -212,6 +212,7 @@ func TestGoVerifyReceivesMemoryLimits(t *testing.T) {
 	fakeGo(t, `test "$GOMEMLIMIT" = "512MiB" && test "$GOGC" = "50" && printf ok > `+strconv.Quote(outFile))
 
 	r := mustRegistry(t, dir)
+	r.allowUnsandboxedForTest = true
 	out := legacyApproved(t, r, context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})
 	got, err := os.ReadFile(outFile)
 	if err != nil {
@@ -248,6 +249,7 @@ func TestGoVerifyTimeoutKillsChildProcesses(t *testing.T) {
 	fakeGo(t, `( sleep 2; printf alive > `+strconv.Quote(marker)+` ) &`+"\nwait")
 
 	r := mustRegistry(t, dir)
+	r.allowUnsandboxedForTest = true
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	out := legacyApproved(t, r, ctx, "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})

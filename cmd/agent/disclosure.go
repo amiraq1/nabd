@@ -16,6 +16,7 @@ var advisorySecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}\b`),
 	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
 	regexp.MustCompile(`(?i)\b(api[_-]?key|secret|token|password|passwd)\b\s*[:=]\s*\S{8,}`),
+	regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`),
 }
 
 func advisorySecretWarnings(content string) []string {
