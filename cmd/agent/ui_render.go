@@ -1499,14 +1499,20 @@ func formatHelpWithProject(snap projectContextSnapshot) string {
 	b.WriteString("  all      - needs an explicit y to enable; bypasses approvals and disclosure review, except go_verify and mcp_call which always need a manual approval\n")
 	b.WriteString("  A mode change never authorizes tool calls that were already requested.\n\n")
 	if snap.Disabled {
-		b.WriteString("Project Commands: disabled via NABD_NO_PROJECT_RULES=1\n\n")
-	} else if len(snap.Commands) > 0 {
-		b.WriteString("Project Commands (.nabd/commands/*.md):\n")
-		for _, cmd := range snap.Commands {
-			cmdName := "/" + sanitizeForDisplay(cmd.Name)
-			fmt.Fprintf(&b, "  %-15s - [project] %s\n", cmdName, sanitizeForDisplay(cmd.Description))
+		b.WriteString("Project Commands: disabled via NABD_NO_PROJECT_RULES=1\n")
+		b.WriteString("Project Skills: disabled via NABD_NO_PROJECT_RULES=1\n\n")
+	} else {
+		if len(snap.Commands) > 0 {
+			b.WriteString("Project Commands (.nabd/commands/*.md):\n")
+			for _, cmd := range snap.Commands {
+				cmdName := "/" + sanitizeForDisplay(cmd.Name)
+				fmt.Fprintf(&b, "  %-15s - [project] %s\n", cmdName, sanitizeForDisplay(cmd.Description))
+			}
+			b.WriteString("\n")
 		}
-		b.WriteString("\n")
+		if len(snap.Skills) > 0 {
+			fmt.Fprintf(&b, "Project Skills (.agents/skills/<name>/SKILL.md): %d indexed (use /skills to list, /skill <name> [args] to load)\n\n", len(snap.Skills))
+		}
 	}
 	b.WriteString(`Keybindings:
   Enter           - Send prompt to model

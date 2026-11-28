@@ -44,6 +44,14 @@ var slashCommands = []slashCommand{
 		Name:        "help",
 		Description: "Show available commands and keyboard shortcuts",
 	},
+	{
+		Name:        "skills",
+		Description: "List discovered project skills (.agents/skills)",
+	},
+	{
+		Name:        "skill",
+		Description: "Load a project skill on demand (/skill <name> [args])",
+	},
 }
 
 // slashPalette tracks the interactive state of the command palette.

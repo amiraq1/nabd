@@ -1370,6 +1370,21 @@ func (m uiModel) executeLocalCommand(input string) (tea.Model, tea.Cmd) {
 	if input == "/compact" {
 		return m.handleCompactCommand()
 	}
+	if cmdName, cmdArgs, isSlash := splitSlashCommandInput(input); isSlash {
+		switch cmdName {
+		case "skills":
+			m.clearInput()
+			if strings.TrimSpace(cmdArgs) != "" {
+				m.messages = append(m.messages, Message{Role: "local", Content: "Usage: /skills (use /skill <name> [args] to load a skill)"})
+			} else {
+				m.messages = append(m.messages, Message{Role: "local", Content: formatProjectSkillsList(m.projectCtx, m.viewport.Width)})
+			}
+			m.refresh()
+			return m, nil
+		case "skill":
+			return m.handleSkillCommand(cmdArgs)
+		}
+	}
 
 	if cmdName, cmdArgs, isSlash := splitSlashCommandInput(input); isSlash && !isReservedCommandName(cmdName) {
 		if cmd, ok := m.projectCtx.LookupCommand(cmdName); ok {
@@ -1686,6 +1701,7 @@ func (m *uiModel) formatStatus() string {
 	fmt.Fprintf(&b, "Web Search: %s\n", webProvider)
 	fmt.Fprintf(&b, "Project Rules: %s\n", formatProjectRulesStatus(m.projectCtx))
 	fmt.Fprintf(&b, "Project Commands: %s\n", formatProjectCommandsStatus(m.projectCtx))
+	fmt.Fprintf(&b, "Project Skills: %s\n", formatProjectSkillsStatus(m.projectCtx))
 	fmt.Fprintf(&b, "Iteration: %d / %d\n", m.iteration, m.maxIterations)
 	fmt.Fprintf(&b, "Context tokens: ~%d / %d (~%.1f%%)\n", tokens, budget, float64(tokens)*100.0/float64(budget))
 	b.WriteString(m.cache.statusLine() + "\n")

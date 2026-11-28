@@ -56,8 +56,9 @@
 - `create_file` و`edit_file` و`undo` يرفضون symlinks (بما فيها الروابط المعلّقة عند الهدف والمجلدات الوسيطة لـ`create_file` مع التحقق بـ`O_NOFOLLOW` ومطابقة `SameFile` على Unix).
 - حدود إنشاء المجلدات الأب في `create_file`: حد أقصى 15 مستوى أب، و512 بايت للمسار النسبي، و255 بايت لكل مكوّن، مع تراجع بأفضل جهد عن المجلدات التي أنشأتها العملية وحدها عند فشل الكتابة قبل النشر.
 - على Linux/Android تُفتح ملفات القراءة وكل مكوّنات مسارها بـ`O_NOFOLLOW`.
+- مهارات المشروع (`.agents/skills/<name>/SKILL.md`): تُفتح على Unix عبر `O_NOFOLLOW|O_DIRECTORY` لكل مكوّن (`OpenDirAtNoFollow`) و`O_NOFOLLOW|O_NONBLOCK` للملف (`OpenRegularAtNoFollow`)؛ وعلى Windows عبر `VerifyDirNoReparseWindows` و`OpenRegularNoReparseWindows` (`FILE_FLAG_OPEN_REPARSE_POINT`)؛ وعلى المنصات الأخرى (`!unix && !windows`) تفشل مغلقاً (`errProjectSkillsUnsupportedPlatform`) بدلاً من الاعتماد على `Lstat+Open`.
 - `grep_search` تقرأ فقط عبر `openRegularSingleLink` داخل `os.Root`، وترفض أي مكوّن مسار symlink، وتتخطى symlinks والملفات الثنائية (NUL في أول 8 KiB) والمجلدات `.git` و`.nabd` و`node_modules` و`vendor`، مع سقف 2000 ملف و512 KiB لكل ملف و16 MiB قراءة إجمالية و100 نتيجة و8 KiB مخرجات.
-- **حدود**: هذا لا يجعل كل عمليات الكتابة مقاومة لسباقات الروابط أو إعادة تسمية المجلدات، ولا ينطبق الضمان نفسه على المنصات الأخرى.
+- **حدود**: هذا لا يجعل كل عمليات الكتابة مقاومة لسباقات الروابط أو إعادة تسمية المجلدات، ولا ينطبق الضمان نفسه على المنصات الأخرى. على Windows تبقى نافذة سباق لاستبدال المجلدات الوسيطة بين التحقق وفتح الابن لعدم توفر `openat(dirfd)` في Win32، ولا تُفحص الروابط الصلبة (`NumberOfLinks`) على `SKILL.md`. كما أن إعادة فتح `SKILL.md` عند `/skill` تتحقق من حالة الملف وقت الفتح ولا تمنع تعديلاً متزامناً من عملية محلية أخرى أثناء القراءة.
 
 ### 5.2 سياسة المسارات الحساسة
 
@@ -145,7 +146,8 @@ Profile المُنفَّذ على Linux:
 - **تسريب المحتوى إلى LLM**: أي أداة تُفصح عن مخرجاتها ترسلها للـendpoint؛ إن كان بعيداً خرجت البيانات من الجهاز.
 - **إحصاءات الكاش**: أرقام `Cache` في `/status` هي ما يبلّغ عنه المزوّد فقط؛ قد تكون غائبة أو جزئية أو خاصة بنسخة/إعداد، ولا تثبت إصابة كاش ولا تُترجم إلى وفورات. لا تُستخدم لأي قرار أمني أو مالي. في `llama.cpp` قد يعكس `cache_n` تطابق بادئة عميل آخر على slot مشترك، فلا يُفسَّر كضمان خصوصية.
 - **TOCTOU داخل الجذر**: بين preview والتنفيذ قد يتغيّر محتوى الملف؛ hash guard يخفف ولا يوجد قفل CAS ذري مقابل كاتب خارجي. في `create_file` يُستعمل `RENAME_NOREPLACE` (على Linux/Android) أو `os.Root.Link` (على باقي المنصات) للنشر الحصري الذري؛ أما على أنظمة الملفات التي لا تدعمهما (`ENOTSUP`/`ENOSYS`/`EPERM` مثل `/sdcard` أو FAT32) فتتراجع الأداة إلى فحص `Lstat` أخير داخل `withProcessLock` ثم `Rename` (بينما يبقى `EEXIST` فشلاً مغلقاً دائماً)، ما يترك نافذة سباق ميكروثانية أمام كاتب خارجي في تلك الأنظمة فقط.
-- **حدود الحجم**: صفحة قراءة 3584 بايت، إنشاء/تعديل ونسخة shadow الاحتياطية 2MiB، سجل `go_verify` يحتفظ بـ64KiB من بدايته ونهايته، ووسائط الموافقة ومعاينتها 4000 بايت، وعمق مجلدات `create_file` حتى 15 مستوى أب (512 بايت للمسار النسبي)، وبحث `grep_search` 512 KiB لكل ملف و16 MiB إجمالاً و2000 ملف وعمق 15.
+- **حدود الحجم**: صفحة قراءة 3584 بايت، إنشاء/تعديل ونسخة shadow الاحتياطية 2MiB، سجل `go_verify` يحتفظ بـ64KiB من بدايته ونهايته، ووسائط الموافقة ومعاينتها 4000 بايت، وعمق مجلدات `create_file` حتى 15 مستوى أب (512 بايت للمسار النسبي)، وبحث `grep_search` 512 KiB لكل ملف و16 MiB إجمالاً و2000 ملف وعمق 15، ومهارات المشروع `.agents/skills/<name>/SKILL.md` (عرض 32 مهارة، 256 مدخلاً، 512 KiB اكتشاف كلي، 4 KiB ترويسة، 16 KiB للملف عند `/skill`، 8 KiB وسائط، 256 بايت UTF-8 للوصف).
+- **مهارات المشروع وprompt injection**: فهرسة المهارات لا تحقن أي وصف أو متن في `Role: "system"` أو الرسائل الأولية؛ الاستدعاء عبر `/skill` يضع المتن في `Role: "user"` بتأطير صريح، لكنه **لا يعزل أو يمنع prompt injection**، وتستمر كل بوابات الموافقة والإفصاح وصلاحيات الأدوات بلا استثناء، ولا تُنفَّذ `scripts/` ولا تُفتح ملفات المراجع تلقائياً. ثبات البادئة عند وجود مهارات لا يضمن إصابة الكاش عند المزوّد.
 - **لا حدود معدل أو حصص** لاستدعاءات الأدوات أو الـLLM.
 
 ## 7. فروق المنصات
@@ -184,6 +186,7 @@ Profile المُنفَّذ على Linux:
 - قراءة usage والكاش وعرضه → `TestOpenAIUsageCacheFieldParsing`, `TestGeminiUsageCacheFieldParsing`, `TestCacheStatsUsesSumsNotAverageOfRatios`, `TestCacheStatsCoverageInvalidAndNoData`, `TestLateLLMResponseDoesNotPolluteCacheStats`, `TestCacheStatsResetOnClear`, `TestStatusShowsCacheWithoutConversationText`.
 - حد مسار الكنس → `TestCleanupNeverTouchesFilesOutsideTheStore`.
 - undo بعد تغيير الملف → `TestUndoRefusesAfterDrift`.
+- مهارات المشروع `.agents/skills/<name>/SKILL.md`، حدود القراءة، محلّل frontmatter، الروابط الرمزية/reparse points، التعطيل عبر `NABD_NO_PROJECT_RULES=1`، الحفاظ على الموافقات والبادئة الأولية → اختبارات `cmd/agent/skills_test.go`.
 
 ## 9. المخاطر المتبقية
 
