@@ -15,13 +15,9 @@ import (
 
 func TestEscCancelsRunningToolContextAndDropsLateToolExecutedMsg(t *testing.T) {
 	dir, m := testModel(t)
-	bin := t.TempDir()
 	startedFile := filepath.Join(dir, "started")
-	script := "#!/bin/sh\necho $$ > " + strconv.Quote(startedFile) + "\nsleep 30\n"
-	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	script := "echo $$ > " + strconv.Quote(startedFile) + "\nsleep 30\n"
+	m.runToolForTest = runUnixProcessTreeForTest(t, script)
 
 	t1 := testToolCall("go_verify", `{"pkg":"./..."}`)
 	t2 := testToolCall("read_file", `{"path":"a.txt"}`)

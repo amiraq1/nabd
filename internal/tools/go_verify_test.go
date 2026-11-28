@@ -89,6 +89,7 @@ func TestSummarizeGoTest(t *testing.T) {
 
 func TestGoVerifyTimeout(t *testing.T) {
 	root, reg := newTestRegistry(t)
+	reg.allowUnsandboxedForTest = true
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module audittimeout\n\ngo 1.22\n")
 	writeTestFile(t, filepath.Join(root, "slow_test.go"), `package audittimeout
 
@@ -117,6 +118,7 @@ func TestSlow(t *testing.T) {
 
 func TestGoVerifyTestFailureIsNotToolError(t *testing.T) {
 	root, reg := newTestRegistry(t)
+	reg.allowUnsandboxedForTest = true
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module auditfail\n\ngo 1.22\n")
 	writeTestFile(t, filepath.Join(root, "fail_test.go"), `package auditfail
 
@@ -133,5 +135,35 @@ func TestFail(t *testing.T) {
 	}
 	if !strings.HasPrefix(out, "FAIL") || !strings.Contains(out, "--- FAIL: TestFail") {
 		t.Fatalf("structured failure missing:\n%s", out)
+	}
+}
+
+func TestGoVerifyFailsClosedWithoutSandbox(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module auditfailclosed\n\ngo 1.22\n")
+	writeTestFile(t, filepath.Join(root, "canary_test.go"), `package auditfailclosed
+
+import (
+	"os"
+	"testing"
+)
+
+func init() {
+	_ = os.WriteFile("executed.txt", []byte("ran"), 0o644)
+}
+
+func TestNothing(t *testing.T) {}
+`)
+
+	if _, err := reg.goVerifyCommand(context.Background(), "./..."); err == nil || !strings.Contains(err.Error(), "no proven execution sandbox") {
+		t.Fatalf("goVerifyCommand without sandbox = %v, want fail-closed sandbox error", err)
+	}
+
+	out := runToolApproved(t, reg, "go_verify", map[string]any{"pkg": "./..."})
+	if !strings.HasPrefix(out, "Error:") || !strings.Contains(out, "no proven execution sandbox") {
+		t.Fatalf("go_verify without sandbox = %q, want fail-closed error", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "executed.txt")); err == nil {
+		t.Fatal("go_verify executed code without an active sandbox")
 	}
 }

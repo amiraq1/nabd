@@ -204,6 +204,50 @@ func TestSensitivePathsDenied(t *testing.T) {
 	}
 }
 
+func TestListDirBlocksSensitiveDirs(t *testing.T) {
+	root, reg := newTestRegistry(t)
+	writeTestFile(t, filepath.Join(root, "visible.txt"), "ok")
+	writeTestFile(t, filepath.Join(root, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeTestFile(t, filepath.Join(root, ".env", "secret"), "TOKEN=abc\n")
+	writeTestFile(t, filepath.Join(root, ".env.local", "secret"), "TOKEN=def\n")
+	if err := os.MkdirAll(filepath.Join(root, ".env.example"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := reg.listDir(".")
+	if err != nil {
+		t.Fatalf("listDir(\".\") failed: %v", err)
+	}
+	if !strings.Contains(out, "visible.txt") {
+		t.Fatalf("listDir(\".\") missing visible.txt: %q", out)
+	}
+	if outTool := runTool(t, reg, "list_dir", map[string]any{"path": "."}); !strings.Contains(outTool, "visible.txt") {
+		t.Fatalf("list_dir(\".\") failed: %q", outTool)
+	}
+
+	// Both existing and non-existing sensitive paths must fail immediately at path
+	// validation without leaking existence via stat errors.
+	sensitiveTargets := []string{
+		".git",
+		".git/hooks",
+		".nabd",
+		".nabd/shadow",
+		".env",
+		".env.local",
+		".env.nonexistent",
+		".env.example",
+		".GIT",
+	}
+	for _, target := range sensitiveTargets {
+		if got, err := reg.listDir(target); err == nil || !strings.Contains(err.Error(), "sensitive") {
+			t.Errorf("reg.listDir(%q) = (%q, %v), want sensitive denial", target, got, err)
+		}
+		if out := runTool(t, reg, "list_dir", map[string]any{"path": target}); !strings.Contains(out, "sensitive") {
+			t.Errorf("list_dir(%q) = %q, want sensitive denial", target, out)
+		}
+	}
+}
+
 func TestRunFailsClosedWithoutApprover(t *testing.T) {
 	root, reg := newTestRegistry(t)
 	writeTestFile(t, filepath.Join(root, "target.txt"), "original")
@@ -376,6 +420,7 @@ func TestFileDigest(t *testing.T) {
 
 func TestGoVerifyEnvAllowlist(t *testing.T) {
 	root, reg := newTestRegistry(t)
+	reg.allowUnsandboxedForTest = true
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module auditenv\n\ngo 1.22\n")
 	writeTestFile(t, filepath.Join(root, "env_test.go"), `package auditenv
 
@@ -421,6 +466,7 @@ func TestEnv(t *testing.T) {
 
 func TestGoVerifyOutputCap(t *testing.T) {
 	root, reg := newTestRegistry(t)
+	reg.allowUnsandboxedForTest = true
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module auditloud\n\ngo 1.22\n")
 	writeTestFile(t, filepath.Join(root, "loud_test.go"), `package auditloud
 

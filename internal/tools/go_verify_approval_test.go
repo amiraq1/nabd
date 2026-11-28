@@ -70,6 +70,7 @@ func TestGoVerifyRunApprovedExecutes(t *testing.T) {
 		t.Fatal("go test executed despite rejection")
 	}
 
+	r.allowUnsandboxedForTest = true
 	out = legacyApproved(t, r, context.Background(), "go_verify", json.RawMessage(`{"pkg":"./..."}`), ApprovalState{})
 	if strings.Contains(out, "Error") {
 		t.Fatalf("RunApproved failed: %q", out)

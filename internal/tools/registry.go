@@ -55,20 +55,21 @@ type ToolSpec struct {
 }
 
 type Registry struct {
-	workDir   string
-	root      *os.Root
-	shadow    *shadowstore.Store
-	auditLog  *audit.Log
-	approve   ApprovalFunc
-	handlers  map[string]ToolSpec
-	mu        sync.Mutex
-	writeMu   sync.Mutex
-	pending   map[string]pendingApproval
-	now       func() time.Time
-	mcpConfig *MCPConfig
-	reaConfig *REAConfig
-	webConfig *WebConfig
-	sandbox   sandbox.Backend
+	workDir                 string
+	root                    *os.Root
+	shadow                  *shadowstore.Store
+	auditLog                *audit.Log
+	approve                 ApprovalFunc
+	handlers                map[string]ToolSpec
+	mu                      sync.Mutex
+	writeMu                 sync.Mutex
+	pending                 map[string]pendingApproval
+	now                     func() time.Time
+	mcpConfig               *MCPConfig
+	reaConfig               *REAConfig
+	webConfig               *WebConfig
+	sandbox                 sandbox.Backend
+	allowUnsandboxedForTest bool
 }
 
 type pendingApproval struct {
@@ -569,6 +570,11 @@ func (r *Registry) readFilePage(rel string, offset, limit int64, structured bool
 }
 
 func (r *Registry) listDir(rel string) (string, error) {
+	var err error
+	rel, err = r.resolveSafePath(rel)
+	if err != nil {
+		return "", err
+	}
 	if isEnvTemplate(filepath.Base(rel)) {
 		return "", fmt.Errorf("access to sensitive directory denied: %s", rel)
 	}
@@ -1852,6 +1858,9 @@ func (r *Registry) validatePkgPattern(pattern string) (string, error) {
 // runGoVerify executes go test with a hard timeout and a structured summary.
 // Test failures are normal results, not tool errors.
 func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Duration) (string, error) {
+	if r.sandbox == nil && !r.allowUnsandboxedForTest {
+		return "", fmt.Errorf("go_verify is disabled: no proven execution sandbox is active")
+	}
 	tCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -1880,11 +1889,14 @@ func (r *Registry) runGoVerify(ctx context.Context, pkg string, timeout time.Dur
 	return summarizeGoTest(status, out.String(), err), nil
 }
 
-// goVerifyCommand builds the verifier command. Without a proven sandbox the
-// caller never reaches this code with external execution enabled; with one,
-// the Go toolchain is bound read-only and project code runs in an isolated
-// namespace with a writable tmpfs cache.
+// goVerifyCommand builds the verifier command. Without a proven sandbox it
+// fails closed unless allowUnsandboxedForTest is enabled by internal unit
+// tests; with a proven sandbox, the Go toolchain is bound read-only and project
+// code runs in an isolated namespace with a writable tmpfs cache.
 func (r *Registry) goVerifyCommand(ctx context.Context, pkg string) (*exec.Cmd, error) {
+	if r.sandbox == nil && !r.allowUnsandboxedForTest {
+		return nil, fmt.Errorf("go_verify is disabled: no proven execution sandbox is active")
+	}
 	goTool, err := exec.LookPath("go")
 	if err != nil {
 		return nil, err

@@ -3,7 +3,9 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -11,20 +13,43 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amiraq1/nabd/internal/tools"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// The UI must propagate quit to the real go_verify process group, and the
+func runUnixProcessTreeForTest(t *testing.T, script string) func(context.Context, *tools.Registry, ToolCall, *tools.Approval) string {
+	t.Helper()
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatalf("sh not found: %v", err)
+	}
+	return func(ctx context.Context, _ *tools.Registry, _ ToolCall, _ *tools.Approval) string {
+		cmd := exec.CommandContext(ctx, sh, "-c", script)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			if cmd.Process == nil {
+				return nil
+			}
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		cmd.WaitDelay = 2 * time.Second
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() == context.Canceled {
+				return "CANCELLED (context canceled)"
+			}
+			return "Error: " + err.Error()
+		}
+		return "PASS"
+	}
+}
+
+// The UI must propagate quit to the active tool process group, and the
 // command must finish before the registry can safely be closed.
 func TestReliabilityQuitCancelsToolProcessTree(t *testing.T) {
 	dir, m := testModel(t)
-	bin := t.TempDir()
 	pidFile := filepath.Join(dir, "pids")
-	script := "#!/bin/sh\nsleep 30 &\necho $$ $! > " + strconv.Quote(pidFile) + "\nwait\n"
-	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	script := "sleep 30 &\necho $$ $! > " + strconv.Quote(pidFile) + "\nwait\n"
+	m.runToolForTest = runUnixProcessTreeForTest(t, script)
 	tc := testToolCall("go_verify", `{"pkg":"./..."}`)
 	m.pendingTools = []ToolCall{tc}
 	m.awaitingApproval = true

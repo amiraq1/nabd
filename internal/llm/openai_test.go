@@ -266,6 +266,16 @@ func TestParseRetryAfter(t *testing.T) {
 	if got := parseRetryAfter(future); got <= 0 || got > 3*time.Second {
 		t.Errorf("http date = %v", got)
 	}
+	if got := parseRetryAfter("999999"); got != maxRetryAfter {
+		t.Errorf("large seconds = %v, want %v", got, maxRetryAfter)
+	}
+	if got := parseRetryAfter("99999999999999999999999"); got != maxRetryAfter {
+		t.Errorf("overflow seconds = %v, want %v", got, maxRetryAfter)
+	}
+	farFuture := time.Now().Add(24 * time.Hour).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(farFuture); got != maxRetryAfter {
+		t.Errorf("far future http date = %v, want %v", got, maxRetryAfter)
+	}
 }
 
 func TestAPIKeyHandling(t *testing.T) {
